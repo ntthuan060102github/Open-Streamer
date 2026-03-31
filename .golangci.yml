@@ -1,0 +1,46 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - revive
+    - exhaustive
+    - gofumpt
+    - misspell
+    - bodyclose
+    - contextcheck
+    - noctx
+    - godot
+    - unparam
+    - prealloc
+    - nilerr
+
+linters-settings:
+  exhaustive:
+    default-signifies-exhaustive: false
+    check:
+      - switch
+
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - "checkPrivateReceivers"
+          - "sayRepetitiveInsteadOfStutters"
+
+  godot:
+    scope: declarations
+    capital: false
+
+issues:
+  exclude-rules:
+    # Allow fmt.Errorf without %w in test files
+    - path: _test\.go
+      linters:
+        - errcheck
+    # Allow TODO comments in handlers/stores during scaffolding
+    - text: "TODO"
+      linters:
+        - godot

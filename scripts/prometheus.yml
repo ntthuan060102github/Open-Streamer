@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: open-streamer
+    static_configs:
+      - targets: ["open-streamer:9091"]
