@@ -32,6 +32,7 @@ func NewHTTPReader(input domain.Input) *HTTPReader {
 	}
 }
 
+// Open performs the initial HTTP GET and stores the response body for streaming reads.
 func (r *HTTPReader) Open(ctx context.Context) error {
 	r.client = &http.Client{Timeout: 0} // streaming — no global timeout
 
@@ -53,7 +54,7 @@ func (r *HTTPReader) Open(ctx context.Context) error {
 		return fmt.Errorf("http reader: connect to %q: %w", r.input.URL, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return fmt.Errorf("http reader: server returned %d for %q", resp.StatusCode, r.input.URL)
 	}
 
@@ -77,10 +78,10 @@ func (r *HTTPReader) Read(ctx context.Context) ([]byte, error) {
 	return nil, fmt.Errorf("http reader: read body: %w", err)
 }
 
+// Close closes the HTTP response body, if open.
 func (r *HTTPReader) Close() error {
 	if r.body != nil {
 		return r.body.Close()
 	}
 	return nil
 }
-

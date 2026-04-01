@@ -27,7 +27,9 @@ func NewSRTReader(input domain.Input) *SRTReader {
 	return &SRTReader{input: input, buf: make([]byte, srtReadChunk)}
 }
 
+// Open dials the remote SRT endpoint in caller mode.
 func (r *SRTReader) Open(ctx context.Context) error {
+	_ = ctx // gosrt dial has no context-aware API yet
 	u, err := url.Parse(r.input.URL)
 	if err != nil {
 		return fmt.Errorf("srt reader: parse url: %w", err)
@@ -71,6 +73,7 @@ func (r *SRTReader) Read(ctx context.Context) ([]byte, error) {
 	return nil, nil
 }
 
+// Close closes the SRT socket.
 func (r *SRTReader) Close() error {
 	if r.conn != nil {
 		return r.conn.Close()

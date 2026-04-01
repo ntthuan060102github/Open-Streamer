@@ -3,6 +3,7 @@ package domain
 // WatermarkType determines whether the overlay is text or an image.
 type WatermarkType string
 
+// WatermarkType values select overlay content kind.
 const (
 	WatermarkTypeText  WatermarkType = "text"
 	WatermarkTypeImage WatermarkType = "image"
@@ -11,6 +12,7 @@ const (
 // WatermarkPosition controls where the overlay is placed in the frame.
 type WatermarkPosition string
 
+// WatermarkPosition values name corners and center for overlay placement.
 const (
 	WatermarkTopLeft     WatermarkPosition = "top_left"
 	WatermarkTopRight    WatermarkPosition = "top_right"

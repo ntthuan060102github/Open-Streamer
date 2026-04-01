@@ -65,7 +65,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 			writeID, streamID, buf, err := s.registry.Lookup(streamKey)
 			if err != nil {
 				// Should not happen — HandleConnect already checked.
-				conn.Close()
+				_ = conn.Close()
 				return
 			}
 			slog.Info("srt: publisher connected",
@@ -87,7 +87,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 
 	if err := s.server.ListenAndServe(); err != nil && err != srt.ErrServerClosed {
 		if ctx.Err() != nil {
-			return nil // clean shutdown
+			return nil //nolint:nilerr // clean shutdown while server is stopping
 		}
 		return err
 	}
@@ -96,7 +96,7 @@ func (s *SRTServer) ListenAndServe(ctx context.Context) error {
 
 // handleSRTConn reads MPEG-TS from the SRT connection and writes to the buffer.
 func handleSRTConn(ctx context.Context, conn srt.Conn, bufferWriteID, streamID domain.StreamCode, buf *buffer.Service) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	defer slog.Info("srt: publisher disconnected", "stream_code", streamID)
 
 	readBuf := make([]byte, 1316*4) // read a few SRT payloads at a time

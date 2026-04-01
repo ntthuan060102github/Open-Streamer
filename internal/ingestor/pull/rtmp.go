@@ -32,6 +32,7 @@ func NewRTMPReader(input domain.Input) *RTMPReader {
 	return &RTMPReader{input: input, pkts: make(chan []byte, rtmpChanSize)}
 }
 
+// Open connects to the RTMP source and starts the demux read loop.
 func (r *RTMPReader) Open(ctx context.Context) error {
 	u, err := url.Parse(r.input.URL)
 	if err != nil {
@@ -63,7 +64,7 @@ func (r *RTMPReader) Open(ctx context.Context) error {
 
 	client := gortmp.NewRtmpClient(gortmp.WithChunkSize(60000), gortmp.WithComplexHandshake())
 	client.OnFrame(func(cid gocodec.CodecID, pts, dts uint32, frame []byte) {
-		switch cid {
+		switch cid { //nolint:exhaustive // pull path muxes H264/H265/AAC only
 		case gocodec.CODECID_VIDEO_H264:
 			r.once.Do(func() {
 				videoPid = mux.AddStream(gompeg2.TS_STREAM_H264)
@@ -129,6 +130,7 @@ func (r *RTMPReader) Read(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// Close closes the RTMP TCP connection.
 func (r *RTMPReader) Close() error {
 	if r.conn != nil {
 		return r.conn.Close()

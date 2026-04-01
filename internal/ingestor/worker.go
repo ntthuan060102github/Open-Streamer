@@ -53,7 +53,7 @@ func runPullWorker(
 			if !waitBackoff(ctx, delay) {
 				return
 			}
-			delay = min(delay*2, reconnectMaxDelay)
+			delay = minDur(delay*2, reconnectMaxDelay)
 			continue
 		}
 
@@ -65,7 +65,7 @@ func runPullWorker(
 		delay = reconnectBaseDelay // reset on successful open
 
 		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, onPacket)
-		r.Close()
+		_ = r.Close()
 
 		if ctx.Err() != nil {
 			return
@@ -101,7 +101,7 @@ func runPullWorker(
 		if !waitBackoff(ctx, delay) {
 			return
 		}
-		delay = min(delay*2, reconnectMaxDelay)
+		delay = minDur(delay*2, reconnectMaxDelay)
 	}
 }
 
@@ -147,7 +147,7 @@ func waitBackoff(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func min(a, b time.Duration) time.Duration {
+func minDur(a, b time.Duration) time.Duration {
 	if a < b {
 		return a
 	}

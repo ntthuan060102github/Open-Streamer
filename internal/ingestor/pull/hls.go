@@ -18,7 +18,7 @@ import (
 
 // HLSReader polls an HLS playlist and downloads new segments in order.
 // Supports both live (sliding window) and VOD playlists.
-// Expected URL format: http[s]://host/path/to/playlist.m3u8
+// Expected URL format: http[s]://host/path/to/playlist.m3u8.
 type HLSReader struct {
 	input  domain.Input
 	cfg    config.IngestorConfig
@@ -47,6 +47,7 @@ func NewHLSReader(input domain.Input, cfg config.IngestorConfig) *HLSReader {
 	}
 }
 
+// Open starts background playlist polling until Close or ctx ends.
 func (r *HLSReader) Open(ctx context.Context) error {
 	connectTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
 	if connectTimeout == 0 {
@@ -72,6 +73,7 @@ func (r *HLSReader) Read(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// Close stops the polling goroutine.
 func (r *HLSReader) Close() error {
 	r.once.Do(func() {
 		if r.cancel != nil {
@@ -166,7 +168,7 @@ func (r *HLSReader) fetchPlaylist(ctx context.Context) (segs []string, targetDur
 	if err != nil {
 		return nil, 0, false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, false, fmt.Errorf("http %d", resp.StatusCode)
@@ -180,6 +182,8 @@ func (r *HLSReader) fetchPlaylist(ctx context.Context) (segs []string, targetDur
 	base, _ := url.Parse(r.input.URL)
 
 	switch listType {
+	case m3u8.ListType(0):
+		return nil, 0, false, fmt.Errorf("hls reader: undefined playlist type")
 	case m3u8.MEDIA:
 		media := pl.(*m3u8.MediaPlaylist)
 		for _, seg := range media.Segments {
@@ -221,7 +225,7 @@ func (r *HLSReader) fetchSegment(ctx context.Context, segURL string) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("http %d for segment %s", resp.StatusCode, segURL)

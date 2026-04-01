@@ -39,7 +39,7 @@ func NewRecordingHandler(i do.Injector) (*RecordingHandler, error) {
 // @Param code path string true "Stream code"
 // @Success 201 {object} apidocs.RecordingData
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/recordings/start [post]
+// @Router /streams/{code}/recordings/start [post].
 func (h *RecordingHandler) Start(w http.ResponseWriter, r *http.Request) {
 	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
 
@@ -67,7 +67,7 @@ func (h *RecordingHandler) Start(w http.ResponseWriter, r *http.Request) {
 // @Param code path string true "Stream code"
 // @Success 200 {object} apidocs.StreamActionData
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/recordings/stop [post]
+// @Router /streams/{code}/recordings/stop [post].
 func (h *RecordingHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
 	if err := h.dvr.StopRecording(r.Context(), streamCode); err != nil {
@@ -84,7 +84,7 @@ func (h *RecordingHandler) Stop(w http.ResponseWriter, r *http.Request) {
 // @Param code path string true "Stream code"
 // @Success 200 {object} apidocs.RecordingList
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/recordings [get]
+// @Router /streams/{code}/recordings [get].
 func (h *RecordingHandler) ListByStream(w http.ResponseWriter, r *http.Request) {
 	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
 	recs, err := h.recRepo.ListByStream(r.Context(), streamCode)
@@ -102,7 +102,7 @@ func (h *RecordingHandler) ListByStream(w http.ResponseWriter, r *http.Request) 
 // @Param rid path string true "Recording ID"
 // @Success 200 {object} apidocs.RecordingData
 // @Failure 404 {object} apidocs.ErrorBody
-// @Router /recordings/{rid} [get]
+// @Router /recordings/{rid} [get].
 func (h *RecordingHandler) Get(w http.ResponseWriter, r *http.Request) {
 	rid := domain.RecordingID(chi.URLParam(r, "rid"))
 	rec, err := h.recRepo.FindByID(r.Context(), rid)
@@ -119,7 +119,7 @@ func (h *RecordingHandler) Get(w http.ResponseWriter, r *http.Request) {
 // @Param rid path string true "Recording ID"
 // @Success 204 "No Content"
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /recordings/{rid} [delete]
+// @Router /recordings/{rid} [delete].
 func (h *RecordingHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	rid := domain.RecordingID(chi.URLParam(r, "rid"))
 	if err := h.recRepo.Delete(r.Context(), rid); err != nil {
@@ -136,7 +136,7 @@ func (h *RecordingHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // @Param rid path string true "Recording ID"
 // @Success 200 {string} string "M3U8 body"
 // @Failure 404 {object} apidocs.ErrorBody
-// @Router /recordings/{rid}/playlist.m3u8 [get]
+// @Router /recordings/{rid}/playlist.m3u8 [get].
 func (h *RecordingHandler) Playlist(w http.ResponseWriter, r *http.Request) {
 	rid := domain.RecordingID(chi.URLParam(r, "rid"))
 	rec, err := h.recRepo.FindByID(r.Context(), rid)

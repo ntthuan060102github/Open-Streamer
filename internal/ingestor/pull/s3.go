@@ -33,9 +33,9 @@ const s3ReadChunk = 188 * 56
 // reader after Read returns io.EOF (the worker's reconnect logic handles this
 // automatically).
 type S3Reader struct {
-	input  domain.Input
-	body   io.ReadCloser
-	buf    []byte
+	input domain.Input
+	body  io.ReadCloser
+	buf   []byte
 }
 
 // NewS3Reader constructs an S3Reader.
@@ -43,6 +43,7 @@ func NewS3Reader(input domain.Input) *S3Reader {
 	return &S3Reader{input: input, buf: make([]byte, s3ReadChunk)}
 }
 
+// Open fetches the object and holds the response body for streaming reads.
 func (r *S3Reader) Open(ctx context.Context) error {
 	u, err := url.Parse(r.input.URL)
 	if err != nil {
@@ -122,6 +123,7 @@ func (r *S3Reader) Read(ctx context.Context) ([]byte, error) {
 	return nil, fmt.Errorf("s3 reader: read body: %w", err)
 }
 
+// Close closes the S3 GetObject body, if open.
 func (r *S3Reader) Close() error {
 	if r.body != nil {
 		return r.body.Close()

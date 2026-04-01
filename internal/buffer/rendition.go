@@ -12,7 +12,7 @@ func RenditionBufferID(code domain.StreamCode, slug string) domain.StreamCode {
 	return domain.StreamCode("$r$" + string(code) + "$" + slug)
 }
 
-// VideoTrackSlug returns the stable path segment for the profile at index (0-based): track_1, track_2, …
+// VideoTrackSlug returns the stable path segment for the profile at index (0-based): track_1, track_2, ….
 func VideoTrackSlug(index int) string {
 	return fmt.Sprintf("track_%d", index+1)
 }

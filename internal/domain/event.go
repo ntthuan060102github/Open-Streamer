@@ -1,3 +1,4 @@
+// Package domain defines core types shared across Open Streamer modules.
 package domain
 
 import "time"
@@ -5,18 +6,19 @@ import "time"
 // EventType identifies the kind of domain event that occurred.
 type EventType string
 
+// EventType values are emitted on the event bus for stream lifecycle, inputs, recordings, and segments.
 const (
-	EventStreamCreated     EventType = "stream.created"
-	EventStreamStarted     EventType = "stream.started"
-	EventStreamStopped     EventType = "stream.stopped"
-	EventStreamDeleted     EventType = "stream.deleted"
-	EventInputDegraded     EventType = "input.degraded"
-	EventInputFailed       EventType = "input.failed"
-	EventInputFailover     EventType = "input.failover"
-	EventRecordingStarted  EventType = "recording.started"
-	EventRecordingStopped  EventType = "recording.stopped"
-	EventRecordingFailed   EventType = "recording.failed"
-	EventSegmentWritten    EventType = "segment.written"
+	EventStreamCreated    EventType = "stream.created"
+	EventStreamStarted    EventType = "stream.started"
+	EventStreamStopped    EventType = "stream.stopped"
+	EventStreamDeleted    EventType = "stream.deleted"
+	EventInputDegraded    EventType = "input.degraded"
+	EventInputFailed      EventType = "input.failed"
+	EventInputFailover    EventType = "input.failover"
+	EventRecordingStarted EventType = "recording.started"
+	EventRecordingStopped EventType = "recording.stopped"
+	EventRecordingFailed  EventType = "recording.failed"
+	EventSegmentWritten   EventType = "segment.written"
 )
 
 // Event is an immutable fact describing a domain state change.

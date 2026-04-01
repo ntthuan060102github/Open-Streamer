@@ -35,6 +35,7 @@ func ValidateStreamCode(s string) error {
 // StreamStatus represents the lifecycle state of a stream.
 type StreamStatus string
 
+// StreamStatus values are used by the stream manager and API.
 const (
 	StatusIdle     StreamStatus = "idle"
 	StatusActive   StreamStatus = "active"

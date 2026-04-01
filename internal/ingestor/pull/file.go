@@ -18,7 +18,7 @@ const fileReadChunk = 188 * 56 // ~10 KiB per read
 // repeatedly from the beginning after reaching EOF.
 //
 // Expected URL format: file:///absolute/path/to/source.ts
-// Or plain path:        /absolute/path/to/source.ts
+// Or plain path: /absolute/path/to/source.ts.
 type FileReader struct {
 	input domain.Input
 	path  string
@@ -38,6 +38,7 @@ func NewFileReader(input domain.Input) *FileReader {
 	}
 }
 
+// Open opens the underlying file for reading.
 func (r *FileReader) Open(_ context.Context) error {
 	f, err := os.Open(r.path)
 	if err != nil {
@@ -73,6 +74,7 @@ func (r *FileReader) Read(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// Close closes the open file, if any.
 func (r *FileReader) Close() error {
 	if r.f != nil {
 		return r.f.Close()

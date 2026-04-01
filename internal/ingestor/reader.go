@@ -91,6 +91,12 @@ func NewReader(input domain.Input, cfg config.IngestorConfig) (Reader, error) {
 	case protocol.KindS3:
 		return pull.NewS3Reader(input), nil
 
+	case protocol.KindUnknown:
+		return nil, fmt.Errorf(
+			"ingestor: cannot infer protocol from URL %q — unsupported scheme",
+			input.URL,
+		)
+
 	default:
 		return nil, fmt.Errorf(
 			"ingestor: cannot infer protocol from URL %q — unsupported scheme",

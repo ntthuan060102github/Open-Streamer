@@ -6,6 +6,7 @@ type HookID string
 // HookType is the delivery mechanism for a hook.
 type HookType string
 
+// HookType values name supported hook transports.
 const (
 	HookTypeHTTP  HookType = "http"
 	HookTypeNATS  HookType = "nats"

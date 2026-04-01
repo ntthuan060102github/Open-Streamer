@@ -49,6 +49,7 @@ func (s *Service) serveSRT(ctx context.Context, streamID domain.StreamCode) {
 			"client_hint_pattern", fmt.Sprintf("srt://%s:%d?mode=caller&transtype=live&latency=<ms>&streamid=live/<stream_code>",
 				host, s.srtListenPort()),
 		)
+		//nolint:contextcheck // shared listener outlives any single stream ctx
 		go s.srtAcceptLoop(ln)
 	}
 	s.srtActive[streamID] = struct{}{}

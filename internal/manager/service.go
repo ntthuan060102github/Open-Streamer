@@ -254,11 +254,11 @@ func (s *Service) checkHealth(ctx context.Context, streamID domain.StreamCode) {
 			})
 			s.tryFailover(ctx, streamID, state)
 		}
-		s.probeDegradedInput(streamID, state, priority, h)
+		s.probeDegradedInput(ctx, streamID, state, priority, h)
 	}
 }
 
-func (s *Service) probeDegradedInput(streamID domain.StreamCode, state *streamState, priority int, h *InputHealth) {
+func (s *Service) probeDegradedInput(ctx context.Context, streamID domain.StreamCode, state *streamState, priority int, h *InputHealth) {
 	if h.Status != domain.StatusDegraded || priority == state.active {
 		return
 	}
@@ -277,9 +277,9 @@ func (s *Service) probeDegradedInput(streamID domain.StreamCode, state *streamSt
 			state.probing[priority] = false
 		}()
 
-		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 		defer cancel()
-		if err := s.ingestor.Probe(ctx, input); err != nil {
+		if err := s.ingestor.Probe(probeCtx, input); err != nil {
 			return
 		}
 
@@ -291,7 +291,7 @@ func (s *Service) probeDegradedInput(streamID domain.StreamCode, state *streamSt
 		)
 
 		if priority < state.active && time.Since(state.lastSwitchAt) >= failbackSwitchCooldown {
-			s.tryFailover(context.Background(), streamID, state)
+			s.tryFailover(ctx, streamID, state)
 		}
 	}()
 }

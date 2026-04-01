@@ -54,18 +54,6 @@ func (m *mockReader) Close() error {
 	return nil
 }
 
-func (m *mockReader) openCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.opens
-}
-
-func (m *mockReader) closeCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.closes
-}
-
 // ---- waitBackoff ----
 
 func TestWaitBackoff_ContextCancelled(t *testing.T) {

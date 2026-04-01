@@ -67,6 +67,8 @@ func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error 
 			Payload:    map[string]any{"test": true, "hook_id": string(h.ID)},
 		}
 		return s.deliver(ctx, h, ev)
+	case domain.HookTypeNATS, domain.HookTypeKafka:
+		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	default:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	}
@@ -176,9 +178,9 @@ func (s *Service) deliver(ctx context.Context, h *domain.Hook, event domain.Even
 	case domain.HookTypeHTTP:
 		return s.deliverHTTP(ctx, h, event)
 	case domain.HookTypeNATS:
-		return fmt.Errorf("NATS delivery: not implemented")
+		return fmt.Errorf("nats delivery: not implemented")
 	case domain.HookTypeKafka:
-		return fmt.Errorf("Kafka delivery: not implemented")
+		return fmt.Errorf("kafka delivery: not implemented")
 	default:
 		return fmt.Errorf("unknown hook type: %s", h.Type)
 	}
@@ -213,7 +215,7 @@ func (s *Service) deliverHTTP(ctx context.Context, h *domain.Hook, event domain.
 	if err != nil {
 		return fmt.Errorf("http post: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)

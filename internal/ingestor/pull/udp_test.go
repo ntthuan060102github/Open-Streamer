@@ -19,7 +19,7 @@ func TestUDPReader_ReceivesPackets(t *testing.T) {
 	// Bind the reader on an OS-assigned loopback port.
 	r := pull.NewUDPReader(domain.Input{URL: "udp://127.0.0.1:0"})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	// Find out what port was actually bound.
 	addr := r.LocalAddr()
@@ -28,12 +28,13 @@ func TestUDPReader_ReceivesPackets(t *testing.T) {
 	payload := []byte("ts-packet-12345")
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		conn, err := net.Dial("udp", addr.String())
+		d := net.Dialer{}
+		conn, err := d.DialContext(context.Background(), "udp", addr.String())
 		if err != nil {
 			return
 		}
-		defer conn.Close()
-		conn.Write(payload) //nolint:errcheck
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write(payload)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -49,7 +50,7 @@ func TestUDPReader_ContextCancelled(t *testing.T) {
 
 	r := pull.NewUDPReader(domain.Input{URL: "udp://127.0.0.1:0"})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

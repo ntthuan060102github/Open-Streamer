@@ -105,8 +105,9 @@ func (b *inProcessBus) runWorker(ctx context.Context) {
 
 func (b *inProcessBus) dispatch(ctx context.Context, event domain.Event) {
 	b.mu.RLock()
-	handlers := make([]HandlerFunc, 0)
-	for _, s := range b.subs[event.Type] {
+	subs := b.subs[event.Type]
+	handlers := make([]HandlerFunc, 0, len(subs))
+	for _, s := range subs {
 		handlers = append(handlers, s.handler)
 	}
 	b.mu.RUnlock()

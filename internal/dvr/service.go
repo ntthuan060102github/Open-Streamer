@@ -27,12 +27,12 @@ type recordingSession struct {
 
 // Service manages DVR recording sessions.
 type Service struct {
-	cfg       config.DVRConfig
-	buf       *buffer.Service
-	bus       events.Bus
-	recRepo   store.RecordingRepository
-	mu        sync.Mutex
-	sessions  map[domain.StreamCode]*recordingSession
+	cfg      config.DVRConfig
+	buf      *buffer.Service
+	bus      events.Bus
+	recRepo  store.RecordingRepository
+	mu       sync.Mutex
+	sessions map[domain.StreamCode]*recordingSession
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -72,10 +72,10 @@ func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode
 	}
 
 	rec := &domain.Recording{
-		ID:        domain.RecordingID(fmt.Sprintf("%s-%d", streamID, time.Now().UnixNano())),
+		ID:         domain.RecordingID(fmt.Sprintf("%s-%d", streamID, time.Now().UnixNano())),
 		StreamCode: streamID,
-		StartedAt: time.Now(),
-		Status:    domain.RecordingStatusRecording,
+		StartedAt:  time.Now(),
+		Status:     domain.RecordingStatusRecording,
 	}
 
 	if err := s.recRepo.Save(ctx, rec); err != nil {
@@ -95,9 +95,9 @@ func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode
 	go s.record(workerCtx, rec, subscribeID, segmentDuration)
 
 	s.bus.Publish(ctx, domain.Event{
-		Type:     domain.EventRecordingStarted,
+		Type:       domain.EventRecordingStarted,
 		StreamCode: streamID,
-		Payload:  map[string]any{"recording_id": rec.ID},
+		Payload:    map[string]any{"recording_id": rec.ID},
 	})
 
 	slog.Info("dvr: recording started", "stream_code", streamID, "recording_id", rec.ID)
@@ -125,9 +125,9 @@ func (s *Service) StopRecording(ctx context.Context, streamID domain.StreamCode)
 	}
 
 	s.bus.Publish(ctx, domain.Event{
-		Type:     domain.EventRecordingStopped,
+		Type:       domain.EventRecordingStopped,
 		StreamCode: streamID,
-		Payload:  map[string]any{"recording_id": session.recording.ID},
+		Payload:    map[string]any{"recording_id": session.recording.ID},
 	})
 
 	slog.Info("dvr: recording stopped",

@@ -7,9 +7,9 @@ import (
 	"net/url"
 	"sync"
 
+	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 	gortsp "github.com/yapingcat/gomedia/go-rtsp"
 	"github.com/yapingcat/gomedia/go-rtsp/sdp"
-	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/open-streamer/open-streamer/internal/domain"
 )
@@ -32,6 +32,7 @@ func NewRTSPReader(input domain.Input) *RTSPReader {
 	return &RTSPReader{input: input, pkts: make(chan []byte, rtspChanSize)}
 }
 
+// Open connects in play mode and starts receiving MPEG-TS from the RTSP session.
 func (r *RTSPReader) Open(ctx context.Context) error {
 	u, err := url.Parse(r.input.URL)
 	if err != nil {
@@ -61,7 +62,7 @@ func (r *RTSPReader) Open(ctx context.Context) error {
 	handler := &rtspClientHandler{mux: mux}
 	client, err := gortsp.NewRtspClient(r.input.URL, handler)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("rtsp reader: build client: %w", err)
 	}
 	client.SetOutput(func(b []byte) error {
@@ -70,7 +71,7 @@ func (r *RTSPReader) Open(ctx context.Context) error {
 	})
 
 	if err := client.Start(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("rtsp reader: start: %w", err)
 	}
 
@@ -105,6 +106,7 @@ func (r *RTSPReader) Read(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// Close tears down the RTSP client and closes the connection.
 func (r *RTSPReader) Close() error {
 	if r.conn != nil {
 		return r.conn.Close()
@@ -135,7 +137,7 @@ func (h *rtspClientHandler) HandleDescribe(_ *gortsp.RtspClient, _ gortsp.RtspRe
 			sampleRate = 90000
 		}
 
-		switch track.Codec.Cid {
+		switch track.Codec.Cid { //nolint:exhaustive // pull path muxes H264/H265/AAC only
 		case gortsp.RTSP_CODEC_H264:
 			h.mu.Lock()
 			h.videoPid = h.mux.AddStream(gompeg2.TS_STREAM_H264)
@@ -182,30 +184,39 @@ func (h *rtspClientHandler) HandleDescribe(_ *gortsp.RtspClient, _ gortsp.RtspRe
 func (h *rtspClientHandler) HandleSetup(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *gortsp.RtspTrack, _ map[string]*gortsp.RtspTrack, _ string, _ int) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleAnnounce(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandlePlay(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *gortsp.RangeTime, _ *gortsp.RtpInfo) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandlePause(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleTeardown(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleGetParameter(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleSetParameter(_ *gortsp.RtspClient, _ gortsp.RtspResponse) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleRedirect(_ *gortsp.RtspClient, _ gortsp.RtspRequest, _ string, _ *gortsp.RangeTime) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleRecord(_ *gortsp.RtspClient, _ gortsp.RtspResponse, _ *gortsp.RangeTime, _ *gortsp.RtpInfo) error {
 	return nil
 }
+
 func (h *rtspClientHandler) HandleRequest(_ *gortsp.RtspClient, _ gortsp.RtspRequest) error {
 	return nil
 }

@@ -141,7 +141,7 @@ func runDASHFMP4Packager(
 			wallDue := !p.segmentStart.IsZero() && time.Since(p.segmentStart) >= time.Duration(p.segSec)*time.Second
 			targetV := uint64(p.segSec) * uint64(dashVideoTimescale)
 			vDurQ := totalQueuedVideoDur90k(p.vDTS)
-			audioNeed := 1<<30 // no audio flush by count
+			audioNeed := 1 << 30 // no audio flush by count
 			if p.audioInit != nil {
 				audioNeed = p.audioFramesPerSegment()
 			}
@@ -895,15 +895,15 @@ type mpdAdaptationSet struct {
 }
 
 type mpdRepresentation struct {
-	ID                  string             `xml:"id,attr"`
-	MimeType            string             `xml:"mimeType,attr"`
-	Codecs              string             `xml:"codecs,attr"`
-	Bandwidth           int                `xml:"bandwidth,attr"`
-	Width               int                `xml:"width,attr,omitempty"`
-	Height              int                `xml:"height,attr,omitempty"`
-	AudioSamplingRate   *int               `xml:"audioSamplingRate,attr,omitempty"`
-	BaseURL             string             `xml:"BaseURL,omitempty"`
-	SegmentTemplate     mpdSegmentTemplate `xml:"SegmentTemplate"`
+	ID                string             `xml:"id,attr"`
+	MimeType          string             `xml:"mimeType,attr"`
+	Codecs            string             `xml:"codecs,attr"`
+	Bandwidth         int                `xml:"bandwidth,attr"`
+	Width             int                `xml:"width,attr,omitempty"`
+	Height            int                `xml:"height,attr,omitempty"`
+	AudioSamplingRate *int               `xml:"audioSamplingRate,attr,omitempty"`
+	BaseURL           string             `xml:"BaseURL,omitempty"`
+	SegmentTemplate   mpdSegmentTemplate `xml:"SegmentTemplate"`
 }
 
 type mpdSegmentTemplate struct {

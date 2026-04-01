@@ -1,6 +1,6 @@
 module github.com/open-streamer/open-streamer
 
-go 1.25.3
+go 1.25.5
 
 require (
 	github.com/Eyevinn/mp4ff v0.51.0

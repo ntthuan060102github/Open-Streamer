@@ -34,6 +34,7 @@ func NewUDPReader(input domain.Input) *UDPReader {
 	}
 }
 
+// Open binds a UDP socket for the URL host (unicast or multicast listen address).
 func (r *UDPReader) Open(ctx context.Context) error {
 	u, err := url.Parse(r.input.URL)
 	if err != nil {
@@ -110,6 +111,7 @@ func (r *UDPReader) Read(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// Close closes the UDP packet connection.
 func (r *UDPReader) Close() error {
 	if r.conn != nil {
 		err := r.conn.Close()

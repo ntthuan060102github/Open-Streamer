@@ -48,38 +48,41 @@ func (s *Service) rtspEnsureStartedLocked() error {
 	return nil
 }
 
+// OnDescribe implements gortsplib.ServerHandler: returns 404 with nil error when the path is invalid or unmounted.
 func (s *Service) OnDescribe(
 	ctx *gortsplib.ServerHandlerOnDescribeCtx,
 ) (*base.Response, *gortsplib.ServerStream, error) {
 	code, err := streamCodeFromLivePath(ctx.Path)
 	if err != nil {
-		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
+		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil //nolint:nilerr // gortsplib 404
 	}
 	s.rtspMu.RLock()
 	st := s.rtspMounts[publisherLiveMountPath(code)]
 	s.rtspMu.RUnlock()
 	if st == nil {
-		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
+		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil //nolint:nilerr // unmounted
 	}
 	return &base.Response{StatusCode: base.StatusOK}, st, nil
 }
 
+// OnSetup implements gortsplib.ServerHandler: returns 404 with nil error when the path is invalid or unmounted.
 func (s *Service) OnSetup(
 	ctx *gortsplib.ServerHandlerOnSetupCtx,
 ) (*base.Response, *gortsplib.ServerStream, error) {
 	code, err := streamCodeFromLivePath(ctx.Path)
 	if err != nil {
-		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
+		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil //nolint:nilerr // gortsplib 404
 	}
 	s.rtspMu.RLock()
 	st := s.rtspMounts[publisherLiveMountPath(code)]
 	s.rtspMu.RUnlock()
 	if st == nil {
-		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
+		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil //nolint:nilerr // unmounted
 	}
 	return &base.Response{StatusCode: base.StatusOK}, st, nil
 }
 
+// OnPlay implements gortsplib.ServerHandler for play requests (always OK here).
 func (s *Service) OnPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }

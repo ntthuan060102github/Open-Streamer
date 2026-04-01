@@ -119,7 +119,7 @@ func (r *streamRepo) List(ctx context.Context, filter store.StreamFilter) ([]*do
 	if err != nil {
 		return nil, fmt.Errorf("mongo streams.List: %w", err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	out := make([]*domain.Stream, 0)
 	for cur.Next(ctx) {
@@ -164,9 +164,9 @@ func (r *recordingRepo) Save(ctx context.Context, rec *domain.Recording) error {
 	filter := bson.M{"_id": string(rec.ID)}
 	update := bson.M{
 		"$set": bson.M{
-			"data":       payload,
+			"data":        payload,
 			"stream_code": string(rec.StreamCode),
-			"updated_at": time.Now().UTC(),
+			"updated_at":  time.Now().UTC(),
 		},
 	}
 	opts := options.UpdateOne().SetUpsert(true)
@@ -200,7 +200,7 @@ func (r *recordingRepo) ListByStream(ctx context.Context, streamCode domain.Stre
 	if err != nil {
 		return nil, fmt.Errorf("mongo recordings.ListByStream: %w", err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	out := make([]*domain.Recording, 0)
 	for cur.Next(ctx) {
@@ -277,7 +277,7 @@ func (r *hookRepo) List(ctx context.Context) ([]*domain.Hook, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mongo hooks.List: %w", err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	out := make([]*domain.Hook, 0)
 	for cur.Next(ctx) {

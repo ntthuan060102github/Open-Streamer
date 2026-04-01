@@ -1,6 +1,9 @@
 version: "2"
 
 linters:
+  exclusions:
+    paths:
+      - api/docs
   enable:
     - errcheck
     - govet

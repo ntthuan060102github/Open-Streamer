@@ -184,16 +184,16 @@ func transcoderProfilesFromDomain(profiles []domain.VideoProfile) []transcoder.P
 			preset = "fast"
 		}
 		out = append(out, transcoder.Profile{
-			Width:              p.Width,
-			Height:             p.Height,
-			Bitrate:            br,
-			Codec:              codec,
-			Preset:             preset,
-			CodecProfile:       p.Profile,
-			CodecLevel:         p.Level,
-			MaxBitrate:         p.MaxBitrate,
-			Framerate:          p.Framerate,
-			KeyframeInterval:   p.KeyframeInterval,
+			Width:            p.Width,
+			Height:           p.Height,
+			Bitrate:          br,
+			Codec:            codec,
+			Preset:           preset,
+			CodecProfile:     p.Profile,
+			CodecLevel:       p.Level,
+			MaxBitrate:       p.MaxBitrate,
+			Framerate:        p.Framerate,
+			KeyframeInterval: p.KeyframeInterval,
 		})
 	}
 	return out

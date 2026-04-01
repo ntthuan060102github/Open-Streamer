@@ -13,7 +13,7 @@ import (
 	"github.com/samber/do/v2"
 )
 
-// HookHandler handles webhook/hook management REST endpoints.
+// HookHandler handles webhook and hook management REST endpoints.
 type HookHandler struct {
 	hookRepo store.HookRepository
 	hooks    *hooks.Service
@@ -33,7 +33,7 @@ func NewHookHandler(i do.Injector) (*HookHandler, error) {
 // @Produce json
 // @Success 200 {object} apidocs.HookList
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /hooks [get]
+// @Router /hooks [get].
 func (h *HookHandler) List(w http.ResponseWriter, r *http.Request) {
 	hooksList, err := h.hookRepo.List(r.Context())
 	if err != nil {
@@ -52,7 +52,7 @@ func (h *HookHandler) List(w http.ResponseWriter, r *http.Request) {
 // @Success 201 {object} apidocs.HookData
 // @Failure 400 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /hooks [post]
+// @Router /hooks [post].
 func (h *HookHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var hook domain.Hook
 	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil {
@@ -73,7 +73,7 @@ func (h *HookHandler) Create(w http.ResponseWriter, r *http.Request) {
 // @Param hid path string true "Hook ID"
 // @Success 200 {object} apidocs.HookData
 // @Failure 404 {object} apidocs.ErrorBody
-// @Router /hooks/{hid} [get]
+// @Router /hooks/{hid} [get].
 func (h *HookHandler) Get(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	hook, err := h.hookRepo.FindByID(r.Context(), hid)
@@ -95,7 +95,7 @@ func (h *HookHandler) Get(w http.ResponseWriter, r *http.Request) {
 // @Failure 400 {object} apidocs.ErrorBody
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /hooks/{hid} [put]
+// @Router /hooks/{hid} [put].
 func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	if _, err := h.hookRepo.FindByID(r.Context(), hid); err != nil {
@@ -122,7 +122,7 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 // @Param hid path string true "Hook ID"
 // @Success 204 "No Content"
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /hooks/{hid} [delete]
+// @Router /hooks/{hid} [delete].
 func (h *HookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	if err := h.hookRepo.Delete(r.Context(), hid); err != nil {
@@ -141,7 +141,7 @@ func (h *HookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // @Failure 400 {object} apidocs.ErrorBody
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 502 {object} apidocs.ErrorBody
-// @Router /hooks/{hid}/test [post]
+// @Router /hooks/{hid}/test [post].
 func (h *HookHandler) Test(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	if err := h.hooks.DeliverTestEvent(r.Context(), hid); err != nil {

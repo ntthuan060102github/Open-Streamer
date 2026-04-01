@@ -50,7 +50,8 @@ func (s *RTMPServer) ListenAndServe(ctx context.Context) error {
 		addr = ":1935"
 	}
 
-	ln, err := net.Listen("tcp", addr)
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("rtmp server: listen %s: %w", addr, err)
 	}
@@ -59,14 +60,14 @@ func (s *RTMPServer) ListenAndServe(ctx context.Context) error {
 
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return nil //nolint:nilerr // clean shutdown while listener is closing
 			}
 			slog.Error("rtmp server: accept error", "err", err)
 			continue
@@ -76,11 +77,11 @@ func (s *RTMPServer) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	session := &rtmpSession{
-		conn:     conn,
-		registry: s.registry,
+		conn:      conn,
+		registry:  s.registry,
 		serverCtx: ctx,
 	}
 	session.run()
@@ -88,17 +89,16 @@ func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
 
 // rtmpSession manages one RTMP connection using gomedia's RtmpServerHandle.
 type rtmpSession struct {
-	conn      net.Conn
-	registry  Registry
-	serverCtx context.Context
-
-	handle   *gortmp.RtmpServerHandle
-	mux      *gompeg2.TSMuxer
-	mu       sync.Mutex
-	videoPid uint16
-	audioPid uint16
-	hasVideo bool
-	hasAudio bool
+	conn          net.Conn
+	registry      Registry
+	serverCtx     context.Context
+	handle        *gortmp.RtmpServerHandle
+	mux           *gompeg2.TSMuxer
+	mu            sync.Mutex
+	videoPid      uint16
+	audioPid      uint16
+	hasVideo      bool
+	hasAudio      bool
 	streamID      domain.StreamCode // logical stream (logs)
 	bufferWriteID domain.StreamCode // buf.Write target
 	buf           *buffer.Service
@@ -123,7 +123,7 @@ func (s *rtmpSession) run() {
 		return err
 	})
 
-	s.handle.OnPublish(func(app, streamName string) gortmp.StatusCode {
+	s.handle.OnPublish(func(_, streamName string) gortmp.StatusCode {
 		writeID, streamID, buf, err := s.registry.Lookup(streamName)
 		if err != nil {
 			slog.Warn("rtmp: rejected unknown stream key", "key", streamName)
@@ -141,7 +141,7 @@ func (s *rtmpSession) run() {
 	s.handle.OnFrame(func(cid gocodec.CodecID, pts, dts uint32, frame []byte) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		switch cid {
+		switch cid { //nolint:exhaustive // push path muxes H264/H265/AAC only
 		case gocodec.CODECID_VIDEO_H264:
 			if !s.hasVideo {
 				s.videoPid = s.mux.AddStream(gompeg2.TS_STREAM_H264)

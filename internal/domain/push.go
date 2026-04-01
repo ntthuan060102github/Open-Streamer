@@ -3,13 +3,14 @@ package domain
 // PushStatus is the runtime state of a push destination.
 type PushStatus string
 
+// PushStatus values describe outbound publisher connectivity.
 const (
-	PushStatusIdle        PushStatus = "idle"
-	PushStatusConnecting  PushStatus = "connecting"
-	PushStatusActive      PushStatus = "active"
-	PushStatusRetrying    PushStatus = "retrying"
-	PushStatusFailed      PushStatus = "failed"
-	PushStatusDisabled    PushStatus = "disabled"
+	PushStatusIdle       PushStatus = "idle"
+	PushStatusConnecting PushStatus = "connecting"
+	PushStatusActive     PushStatus = "active"
+	PushStatusRetrying   PushStatus = "retrying"
+	PushStatusFailed     PushStatus = "failed"
+	PushStatusDisabled   PushStatus = "disabled"
 )
 
 // PushDestination is an external endpoint the server actively pushes the stream to.

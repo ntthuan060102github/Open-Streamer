@@ -8,6 +8,7 @@ type RecordingID string
 // RecordingStatus represents the lifecycle state of a recording.
 type RecordingStatus string
 
+// RecordingStatus values describe DVR recording lifecycle.
 const (
 	RecordingStatusRecording RecordingStatus = "recording"
 	RecordingStatusStopped   RecordingStatus = "stopped"
@@ -25,12 +26,12 @@ type Segment struct {
 
 // Recording represents a DVR recording session for a stream.
 type Recording struct {
-	ID         RecordingID `json:"id"`
-	StreamCode StreamCode  `json:"stream_code"`
-	StartedAt time.Time       `json:"started_at"`
-	StoppedAt *time.Time      `json:"stopped_at,omitempty"`
-	Status    RecordingStatus `json:"status"`
-	Segments  []Segment       `json:"segments"`
+	ID         RecordingID     `json:"id"`
+	StreamCode StreamCode      `json:"stream_code"`
+	StartedAt  time.Time       `json:"started_at"`
+	StoppedAt  *time.Time      `json:"stopped_at,omitempty"`
+	Status     RecordingStatus `json:"status"`
+	Segments   []Segment       `json:"segments"`
 
 	// TotalSizeBytes is the sum of all segment sizes. Updated as segments are flushed.
 	TotalSizeBytes int64 `json:"total_size_bytes"`

@@ -137,7 +137,7 @@ type dashABRVRep struct {
 
 func writeDashABRRootMPD(
 	rootPath string,
-	streamID domain.StreamCode,
+	_ domain.StreamCode,
 	availabilityStart time.Time,
 	segSec, window int,
 	vreps []dashABRVRep,

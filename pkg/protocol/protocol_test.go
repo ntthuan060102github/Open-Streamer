@@ -96,7 +96,7 @@ func TestIsMPEGTS(t *testing.T) {
 	t.Parallel()
 
 	syncByte := byte(0x47)
-	pkt188 := make([]byte, 188)
+	pkt188 := make([]byte, 188) //nolint:prealloc // fixed 188-byte TS packet for table-driven cases
 	pkt188[0] = syncByte
 
 	tests := []struct {

@@ -42,6 +42,7 @@ func (s *Service) serveRTMP(ctx context.Context, streamID domain.StreamCode) {
 			"listen_addr", addr,
 			"client_hint", fmt.Sprintf("rtmp://<this-host>:%d/live/<stream_code>", port),
 		)
+		//nolint:contextcheck // shared listener outlives any single stream ctx
 		go s.rtmpAcceptLoop(ln)
 	}
 	s.rtmpActive[streamID] = struct{}{}
@@ -81,6 +82,7 @@ func (s *Service) rtmpAcceptLoop(ln net.Listener) {
 }
 
 func (s *Service) handleRTMPPlayConn(conn net.Conn) {
+	//nolint:contextcheck // per-connection cancel; not tied to a single stream lifecycle
 	connCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer func() { _ = conn.Close() }()
@@ -143,6 +145,7 @@ func (s *Service) handleRTMPPlayConn(conn net.Conn) {
 		if !has {
 			return
 		}
+		//nolint:contextcheck // pump follows stream work ctx from publisher, not the TCP conn ctx
 		s.runRTMPMediaPump(wctx, code, handle)
 	}()
 

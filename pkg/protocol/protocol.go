@@ -11,15 +11,16 @@ import (
 // the ingestor to choose the right reader implementation.
 type Kind string
 
+// Kind constants classify ingest URLs; see Detect.
 const (
-	KindUDP     Kind = "udp"    // raw MPEG-TS over UDP (unicast or multicast)
-	KindHLS     Kind = "hls"    // HLS playlist pull over HTTP/HTTPS
-	KindHTTP    Kind = "http"   // raw byte-stream over HTTP/HTTPS (e.g. MPEG-TS over HTTP)
-	KindFile    Kind = "file"   // local filesystem path
-	KindRTMP    Kind = "rtmp"   // RTMP / RTMPS (pull or push-listen)
-	KindRTSP    Kind = "rtsp"   // RTSP pull
-	KindSRT     Kind = "srt"    // SRT (pull caller or push listener)
-	KindS3      Kind = "s3"     // AWS S3 / S3-compatible object (MinIO, etc.)
+	KindUDP     Kind = "udp"  // raw MPEG-TS over UDP (unicast or multicast)
+	KindHLS     Kind = "hls"  // HLS playlist pull over HTTP/HTTPS
+	KindHTTP    Kind = "http" // raw byte-stream over HTTP/HTTPS (e.g. MPEG-TS over HTTP)
+	KindFile    Kind = "file" // local filesystem path
+	KindRTMP    Kind = "rtmp" // RTMP / RTMPS (pull or push-listen)
+	KindRTSP    Kind = "rtsp" // RTSP pull
+	KindSRT     Kind = "srt"  // SRT (pull caller or push listener)
+	KindS3      Kind = "s3"   // AWS S3 / S3-compatible object (MinIO, etc.)
 	KindUnknown Kind = "unknown"
 )
 

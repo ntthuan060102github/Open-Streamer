@@ -36,6 +36,7 @@ type Metrics struct {
 
 // New registers all metrics and returns a Metrics instance.
 func New(i do.Injector) (*Metrics, error) {
+	_ = i // injector reserved for future wiring
 	m := &Metrics{
 		IngestorBytesTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "open_streamer_ingestor_bytes_total",

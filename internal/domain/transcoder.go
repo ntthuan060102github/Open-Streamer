@@ -20,6 +20,7 @@ const (
 // HWAccel selects the hardware acceleration backend for encoding/decoding.
 type HWAccel string
 
+// HWAccel values map to FFmpeg hardware device options.
 const (
 	HWAccelNone         HWAccel = "none"         // CPU only (libx264, libx265)
 	HWAccelNVENC        HWAccel = "nvenc"        // NVIDIA GPU (h264_nvenc, hevc_nvenc)
@@ -31,6 +32,7 @@ const (
 // VideoCodec identifies the video compression format.
 type VideoCodec string
 
+// VideoCodec values name supported output video codecs.
 const (
 	VideoCodecH264 VideoCodec = "h264" // AVC — widest device support
 	VideoCodecH265 VideoCodec = "h265" // HEVC — ~50% smaller than H.264
@@ -42,6 +44,7 @@ const (
 // AudioCodec identifies the audio compression format.
 type AudioCodec string
 
+// AudioCodec values name supported output audio codecs.
 const (
 	AudioCodecAAC  AudioCodec = "aac"  // default for HLS/DASH
 	AudioCodecMP3  AudioCodec = "mp3"  // legacy compatibility

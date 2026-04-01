@@ -132,9 +132,11 @@ func startAll(ctx context.Context, i *do.RootScope) error {
 
 	slog.Info("server: shutdown complete")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	i.ShutdownWithContext(shutdownCtx)
+	if err := i.ShutdownWithContext(shutdownCtx); err != nil {
+		slog.Warn("server: injector shutdown", "err", err)
+	}
 
 	return nil
 }

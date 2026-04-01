@@ -51,7 +51,8 @@ func TestTsPacketBufFeedJunkBeforeSync(t *testing.T) {
 	t.Parallel()
 	var b tsPacketBuf
 	p := tsPacket(9)
-	prefix := []byte{0x00, 0x11, 0x22}
+	prefix := make([]byte, 0, 3+len(p))
+	prefix = append(prefix, 0x00, 0x11, 0x22)
 	out := b.Feed(append(prefix, p...))
 	require.Len(t, out, 1)
 	require.Equal(t, p, out[0])

@@ -31,7 +31,7 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 	}, nil
 }
 
-// List streams, optional ?status=idle|active|degraded|stopped.
+// List streams; optional ?status=idle|active|degraded|stopped.
 // @Summary List streams
 // @Tags streams
 // @Produce json
@@ -39,7 +39,7 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 // @Success 200 {object} apidocs.StreamList
 // @Failure 400 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams [get]
+// @Router /streams [get].
 func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 	filter := store.StreamFilter{}
 	if q := r.URL.Query().Get("status"); q != "" {
@@ -69,7 +69,7 @@ func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} apidocs.StreamData
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code} [get]
+// @Router /streams/{code} [get].
 func (h *StreamHandler) Get(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)
@@ -91,7 +91,7 @@ func (h *StreamHandler) Get(w http.ResponseWriter, r *http.Request) {
 // @Success 201 {object} apidocs.StreamData
 // @Failure 400 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code} [put]
+// @Router /streams/{code} [put].
 func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	cur, exists, err := h.loadCurrentStream(r, code)
@@ -194,7 +194,7 @@ func decodeStreamPutBody(
 // @Param code path string true "Stream code"
 // @Success 204 "No Content"
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code} [delete]
+// @Router /streams/{code} [delete].
 func (h *StreamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	h.coordinator.Stop(code)
@@ -213,7 +213,7 @@ func (h *StreamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} apidocs.StreamActionData
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/start [post]
+// @Router /streams/{code}/start [post].
 func (h *StreamHandler) Start(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)
@@ -241,7 +241,7 @@ func (h *StreamHandler) Start(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} apidocs.StreamActionData
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/stop [post]
+// @Router /streams/{code}/stop [post].
 func (h *StreamHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)
@@ -267,7 +267,7 @@ func (h *StreamHandler) Stop(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} apidocs.StreamStatusData
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/status [get]
+// @Router /streams/{code}/status [get].
 func (h *StreamHandler) Status(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)

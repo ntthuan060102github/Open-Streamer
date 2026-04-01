@@ -128,7 +128,7 @@ func (s *Service) Probe(ctx context.Context, input domain.Input) error {
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	if err := reader.Open(ctx); err != nil {
 		return err
@@ -188,6 +188,7 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 		s.mu.Unlock()
 		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, observer, errObserver)
 		cancel()
+		//nolint:contextcheck // worker ctx is cancelled; publish must outlive it for hooks/manager.
 		s.bus.Publish(context.Background(), domain.Event{
 			Type:       domain.EventInputFailed,
 			StreamCode: streamID,
@@ -216,7 +217,7 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 
 // pushStreamKey extracts the routing key from the last path segment of the URL.
 //
-// Example: rtmp://0.0.0.0:1935/live/myshow → "myshow"
+// Example: rtmp://0.0.0.0:1935/live/myshow → "myshow".
 func pushStreamKey(input domain.Input) string {
 	url := strings.TrimRight(input.URL, "/")
 	if idx := strings.LastIndex(url, "/"); idx >= 0 {

@@ -116,9 +116,11 @@ func (s *Server) buildRouter(
 func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		_ = s.http.Shutdown(shutCtx)
+		if err := s.http.Shutdown(shutCtx); err != nil {
+			slog.Warn("api: HTTP shutdown", "err", err)
+		}
 	}()
 
 	slog.Info("api: HTTP server listening", "addr", s.cfg.HTTPAddr)
@@ -133,7 +135,7 @@ func (s *Server) Start(ctx context.Context) error {
 // @Description Returns 200 if the process is up.
 // @Tags system
 // @Success 200 {string} string "ok"
-// @Router /healthz [get]
+// @Router /healthz [get].
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
@@ -144,7 +146,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 // @Description Returns 200 when the server accepts traffic (basic check).
 // @Tags system
 // @Success 200 {string} string "ok"
-// @Router /readyz [get]
+// @Router /readyz [get].
 func readyz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))

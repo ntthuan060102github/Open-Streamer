@@ -1,3 +1,4 @@
+// Package config holds the root configuration struct and Viper-based loading.
 package config
 
 import (

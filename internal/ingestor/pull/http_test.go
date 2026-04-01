@@ -18,7 +18,7 @@ func TestHTTPReader_ReadsBody(t *testing.T) {
 	t.Parallel()
 
 	want := []byte("raw-mpeg-ts-bytes-from-http-stream")
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write(want) //nolint:errcheck
 	}))
@@ -26,7 +26,7 @@ func TestHTTPReader_ReadsBody(t *testing.T) {
 
 	r := pull.NewHTTPReader(domain.Input{URL: srv.URL})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	got := readAll(t, r)
 	assert.Equal(t, want, got)
@@ -54,7 +54,7 @@ func TestHTTPReader_BasicAuth(t *testing.T) {
 		},
 	})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	got := readAll(t, r)
 	assert.Equal(t, []byte("authenticated"), got)
@@ -63,7 +63,7 @@ func TestHTTPReader_BasicAuth(t *testing.T) {
 func TestHTTPReader_Non200_ReturnsError(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
 	defer srv.Close()
@@ -85,7 +85,7 @@ func TestHTTPReader_ConnectFails_ReturnsError(t *testing.T) {
 func TestHTTPReader_ContextCancelledBeforeOpen(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("data")) //nolint:errcheck
 	}))
 	defer srv.Close()
@@ -101,14 +101,14 @@ func TestHTTPReader_ContextCancelledBeforeOpen(t *testing.T) {
 func TestHTTPReader_ReturnsEOFAtEnd(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("small")) //nolint:errcheck
 	}))
 	defer srv.Close()
 
 	r := pull.NewHTTPReader(domain.Input{URL: srv.URL})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	// Drain until EOF.
 	var lastErr error

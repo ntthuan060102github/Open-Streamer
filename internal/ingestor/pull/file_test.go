@@ -27,7 +27,7 @@ func TestFileReader_ReadsFile(t *testing.T) {
 
 	r := pull.NewFileReader(domain.Input{URL: "file://" + f})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	got := readAll(t, r)
 	assert.Equal(t, want, got)
@@ -41,7 +41,7 @@ func TestFileReader_BarePath(t *testing.T) {
 
 	r := pull.NewFileReader(domain.Input{URL: f}) // no file:// prefix
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	assert.Equal(t, want, readAll(t, r))
 }
@@ -67,7 +67,7 @@ func TestFileReader_ReturnsEOFAtEnd(t *testing.T) {
 	f := writeTempFile(t, []byte("data"))
 	r := pull.NewFileReader(domain.Input{URL: f})
 	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	// Drain all data.
 	for {
