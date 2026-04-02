@@ -18,7 +18,9 @@ const (
 	reconnectMaxDelay  = 10 * time.Second
 )
 
-var httpStatusPattern = regexp.MustCompile(`\bhttp (\d{3})\b`)
+// httpStatusPattern matches HTTP status codes in error strings, case-insensitively,
+// to cover both "HTTP 404" (typical ingestor errors) and "http 404".
+var httpStatusPattern = regexp.MustCompile(`(?i)\bhttp (\d{3})\b`)
 
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.
 // It reconnects automatically after transient failures using exponential backoff.
@@ -72,12 +74,16 @@ func runPullWorker(
 		}
 
 		if errors.Is(readErr, io.EOF) {
-			// Graceful end of source (e.g. file finished).
-			// For files configured to loop, the reader itself handles it.
+			// Source ended cleanly (file finished, live stream closed by server).
+			// Notify the manager so it can immediately failover to a backup input
+			// rather than waiting for the packet-timeout to expire.
 			slog.Info("ingestor: source ended (EOF)",
 				"stream_code", streamID,
 				"input_priority", input.Priority,
 			)
+			if onInputError != nil {
+				onInputError(streamID, input.Priority, io.EOF)
+			}
 			return
 		}
 
@@ -106,6 +112,8 @@ func runPullWorker(
 }
 
 // readLoop reads from reader until error or ctx cancellation.
+// The first packet written in each call is marked Discontinuity=true so that
+// downstream consumers (HLS, DASH packager) know the source has just switched.
 func readLoop(
 	ctx context.Context,
 	streamID domain.StreamCode,
@@ -115,6 +123,7 @@ func readLoop(
 	buf *buffer.Service,
 	onPacket func(streamID domain.StreamCode, inputPriority int),
 ) error {
+	firstPacket := true
 	for {
 		batch, err := r.ReadPackets(ctx)
 		if err != nil {
@@ -125,6 +134,10 @@ func readLoop(
 				continue
 			}
 			cl := p.Clone()
+			if firstPacket {
+				cl.Discontinuity = true
+				firstPacket = false
+			}
 			if writeErr := buf.Write(bufferWriteID, buffer.Packet{AV: cl}); writeErr != nil {
 				slog.Error("ingestor: buffer write failed",
 					"stream_code", streamID,

@@ -21,6 +21,7 @@ package pull
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,6 +54,33 @@ const (
 	m3u8TagExtInf     = "#EXTINF:"
 	m3u8TagStreamInf  = "#EXT-X-STREAM-INF:"
 )
+
+// ─── HTTP error type ─────────────────────────────────────────────────────────
+
+// httpStatusErr captures a non-2xx HTTP response.
+// Permanent errors (4xx client errors that cannot be resolved by retrying)
+// short-circuit the retry loop so that failover is triggered immediately.
+type httpStatusErr struct {
+	url  string
+	code int
+}
+
+func (e *httpStatusErr) Error() string {
+	return fmt.Sprintf("hls: GET %q: HTTP %d", e.url, e.code)
+}
+
+// isPermanent returns true for codes that signal the resource is permanently
+// unavailable and will never succeed on retry (auth failure, not-found, gone).
+func (e *httpStatusErr) isPermanent() bool {
+	switch e.code {
+	case http.StatusUnauthorized, // 401
+		http.StatusForbidden, // 403
+		http.StatusNotFound,  // 404
+		http.StatusGone:      // 410
+		return true
+	}
+	return false
+}
 
 // ─── Result channel type ────────────────────────────────────────────────────
 
@@ -276,6 +304,12 @@ func (r *HLSReader) fetchPlaylistWithRetry(ctx context.Context, mediaURL *string
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			// Permanent HTTP errors (401, 403, 404, 410) will not recover on retry;
+			// fail immediately so the caller can trigger failover without delay.
+			var he *httpStatusErr
+			if errors.As(err, &he) && he.isPermanent() {
+				return nil, err
+			}
 			lastErr = err
 			slog.Warn("hls: playlist fetch failed, retrying",
 				"url", *mediaURL, "attempt", attempt+1, "err", err)
@@ -329,7 +363,7 @@ func (r *HLSReader) fetchPlaylistOnce(ctx context.Context, playlistURL string) (
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hls: GET %q: HTTP %d", playlistURL, resp.StatusCode)
+		return nil, &httpStatusErr{url: playlistURL, code: resp.StatusCode}
 	}
 
 	base, _ := url.Parse(playlistURL)
@@ -375,7 +409,7 @@ func (r *HLSReader) fetchSegmentOnce(ctx context.Context, segURL string) ([]byte
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hls: segment %q: HTTP %d", segURL, resp.StatusCode)
+		return nil, &httpStatusErr{url: segURL, code: resp.StatusCode}
 	}
 	return io.ReadAll(resp.Body)
 }

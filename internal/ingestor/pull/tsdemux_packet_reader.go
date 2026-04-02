@@ -22,6 +22,7 @@ package pull
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"sync"
 
@@ -80,6 +81,12 @@ type TSDemuxPacketReader struct {
 	q      chan domain.AVPacket // decoded packets ready for ReadPackets
 	done   chan struct{}        // closed by Close to unblock pumpChunks and OnFrame
 
+	// readErr holds the first non-EOF, non-cancellation error returned by the
+	// underlying TSChunkReader.  It is written once by pumpChunks (before
+	// close(chunks)) and read by ReadPackets (after q closes).  The happens-before
+	// chain through channel close operations makes this access race-free.
+	readErr error
+
 	readLoopDone chan struct{}
 	demuxDone    chan struct{}
 }
@@ -115,6 +122,8 @@ func (d *TSDemuxPacketReader) Open(ctx context.Context) error {
 
 // pumpChunks reads raw TS chunks from the source and forwards them to chanReader via chunks.
 // It exits when the source is exhausted, the context is cancelled, or Close is called.
+// Real (non-EOF, non-cancellation) errors are stored in d.readErr before the channel
+// closes, so ReadPackets can propagate them to the caller.
 func (d *TSDemuxPacketReader) pumpChunks(ctx context.Context) {
 	defer close(d.readLoopDone)
 	defer close(d.chunks) // EOF signal for chanReader → demux.Input returns
@@ -132,8 +141,24 @@ func (d *TSDemuxPacketReader) pumpChunks(ctx context.Context) {
 			}
 		}
 		if rerr != nil {
+			d.captureReadErr(rerr, ctx)
 			return
 		}
+	}
+}
+
+// captureReadErr stores err in d.readErr when it represents a genuine source failure:
+// not a clean EOF, not a context cancellation, and not triggered by Close().
+func (d *TSDemuxPacketReader) captureReadErr(err error, ctx context.Context) {
+	if errors.Is(err, io.EOF) || ctx.Err() != nil {
+		return
+	}
+	select {
+	case <-d.done:
+		// Close() was called concurrently; suppress to avoid confusing callers
+		// with a spurious "connection closed" from d.r.Close().
+	default:
+		d.readErr = err
 	}
 }
 
@@ -209,6 +234,11 @@ func (d *TSDemuxPacketReader) ReadPackets(ctx context.Context) ([]domain.AVPacke
 		return nil, ctx.Err()
 	case p, ok := <-q:
 		if !ok {
+			// Prefer the real source error over a generic EOF so the caller
+			// (runPullWorker) can distinguish "clean end" from "source failed".
+			if d.readErr != nil {
+				return nil, d.readErr
+			}
 			return nil, io.EOF
 		}
 		batch := []domain.AVPacket{p}

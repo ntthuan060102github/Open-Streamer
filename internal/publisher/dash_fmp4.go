@@ -195,6 +195,13 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 				if !ok {
 					return
 				}
+				// On source switch the TS muxer will reset, producing a fresh stream
+				// from timestamp 0.  Any bytes in tsCarry belong to the previous source;
+				// discard them so the pipe never receives a hybrid 188-byte packet that
+				// mixes data from two independent TS streams.
+				if pkt.AV != nil && pkt.AV.Discontinuity {
+					tsCarry = tsCarry[:0]
+				}
 				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
 					tsCarry = append(tsCarry, b...)
 					for len(tsCarry) >= 188 {
@@ -305,6 +312,14 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		if len(frame) == 0 {
 			return
 		}
+		// Detect source switch: timestamps should be monotonically increasing.
+		// A backward jump of more than 1 second means a new source started.
+		// Flush accumulated frames from the old source before mixing in new ones;
+		// this prevents uint64 underflow in duration computation inside
+		// writeVideoSegmentLocked that would produce astronomically large samples.
+		if len(p.vDTS) > 0 && dts+1000 < p.vDTS[len(p.vDTS)-1] {
+			_ = p.flushSegmentLocked()
+		}
 		cp := append([]byte(nil), frame...)
 		p.vAnnex = append(p.vAnnex, cp)
 		p.vDTS = append(p.vDTS, dts)
@@ -329,6 +344,11 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 	case mpeg2.TS_STREAM_AAC:
 		if !p.packAudio {
 			return
+		}
+		// Same backward-jump guard as for video: flush before mixing frames
+		// from two different sources in the audio queue.
+		if len(p.aPTS) > 0 && pts+1000 < p.aPTS[len(p.aPTS)-1] {
+			_ = p.flushSegmentLocked()
 		}
 		// A PES payload may contain multiple concatenated ADTS frames.
 		pos := 0
