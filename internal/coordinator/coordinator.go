@@ -79,7 +79,7 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 	}
 
 	if shouldRunTranscoder(stream) {
-		profiles := transcoderProfilesFromDomain(stream.Transcoder.Video.Profiles)
+		profiles := transcoderProfilesFromDomain(&stream.Transcoder.Video)
 		rawID := buffer.RawIngestBufferID(stream.Code)
 		var slugs []string
 		targets := make([]transcoder.RenditionTarget, 0, len(profiles))
@@ -165,12 +165,19 @@ func shouldRunTranscoder(stream *domain.Stream) bool {
 	return !stream.Transcoder.Global.External
 }
 
-func transcoderProfilesFromDomain(profiles []domain.VideoProfile) []transcoder.Profile {
-	if len(profiles) == 0 {
-		return transcoder.DefaultProfiles
+// transcoderProfilesFromDomain maps stream video settings to FFmpeg ladder profiles.
+// When video.copy is true or profiles is empty, returns a single passthrough profile
+// (mpegts copy — one worker, no ABR). Explicit non-empty profiles with copy false
+// build a multi-rendition encode ladder.
+func transcoderProfilesFromDomain(video *domain.VideoTranscodeConfig) []transcoder.Profile {
+	if video == nil {
+		return singleOriginCopyProfile()
 	}
-	out := make([]transcoder.Profile, 0, len(profiles))
-	for _, p := range profiles {
+	if video.Copy || len(video.Profiles) == 0 {
+		return singleOriginCopyProfile()
+	}
+	out := make([]transcoder.Profile, 0, len(video.Profiles))
+	for _, p := range video.Profiles {
 		codec := string(p.Codec)
 		if codec == "" || codec == string(domain.VideoCodecCopy) {
 			codec = "libx264"
@@ -197,4 +204,14 @@ func transcoderProfilesFromDomain(profiles []domain.VideoProfile) []transcoder.P
 		})
 	}
 	return out
+}
+
+func singleOriginCopyProfile() []transcoder.Profile {
+	return []transcoder.Profile{{
+		Width:   0,
+		Height:  0,
+		Bitrate: "2500k",
+		Codec:   "libx264",
+		Preset:  "fast",
+	}}
 }

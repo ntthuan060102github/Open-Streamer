@@ -8,12 +8,51 @@
     "status": "idle",
     "inputs": [
       {
-        "url": "publish://",
+        "url": "http://10.241.1.100/test1/index.m3u8",
         "priority": 0,
         "net": {}
       }
     ],
-    "transcoder": null,
+    "transcoder": {
+      "video": {
+        "copy": false,
+        "profiles": [
+          {
+            "width": 1280,
+            "height": 720,
+            "bitrate": 2500,
+            "keyframe_interval": 4,
+            "codec": "h264",
+            "preset": "veryfast",
+            "profile": "main",
+            "level": "4.0"
+          },
+          {
+            "width": 854,
+            "height": 480,
+            "bitrate": 1000,
+            "keyframe_interval": 4,
+            "codec": "h264",
+            "preset": "veryfast",
+            "profile": "main",
+            "level": "3.1"
+          }
+        ]
+      },
+      "audio": {
+        "copy": true
+      },
+      "decoder": {
+        "name": ""
+      },
+      "global": {
+        "external": false,
+        "hw": "none",
+        "fps": 25,
+        "gop": 0,
+        "deviceid": 0
+      }
+    },
     "protocols": {
       "hls": true,
       "dash": true

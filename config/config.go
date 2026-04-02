@@ -242,16 +242,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("publisher.hls.dir", "./hls")
 	v.SetDefault("publisher.hls.base_url", "http://localhost:8080/hls")
 	v.SetDefault("publisher.hls.live_ephemeral", true)
-	v.SetDefault("publisher.hls.live_segment_sec", 2)
-	v.SetDefault("publisher.hls.live_window", 24)
-	// History: segments kept after leaving the playlist; large enough for slow clients / transient write errors.
-	v.SetDefault("publisher.hls.live_history", 48)
+	v.SetDefault("publisher.hls.live_segment_sec", 4)
+	v.SetDefault("publisher.hls.live_window", 10)
+	v.SetDefault("publisher.hls.live_history", 20)
 
 	v.SetDefault("publisher.dash.dir", "./dash")
 	v.SetDefault("publisher.dash.live_ephemeral", true)
-	v.SetDefault("publisher.dash.live_segment_sec", 2)
-	v.SetDefault("publisher.dash.live_window", 24)
-	v.SetDefault("publisher.dash.live_history", 48)
+	v.SetDefault("publisher.dash.live_segment_sec", 4)
+	v.SetDefault("publisher.dash.live_window", 10)
+	v.SetDefault("publisher.dash.live_history", 20)
 
 	v.SetDefault("publisher.rtsp.listen_host", defaultPublisherListenHost)
 	v.SetDefault("publisher.rtsp.port_min", 18554)

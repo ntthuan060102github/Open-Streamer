@@ -44,6 +44,11 @@ func (s *Service) runProfileEncoder(
 	defer s.buf.Unsubscribe(rawIngestID, sub)
 
 	cmd := exec.CommandContext(ctx, s.cfg.FFmpegPath, args...)
+	slog.Info("transcoder: ffmpeg command",
+		"stream_code", logStream,
+		"profile", track,
+		"cmd", cmd.String(),
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		slog.Error("transcoder: stdin pipe failed", "stream_code", logStream, "profile", track, "err", err)

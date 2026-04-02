@@ -1,5 +1,6 @@
 // Package transcoder manages a bounded pool of FFmpeg worker processes.
-// Each stream may run one FFmpeg process per ladder profile (ABR); all read the same raw ingest.
+// Each stream may run one FFmpeg process per ladder rung (passthrough copy or ABR encode);
+// all read the same raw ingest.
 // GPU acceleration (NVENC) is used when configured on profiles / global HW.
 package transcoder
 
@@ -31,13 +32,6 @@ type Profile struct {
 	MaxBitrate       int    // kbps peak (0 = omit -maxrate)
 	Framerate        float64
 	KeyframeInterval int // GOP target in seconds (0 = encoder default)
-}
-
-// DefaultProfiles are the standard ABR output renditions (CPU libx264 for broad portability).
-var DefaultProfiles = []Profile{
-	{Width: 1920, Height: 1080, Bitrate: "5000k", Codec: "libx264", Preset: "fast"},
-	{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "libx264", Preset: "fast"},
-	{Width: 854, Height: 480, Bitrate: "1000k", Codec: "libx264", Preset: "fast"},
 }
 
 // worker is a logical transcoding job for one stream (may spawn multiple FFmpeg processes).

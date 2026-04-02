@@ -27,16 +27,24 @@ type RenditionPlayout struct {
 }
 
 // RenditionsForTranscoder returns ladder entries when transcoding is active (non-external).
+// When video.copy is true or video.profiles is empty, a single passthrough rendition
+// is returned (one worker: copy from raw ingest, no ABR ladder).
 func RenditionsForTranscoder(code domain.StreamCode, tc *domain.TranscoderConfig) []RenditionPlayout {
 	if tc == nil || tc.Global.External {
 		return nil
 	}
-	profiles := tc.Video.Profiles
-	if len(profiles) == 0 {
-		profiles = defaultVideoProfilesForABR()
+	if tc.Video.Copy || len(tc.Video.Profiles) == 0 {
+		slug := VideoTrackSlug(0)
+		return []RenditionPlayout{{
+			Slug:        slug,
+			BufferID:    RenditionBufferID(code, slug),
+			Width:       0,
+			Height:      0,
+			BitrateKbps: 0,
+		}}
 	}
-	out := make([]RenditionPlayout, 0, len(profiles))
-	for i, p := range profiles {
+	out := make([]RenditionPlayout, 0, len(tc.Video.Profiles))
+	for i, p := range tc.Video.Profiles {
 		slug := VideoTrackSlug(i)
 		br := p.Bitrate
 		if br <= 0 {
@@ -51,14 +59,6 @@ func RenditionsForTranscoder(code domain.StreamCode, tc *domain.TranscoderConfig
 		})
 	}
 	return out
-}
-
-func defaultVideoProfilesForABR() []domain.VideoProfile {
-	return []domain.VideoProfile{
-		{Width: 1920, Height: 1080, Bitrate: 5000},
-		{Width: 1280, Height: 720, Bitrate: 2500},
-		{Width: 854, Height: 480, Bitrate: 1000},
-	}
 }
 
 // BestRenditionIndex picks the highest resolution (then bitrate) for single-bitrate protocols.
