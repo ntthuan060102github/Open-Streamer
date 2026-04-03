@@ -8,7 +8,7 @@
     "status": "idle",
     "inputs": [
       {
-        "url": "http://10.241.1.100/test1/index.m3u8",
+        "url": "publish://",
         "priority": 0,
         "net": {}
       }
@@ -54,7 +54,8 @@
       }
     },
     "protocols": {
-      "hls": true
+      "hls": true,
+      "dash": true
     },
     "push": [
       {

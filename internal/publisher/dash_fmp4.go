@@ -179,11 +179,15 @@ type dashFMP4Packager struct {
 
 // run is the main goroutine: wires the TS pipe, demuxer, and flush ticker.
 func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
-	pr, pw := io.Pipe()
+	// tb is a buffered pipe: Write never blocks, Read blocks only when empty.
+	// This replaces io.Pipe (unbuffered) which caused the producer goroutine to
+	// block on Write while the demuxer held p.mu in onTSFrame, preventing the
+	// producer from reading new packets; the buffer hub then dropped them.
+	tb := newTSBuffer()
 
-	// Producer: buffer → FeedWirePacket → aligned TS → pw.
+	// Producer: buffer → FeedWirePacket → aligned TS → tb.
 	go func() {
-		defer func() { _ = pw.Close() }()
+		defer tb.Close()
 		var tsCarry []byte
 		var avMux *tsmux.FromAV
 
@@ -222,7 +226,7 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 							tsCarry = tsCarry[1:]
 							continue
 						}
-						if _, err := pw.Write(tsCarry[:188]); err != nil {
+						if _, err := tb.Write(tsCarry[:188]); err != nil {
 							return
 						}
 						tsCarry = tsCarry[188:]
@@ -232,13 +236,13 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 		}
 	}()
 
-	// Demuxer: pr → onTSFrame (H.264 AUs and AAC ADTS frames).
+	// Demuxer: tb → onTSFrame (H.264 AUs and AAC ADTS frames).
 	demux := mpeg2.NewTSDemuxer()
 	demux.OnFrame = p.onTSFrame
 
 	demuxDone := make(chan error, 1)
 	go func() {
-		demuxDone <- demux.Input(pr)
+		demuxDone <- demux.Input(tb)
 	}()
 
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -249,7 +253,7 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 	for {
 		select {
 		case <-ctx.Done():
-			_ = pr.Close()
+			tb.Close()
 			<-demuxDone
 			p.mu.Lock()
 			_ = p.flushSegmentLocked()
@@ -788,6 +792,65 @@ func encodeInitToFile(path string, init *mp4.InitSegment) error {
 		return err
 	}
 	return writeFileAtomic(path, buf.Bytes())
+}
+
+// tsBuffer is a goroutine-safe, unbounded byte buffer implementing io.Reader and
+// io.Writer. Unlike io.Pipe, Write never blocks; Read blocks only when the buffer
+// is empty, and returns io.EOF once the buffer is closed and drained.
+//
+// This is used to decouple the packet-producer goroutine from the TS demuxer
+// goroutine. With io.Pipe, a slow demuxer (holding p.mu in onTSFrame) would
+// block the producer's Write, preventing it from reading new packets; the buffer
+// hub then drops them with the "slow consumer" path, starving the segment queue.
+type tsBuffer struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	buf  []byte
+	done bool
+}
+
+func newTSBuffer() *tsBuffer {
+	b := &tsBuffer{}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+// Write appends p to the internal buffer and wakes any blocked Read. Never blocks.
+func (b *tsBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	if b.done {
+		b.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	b.buf = append(b.buf, p...)
+	b.cond.Signal()
+	b.mu.Unlock()
+	return len(p), nil
+}
+
+// Read fills p from the internal buffer, blocking until data is available or
+// the buffer is closed.
+func (b *tsBuffer) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	for len(b.buf) == 0 && !b.done {
+		b.cond.Wait()
+	}
+	if len(b.buf) == 0 {
+		b.mu.Unlock()
+		return 0, io.EOF
+	}
+	n := copy(p, b.buf)
+	b.buf = b.buf[n:]
+	b.mu.Unlock()
+	return n, nil
+}
+
+// Close marks the buffer as done, unblocking any blocked Read.
+func (b *tsBuffer) Close() {
+	b.mu.Lock()
+	b.done = true
+	b.cond.Broadcast()
+	b.mu.Unlock()
 }
 
 // parseDashSegNum extracts the segment number from "seg_v_00042.m4s" / "seg_a_00012.m4s".
