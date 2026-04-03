@@ -64,7 +64,33 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		c.buf.Create(ingestWriteID)
 	}
 
+	// Build the rendition targets and create their buffers BEFORE starting the
+	// publisher. The publisher goroutines (serveHLSAdaptive, serveDASHAdaptive)
+	// subscribe to rendition buffers synchronously on a different goroutine; if
+	// those buffers don't exist yet the subscribe fails and the rendition is
+	// silently dropped from the master playlist.
+	var (
+		transcoderTargets []transcoder.RenditionTarget
+		renditionSlugs    []string
+	)
+	if shouldRunTranscoder(stream) {
+		profiles := transcoderProfilesFromDomain(&stream.Transcoder.Video)
+		for i := range profiles {
+			slug := buffer.VideoTrackSlug(i)
+			bid := buffer.RenditionBufferID(stream.Code, slug)
+			c.buf.Create(bid)
+			renditionSlugs = append(renditionSlugs, slug)
+			transcoderTargets = append(transcoderTargets, transcoder.RenditionTarget{
+				BufferID: bid,
+				Profile:  profiles[i],
+			})
+		}
+	}
+
 	if err := c.mgr.Register(ctx, stream, ingestWriteID); err != nil {
+		for _, slug := range renditionSlugs {
+			c.buf.Delete(buffer.RenditionBufferID(stream.Code, slug))
+		}
 		c.buf.Delete(stream.Code)
 		if ingestWriteID != stream.Code {
 			c.buf.Delete(ingestWriteID)
@@ -74,6 +100,9 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 
 	if err := c.pub.Start(ctx, stream); err != nil {
 		c.mgr.Unregister(stream.Code)
+		for _, slug := range renditionSlugs {
+			c.buf.Delete(buffer.RenditionBufferID(stream.Code, slug))
+		}
 		c.buf.Delete(stream.Code)
 		if ingestWriteID != stream.Code {
 			c.buf.Delete(ingestWriteID)
@@ -81,20 +110,10 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		return fmt.Errorf("coordinator: publisher: %w", err)
 	}
 
-	if shouldRunTranscoder(stream) {
-		profiles := transcoderProfilesFromDomain(&stream.Transcoder.Video)
+	if len(transcoderTargets) > 0 {
 		rawID := buffer.RawIngestBufferID(stream.Code)
-		var slugs []string
-		targets := make([]transcoder.RenditionTarget, 0, len(profiles))
-		for i := range profiles {
-			slug := buffer.VideoTrackSlug(i)
-			bid := buffer.RenditionBufferID(stream.Code, slug)
-			c.buf.Create(bid)
-			slugs = append(slugs, slug)
-			targets = append(targets, transcoder.RenditionTarget{BufferID: bid, Profile: profiles[i]})
-		}
-		if err := c.tc.Start(ctx, stream.Code, rawID, stream.Transcoder, targets); err != nil {
-			for _, slug := range slugs {
+		if err := c.tc.Start(ctx, stream.Code, rawID, stream.Transcoder, transcoderTargets); err != nil {
+			for _, slug := range renditionSlugs {
 				c.buf.Delete(buffer.RenditionBufferID(stream.Code, slug))
 			}
 			c.pub.Stop(stream.Code)
@@ -104,7 +123,7 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 			return fmt.Errorf("coordinator: transcoder: %w", err)
 		}
 		c.rendMu.Lock()
-		c.renditions[stream.Code] = slugs
+		c.renditions[stream.Code] = renditionSlugs
 		c.rendMu.Unlock()
 	}
 
