@@ -21,7 +21,6 @@ import (
 	"github.com/ntthuan060102github/open-streamer/internal/buffer"
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 	"github.com/ntthuan060102github/open-streamer/internal/events"
-	"github.com/ntthuan060102github/open-streamer/internal/ingestor/push"
 	"github.com/ntthuan060102github/open-streamer/pkg/protocol"
 	"github.com/samber/do/v2"
 )
@@ -80,20 +79,14 @@ func (s *Service) SetInputErrorObserver(fn func(streamID domain.StreamCode, inpu
 // Run starts the push servers (RTMP, SRT) and blocks until ctx is cancelled.
 // Call this in a dedicated goroutine alongside the rest of the application.
 func (s *Service) Run(ctx context.Context) error {
-	g, gctx := errgroup.WithContext(ctx)
+	g, _ := errgroup.WithContext(ctx)
 
 	if s.cfg.RTMPEnabled {
-		srv := push.NewRTMPServer(s.cfg, s.registry)
-		g.Go(func() error {
-			return srv.ListenAndServe(gctx)
-		})
+		// TODO: start RTMP push server
 	}
 
 	if s.cfg.SRTEnabled {
-		srv := push.NewSRTServer(s.cfg, s.registry)
-		g.Go(func() error {
-			return srv.ListenAndServe(gctx)
-		})
+		// TODO: start SRT push server
 	}
 
 	return g.Wait()
