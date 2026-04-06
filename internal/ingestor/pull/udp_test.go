@@ -25,7 +25,8 @@ func TestUDPReader_ReceivesPackets(t *testing.T) {
 	addr := r.LocalAddr()
 	require.NotNil(t, addr, "UDPReader must expose LocalAddr for tests")
 
-	payload := []byte("ts-packet-12345")
+	// Payload must start with 0x47 (MPEG-TS sync byte) to pass processPacket.
+	payload := append([]byte{0x47}, []byte("ts-packet-12345")...)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		d := net.Dialer{}
