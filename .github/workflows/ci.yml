@@ -61,6 +61,23 @@ jobs:
       - name: Test
         run: go test -race -shuffle=on -count=1 -timeout=5m ./...
 
+  swagger:
+    name: swagger docs up-to-date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Regenerate swagger docs
+        run: make swagger
+
+      - name: Check no uncommitted changes
+        run: git diff --exit-code api/docs/
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
