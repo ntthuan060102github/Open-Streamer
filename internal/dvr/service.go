@@ -413,7 +413,7 @@ func (s *Service) flushSegment(
 
 	if err := os.WriteFile(absPath, data, 0o644); err != nil {
 		slog.Error("dvr: write segment failed", "path", absPath, "err", err)
-		s.bus.Publish(context.Background(), domain.Event{
+		s.bus.Publish(context.WithoutCancel(ctx), domain.Event{
 			Type:       domain.EventRecordingFailed,
 			StreamCode: sess.recording.StreamCode,
 			Payload: map[string]any{
@@ -451,7 +451,7 @@ func (s *Service) flushSegment(
 		slog.Warn("dvr: save recording failed", "stream_code", sess.recording.StreamCode, "err", err)
 	}
 
-	s.bus.Publish(context.Background(), domain.Event{
+	s.bus.Publish(context.WithoutCancel(ctx), domain.Event{
 		Type:       domain.EventSegmentWritten,
 		StreamCode: sess.recording.StreamCode,
 		Payload: map[string]any{

@@ -71,6 +71,7 @@ func (s *Service) runProfileEncoder(
 
 		attempt++
 		fatal := maxRestarts > 0 && attempt >= maxRestarts
+		//nolint:contextcheck // ctx may be cancelled after crash; publish must outlive it
 		s.bus.Publish(context.Background(), domain.Event{
 			Type:       domain.EventTranscoderError,
 			StreamCode: logStream,

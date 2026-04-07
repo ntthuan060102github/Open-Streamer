@@ -106,10 +106,12 @@ type Service struct {
 	bus           events.Bus
 	ingestor      *ingestor.Service
 	packetTimeout time.Duration
-	mu            sync.RWMutex
-	streams       map[domain.StreamCode]*streamState
-	onExhausted   func(streamCode domain.StreamCode) // all inputs degraded — no ingest possible
-	onRestored     func(streamCode domain.StreamCode) // at least one input active again after exhaustion
+
+	mu      sync.RWMutex
+	streams map[domain.StreamCode]*streamState
+
+	onExhausted func(streamCode domain.StreamCode) // all inputs degraded — no ingest possible
+	onRestored  func(streamCode domain.StreamCode) // at least one input active again after exhaustion
 }
 
 // SetExhaustedCallback registers a function called when all inputs for a stream are

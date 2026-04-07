@@ -24,10 +24,10 @@ var httpStatusPattern = regexp.MustCompile(`(?i)\bhttp (\d{3})\b`)
 
 // pullWorkerCallbacks groups optional observer callbacks for runPullWorker.
 type pullWorkerCallbacks struct {
-	onPacket    func(streamID domain.StreamCode, inputPriority int)
+	onPacket     func(streamID domain.StreamCode, inputPriority int)
 	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
-	onConnect   func(streamID domain.StreamCode, inputPriority int)
-	onReconnect func(streamID domain.StreamCode, inputPriority int, err error)
+	onConnect    func(streamID domain.StreamCode, inputPriority int)
+	onReconnect  func(streamID domain.StreamCode, inputPriority int, err error)
 }
 
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.

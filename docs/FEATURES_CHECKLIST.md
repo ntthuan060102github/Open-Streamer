@@ -88,6 +88,7 @@ Legend for **Completion**:
 | Degraded state + failback probe | Complete | Probes run in background goroutines with cooldown |
 | Seamless failover (Go-level, no FFmpeg restart) | Complete | Old ingestor stops writing; new one starts; no buffer flush |
 | Failover events (`input.degraded`, `input.failover`) | Complete | Published to event bus; triggers HLS discontinuity counter |
+| All-inputs-exhausted detection | Complete | Stream status → `degraded` in store; auto-recovers to `active` when probe succeeds |
 
 ---
 
@@ -105,6 +106,8 @@ Legend for **Completion**:
 | Hardware acceleration (NVENC / VAAPI / VideoToolbox / QSV) | Complete | `global.hw_accel` maps to encoder + hwaccel flags |
 | FFmpeg stderr filtering | Complete | Timestamp discontinuity, frame reorder → debug; real errors → warn/error |
 | Passthrough / remux mode (no FFmpeg) | Complete | `transcoder.mode: passthrough` or `remux` skips FFmpeg; ingestor writes raw MPEG-TS directly to publisher buffer |
+| FFmpeg crash auto-restart with backoff | Complete | Per-profile retry: 2 s → 4 s → … → 30 s cap; publishes `transcoder.error {attempt, fatal}` |
+| Transcoder fatal → stream stopped | Complete | After `transcoder.max_restarts` (default 5) failures: pipeline torn down, stream status → `stopped` |
 
 ---
 
@@ -241,4 +244,4 @@ Legend for **Completion**:
 
 ---
 
-*Updated against codebase state 2026-04-07 (Kafka hook delivery, full event wiring, EVENTS.md). Update this file when feature status changes.*
+*Updated against codebase state 2026-04-07 (Kafka hooks, full event wiring, FFmpeg auto-restart, exhausted-input detection). Update this file when feature status changes.*

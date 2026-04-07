@@ -118,7 +118,7 @@ func (s *Service) runStreamJob(
 	tc *domain.TranscoderConfig,
 	targets []RenditionTarget,
 ) {
-	defer func() {
+	defer func() { //nolint:contextcheck // ctx is cancelled at this point; publish must outlive it
 		s.mu.Lock()
 		delete(s.workers, logStreamCode)
 		s.mu.Unlock()

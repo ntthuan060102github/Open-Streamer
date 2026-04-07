@@ -218,16 +218,16 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 	go func() {
 		s.mu.Lock()
 		cb := pullWorkerCallbacks{
-			onPacket:    s.onPacket,
+			onPacket:     s.onPacket,
 			onInputError: s.onInputError,
-			onConnect: func(id domain.StreamCode, priority int) {
+			onConnect: func(id domain.StreamCode, priority int) { //nolint:contextcheck // workerCtx is cancelled on stop; publish must outlive it
 				s.bus.Publish(context.Background(), domain.Event{
 					Type:       domain.EventInputConnected,
 					StreamCode: id,
 					Payload:    map[string]any{"input_priority": priority, "url": input.URL},
 				})
 			},
-			onReconnect: func(id domain.StreamCode, priority int, err error) {
+			onReconnect: func(id domain.StreamCode, priority int, err error) { //nolint:contextcheck // workerCtx is cancelled on stop; publish must outlive it
 				s.bus.Publish(context.Background(), domain.Event{
 					Type:       domain.EventInputReconnecting,
 					StreamCode: id,
