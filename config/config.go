@@ -135,22 +135,20 @@ type PublisherRTSPConfig struct {
 }
 
 // PublisherRTMPServeConfig is native RTMP listen output for viewers (not ingestor push).
-// All streams share PortMin; clients use rtmp://host:PortMin/live/<stream_code>.
-// Keep PortMin distinct from ingestor.rtmp_addr (default :1935).
+// Clients use rtmp://host:Port/live/<stream_code>.
+// Keep Port distinct from ingestor.rtmp_addr (default :1935).
 type PublisherRTMPServeConfig struct {
 	ListenHost string `mapstructure:"listen_host"`
-	// PortMin is the single RTMP listen port (PortMax is unused for publisher RTMP).
-	PortMin int `mapstructure:"port_min"`
-	PortMax int `mapstructure:"port_max"`
+	// Port is the single RTMP listen port. 0 = disabled.
+	Port int `mapstructure:"port"`
 }
 
 // PublisherSRTListenerConfig is native SRT listener (protocols.srt).
-// All streams share PortMin; clients set streamid=live/<stream_code> (or a bare valid stream code).
+// Clients set streamid=live/<stream_code> (or a bare valid stream code).
 type PublisherSRTListenerConfig struct {
 	ListenHost string `mapstructure:"listen_host"`
-	// PortMin is the single SRT listen port (PortMax is unused for publisher SRT).
-	PortMin int `mapstructure:"port_min"`
-	PortMax int `mapstructure:"port_max"`
+	// Port is the single SRT listen port. 0 = disabled.
+	Port int `mapstructure:"port"`
 	// LatencyMS is the SRT latency in milliseconds for listener URLs.
 	LatencyMS int `mapstructure:"latency_ms"`
 }
@@ -245,12 +243,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("publisher.rtsp.transport", "tcp")
 
 	v.SetDefault("publisher.rtmp.listen_host", defaultPublisherListenHost)
-	v.SetDefault("publisher.rtmp.port_min", 1936)
-	v.SetDefault("publisher.rtmp.port_max", 2035)
+	v.SetDefault("publisher.rtmp.port", 0) // 0 = disabled; set to e.g. 1936 to enable
 
 	v.SetDefault("publisher.srt.listen_host", defaultPublisherListenHost)
-	v.SetDefault("publisher.srt.port_min", 10000)
-	v.SetDefault("publisher.srt.port_max", 10099)
+	v.SetDefault("publisher.srt.port", 0) // 0 = disabled; set to e.g. 10000 to enable
 	v.SetDefault("publisher.srt.latency_ms", 120)
 
 	v.SetDefault("hooks.worker_count", 4)

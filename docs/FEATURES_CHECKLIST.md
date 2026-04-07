@@ -118,7 +118,7 @@ Legend for **Completion**:
 | DASH — single representation (fMP4 + dynamic MPD) | Complete | H.264 + H.265 + AAC supported; MP3 skipped |
 | DASH — ABR (root MPD + per-track directories) | Complete | Audio packaged only on best track folder |
 | RTSP (MPEG-TS in RTP, gortsplib) | Stub | Fields reserved in publisher.Service; no serve goroutine yet |
-| RTMP play (gomedia) | Stub | Fields reserved in publisher.Service; no serve goroutine yet |
+| RTMP play (gomedia) | Complete | Shared listener on `publisher.rtmp.port_min`; app `live`; clients use `rtmp://host:port/live/<code>` |
 | SRT listen (gosrt) | Stub | Fields reserved in publisher.Service; no serve goroutine yet |
 | RTMP push out (re-stream to platform) | Complete | `rtmp://` destinations; auto-reconnect with backoff; RTMPS/WebRTC return clear error |
 | RTS / WebRTC (WHEP) | Stub | Logs "not implemented"; use HLS/DASH for browsers |
