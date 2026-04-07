@@ -65,7 +65,7 @@ Legend for **Completion**:
 |---------|------------|-------|
 | Pull — HLS | Complete | M3U8 parser, segment fetch, retry + backoff |
 | Pull — HTTP (raw MPEG-TS) | Complete | |
-| Pull — RTSP | Partial | Code path complete; HLS/DASH output can stutter in manual tests — investigate RTP jitter |
+| Pull — RTSP | Complete | Rewritten with gortsplib v5: RTCP A/V sync, RTP reorder buffer, proper DTS extraction (DTSExtractor), H.264 + H.265 + AAC |
 | Pull — RTMP | Complete | AVCC→Annex-B, ADTS wrapping via TSDemuxPacketReader |
 | Pull — SRT (caller) | Partial | Code path complete; HLS/DASH combos not yet verified in manual matrix |
 | Pull — UDP / MPEG-TS | Complete | Unicast + multicast; auto-strip RTP header; OS-assigned port for tests |
@@ -177,7 +177,7 @@ Legend for **Completion**:
 |---------|------------|-------|
 | Watermark config on `Stream` | Schema only | Fields exist; not applied in transcoder graph |
 | Thumbnail config on `Stream` | Schema only | Fields exist; not generated alongside outputs |
-| `TranscodeMode` (passthrough / remux) | Schema only | Enum in domain; pipeline is always encode-focused |
+| `TranscodeMode` (passthrough / remux) | Complete | `transcoder.mode: passthrough/remux` bypasses FFmpeg entirely |
 
 ---
 
@@ -211,7 +211,7 @@ Legend for **Completion**:
 | HLS | OK | OK |
 | RTMP | OK | OK |
 | SRT | — | — |
-| RTSP | Issue | Issue |
+| RTSP | — | — |
 
 ### With internal transcoding (FFmpeg ABR ladder)
 
@@ -221,7 +221,7 @@ Legend for **Completion**:
 | HLS | OK | OK |
 | RTMP | OK | OK |
 | SRT | — | — |
-| RTSP | Issue | Issue |
+| RTSP | — | — |
 
 ### Push ingest
 
@@ -241,4 +241,4 @@ Legend for **Completion**:
 
 ---
 
-*Updated against codebase state 2026-04-06. Update this file when feature status changes.*
+*Updated against codebase state 2026-04-07. Update this file when feature status changes.*
