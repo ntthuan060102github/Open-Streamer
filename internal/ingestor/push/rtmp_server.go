@@ -34,17 +34,33 @@ import (
 // given input (which points to this server's play endpoint).
 type ConnectFunc func(ctx context.Context, streamID, bufferWriteID domain.StreamCode, input domain.Input) error
 
+// PlayFunc is invoked when an external play client connects for a key that has
+// no active ingest relay. It should stream frames to the client via writeFrame
+// until ctx is cancelled or an error occurs. Return a non-nil error only when
+// the stream is not available (causes the client to receive NOTFOUND).
+type PlayFunc func(ctx context.Context, key string, writeFrame func(cid gocodec.CodecID, data []byte, pts, dts uint32) error) error
+
 // RTMPServer accepts RTMP push connections from encoders, validates them
 // against the push Registry, and relays each live stream to an internal
 // RTMP play subscriber (joy4 RTMPReader) via a loopback connection.
+// External play clients (VLC, ffplay) are served via an optional PlayFunc.
 type RTMPServer struct {
 	addr      string
 	port      string // port extracted from addr, used to build loopback pull URL
 	registry  Registry
 	onConnect ConnectFunc
 
-	mu  sync.Mutex
-	hub map[string]*rtmpRelay // stream key → active relay
+	mu       sync.Mutex
+	hub      map[string]*rtmpRelay // stream key → active relay
+	playFunc PlayFunc              // optional; serves external play clients
+}
+
+// SetPlayFunc registers a handler for external RTMP play clients.
+// Must be called before Run. Safe to call concurrently.
+func (s *RTMPServer) SetPlayFunc(fn PlayFunc) {
+	s.mu.Lock()
+	s.playFunc = fn
+	s.mu.Unlock()
 }
 
 // NewRTMPServer creates an RTMPServer. addr is the TCP bind address (e.g. ":1935").
@@ -107,8 +123,13 @@ func (s *RTMPServer) deleteRelay(key string) {
 }
 
 // handleConn drives a single TCP connection. It can be either a publisher
-// (encoder pushing a stream) or a subscriber (our internal joy4 pull worker).
+// (encoder pushing a stream), an internal joy4 pull worker, or an external
+// play client served by the registered PlayFunc.
 func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
+	// connCtx is cancelled when this connection closes, stopping any play session.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	handle := gortmp.NewRtmpServerHandle()
 	handle.SetOutput(func(b []byte) error {
 		_, err := conn.Write(b)
@@ -164,11 +185,18 @@ func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
 	})
 
 	handle.OnPlay(func(app, key string, start, duration float64, reset bool) gortmp.StatusCode {
-		if s.getRelay(key) == nil {
-			slog.Warn("rtmp server: play rejected, no active publisher", "key", key)
-			return gortmp.NETSTREAM_PLAY_NOTFOUND
+		// Accept play if there is an active ingest relay OR a play handler is registered.
+		if s.getRelay(key) != nil {
+			return gortmp.NETSTREAM_PLAY_START
 		}
-		return gortmp.NETSTREAM_PLAY_START
+		s.mu.Lock()
+		fn := s.playFunc
+		s.mu.Unlock()
+		if fn != nil {
+			return gortmp.NETSTREAM_PLAY_START
+		}
+		slog.Warn("rtmp server: play rejected, stream not active", "key", key)
+		return gortmp.NETSTREAM_PLAY_NOTFOUND
 	})
 
 	handle.OnStateChange(func(newState gortmp.RtmpState) {
@@ -176,16 +204,36 @@ func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		key := handle.GetStreamName()
+
+		// Internal joy4 loopback pull → serve via relay.
 		r := s.getRelay(key)
-		if r == nil {
+		if r != nil {
+			sub := newRTMPSub(conn, handle)
+			r.addSub(sub)
+			go func() {
+				sub.run()
+				r.removeSub(sub)
+			}()
+			return
+		}
+
+		// External play client → serve via PlayFunc.
+		s.mu.Lock()
+		fn := s.playFunc
+		s.mu.Unlock()
+		if fn == nil {
 			_ = conn.Close()
 			return
 		}
-		sub := newRTMPSub(conn, handle)
-		r.addSub(sub)
+		slog.Info("rtmp server: external play client connected", "key", key)
 		go func() {
-			sub.run()
-			r.removeSub(sub)
+			err := fn(connCtx, key, func(cid gocodec.CodecID, data []byte, pts, dts uint32) error {
+				return handle.WriteFrame(cid, data, pts, dts)
+			})
+			if err != nil {
+				slog.Debug("rtmp server: play session ended", "key", key, "err", err)
+				_ = conn.Close()
+			}
 		}()
 	})
 

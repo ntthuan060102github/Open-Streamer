@@ -160,6 +160,8 @@ func startAll(ctx context.Context, i *do.RootScope) error {
 	hookSvc := do.MustInvoke[*hooks.Service](i)
 	apiSrv := do.MustInvoke[*api.Server](i)
 
+	ing.SetRTMPPlayHandler(pub.HandleRTMPPlay)
+
 	g, gCtx := errgroup.WithContext(ctx)
 
 	g.Go(func() error { return ing.Run(gCtx) })

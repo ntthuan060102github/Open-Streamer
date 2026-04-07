@@ -47,8 +47,10 @@ type Service struct {
 	onPacket     func(streamID domain.StreamCode, inputPriority int)
 	onInputError func(streamID domain.StreamCode, inputPriority int, err error)
 
-	mu      sync.Mutex
-	workers map[domain.StreamCode]*pullWorkerEntry
+	mu              sync.Mutex
+	workers         map[domain.StreamCode]*pullWorkerEntry
+	rtmpSrv         *push.RTMPServer // set during Run if RTMPEnabled
+	pendingPlayFunc push.PlayFunc    // stored before Run, wired in once server is created
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -80,6 +82,22 @@ func (s *Service) SetInputErrorObserver(fn func(streamID domain.StreamCode, inpu
 	s.onInputError = fn
 }
 
+// SetRTMPPlayHandler registers an external play handler on the RTMP server.
+// Must be called before Run. If the RTMP server is not enabled this is a no-op.
+func (s *Service) SetRTMPPlayHandler(fn push.PlayFunc) {
+	s.mu.Lock()
+	srv := s.rtmpSrv
+	s.mu.Unlock()
+	if srv != nil {
+		srv.SetPlayFunc(fn)
+		return
+	}
+	// Server not yet created (Run not started); store for deferred wiring.
+	s.mu.Lock()
+	s.pendingPlayFunc = fn
+	s.mu.Unlock()
+}
+
 // Run starts the push servers (RTMP, SRT) and blocks until ctx is cancelled.
 // Call this in a dedicated goroutine alongside the rest of the application.
 func (s *Service) Run(ctx context.Context) error {
@@ -96,10 +114,15 @@ func (s *Service) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("ingestor: create rtmp server: %w", err)
 		}
+		s.mu.Lock()
+		s.rtmpSrv = rtmpSrv
+		if s.pendingPlayFunc != nil {
+			rtmpSrv.SetPlayFunc(s.pendingPlayFunc)
+			s.pendingPlayFunc = nil
+		}
+		s.mu.Unlock()
 		g.Go(func() error { return rtmpSrv.Run(ctx) })
 	}
-
-	// TODO: start SRT push server when SRTEnabled
 
 	return g.Wait()
 }
