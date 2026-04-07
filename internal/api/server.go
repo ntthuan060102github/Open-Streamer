@@ -72,6 +72,7 @@ func (s *Server) buildRouter(
 	r.Get("/swagger/doc.json", serveSwaggerJSON)
 	r.Get("/swagger", http.RedirectHandler("/swagger/", http.StatusMovedPermanently).ServeHTTP)
 	r.Get("/swagger/", serveSwaggerIndex)
+
 	mediaserve.Mount(r, s.hlsDir, s.dashDir)
 
 	r.Route("/streams", func(r chi.Router) {
