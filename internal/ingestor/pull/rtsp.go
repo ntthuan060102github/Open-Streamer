@@ -1,32 +1,46 @@
 package pull
 
-// rtsp.go — RTSP pull ingestor using nareix/joy4/format/rtsp.
+// rtsp.go — RTSP pull ingestor using gortsplib (bluenviron/gortsplib/v5).
 //
-// joy4 performs DESCRIBE → SETUP → PLAY internally inside Dial + Streams, so
-// the caller only needs to call ReadPacket in a loop — identical to the RTMP reader.
+// gortsplib is chosen over the legacy joy4 RTSP client because it:
+//   - Implements RTCP Sender Report based A/V clock synchronisation so that
+//     audio and video timestamps are aligned correctly regardless of their
+//     independent RTP clock sources.
+//   - Has a built-in RTP re-ordering buffer (eliminates out-of-order jitter).
+//   - Actively maintained; joy4 is abandoned.
 //
-// Codec support: H.264 (AVCC → Annex-B) and AAC (raw → ADTS).
-// The same package-level helpers used by RTMPReader are reused here:
-//   - filterSupportedRTMPStreams
-//   - h264ForTSMuxer / h264AccessUnitForTS
+// Codec support:
+//   - Video: H.264 (preferred) or H.265 (fallback when no H.264 track exists).
+//   - Audio: MPEG-4 AAC (MPEG4Audio RTP format).
 //
-// Mid-stream codec changes (SPS/PPS rotation that some cameras emit) are
-// handled by calling HandleCodecDataChange() and continuing the loop.
+// Timestamp handling:
+//   - c.PacketPTS returns the media-timeline PTS in clock-rate units, already
+//     synchronised across tracks via the GlobalDecoder / RTCP SR path.
+//   - For H.264/H.265 video (90 kHz RTP clock): ptsMS = pts / 90.
+//   - For AAC audio (sample-rate clock): ptsMS = pts * 1000 / clockRate.
+//   - DTS for H.264/H.265 is extracted by DTSExtractor (mediacommon) which
+//     reads POC/VUI timing info from the bitstream — necessary for streams
+//     with B-frames.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sync"
 	"time"
 
-	joyav "github.com/nareix/joy4/av"
-	"github.com/nareix/joy4/codec/aacparser"
-	joyh264 "github.com/nareix/joy4/codec/h264parser"
-	joyrtsp "github.com/nareix/joy4/format/rtsp"
-
-	gocodec "github.com/yapingcat/gomedia/go-codec"
+	"github.com/bluenviron/gortsplib/v5"
+	"github.com/bluenviron/gortsplib/v5/pkg/base"
+	"github.com/bluenviron/gortsplib/v5/pkg/description"
+	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph265"
+	mch264 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
+	mch265 "github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
+	"github.com/pion/rtp"
 
 	"github.com/ntthuan060102github/open-streamer/internal/domain"
 )
@@ -34,22 +48,14 @@ import (
 const rtspChanSize = 16384
 
 // RTSPReader connects to a remote RTSP server in play (pull) mode and emits domain.AVPacket.
-//
-// It is structurally identical to RTMPReader: Dial → Streams → readLoop → ReadPackets.
-// H.264 AVCC access units are converted to Annex-B; SPS/PPS from the SDP are injected
-// on every IDR frame.  AAC frames are wrapped in ADTS when the raw payload is bare.
+// It uses gortsplib for proper RTCP-based A/V synchronisation and RTP jitter buffering.
 type RTSPReader struct {
 	input domain.Input
 
 	mu   sync.Mutex
-	conn *joyrtsp.Client
+	conn *gortsplib.Client
 	pkts chan domain.AVPacket
 	done chan struct{}
-
-	filtered            []joyav.CodecData
-	idxMap              map[int]int // source stream index → index in filtered
-	h264KeyPrefixAnnexB [][]byte    // per filtered index: 4-byte-SC + SPS + 4-byte-SC + PPS
-	aacCfg              *aacparser.MPEG4AudioConfig
 }
 
 // NewRTSPReader constructs an RTSPReader without opening a connection.
@@ -58,264 +64,344 @@ func NewRTSPReader(input domain.Input) *RTSPReader {
 }
 
 // Open dials the RTSP source, negotiates tracks, and starts the background read loop.
-// It blocks until DESCRIBE + SETUP + PLAY + first codec probing complete.
+// It blocks until DESCRIBE + SETUP + PLAY complete.
 func (r *RTSPReader) Open(ctx context.Context) error {
-	_ = ctx // joy4 dial has no context-aware API
+	_ = ctx
 
 	r.mu.Lock()
 	if r.conn != nil {
 		r.mu.Unlock()
 		return fmt.Errorf("rtsp reader: already open")
 	}
-	r.pkts = make(chan domain.AVPacket, rtspChanSize)
-	r.done = make(chan struct{})
+	pkts := make(chan domain.AVPacket, rtspChanSize)
+	done := make(chan struct{})
+	r.pkts = pkts
+	r.done = done
 	r.mu.Unlock()
+
+	u, err := base.ParseURL(r.input.URL)
+	if err != nil {
+		r.abortOpen(pkts, done)
+		return fmt.Errorf("rtsp reader: parse URL %q: %w", r.input.URL, err)
+	}
 
 	connectTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
 	if connectTimeout == 0 {
 		connectTimeout = 10 * time.Second
 	}
 
-	conn, err := joyrtsp.DialTimeout(r.input.URL, connectTimeout)
+	c := &gortsplib.Client{
+		Scheme:      u.Scheme,
+		Host:        u.Host,
+		ReadTimeout: connectTimeout,
+	}
+	if err := c.Start(); err != nil {
+		r.abortOpen(pkts, done)
+		return fmt.Errorf("rtsp reader: start %q: %w", r.input.URL, err)
+	}
+
+	desc, _, err := c.Describe(u)
 	if err != nil {
-		r.abortOpen()
-		return fmt.Errorf("rtsp reader: dial %q: %w", r.input.URL, err)
+		c.Close()
+		r.abortOpen(pkts, done)
+		return fmt.Errorf("rtsp reader: describe %q: %w", r.input.URL, err)
 	}
 
-	streams, err := conn.Streams()
-	if err != nil {
-		_ = conn.Close()
-		r.abortOpen()
-		return fmt.Errorf("rtsp reader: streams %q: %w", r.input.URL, err)
+	setupCount := 0
+
+	// --- H.264 video ---
+	var h264Forma *format.H264
+	var h264Media *description.Media
+	h264Media = desc.FindFormat(&h264Forma)
+	if h264Media != nil {
+		if _, err := c.Setup(desc.BaseURL, h264Media, 0, 0); err != nil {
+			slog.Warn("rtsp reader: setup H264 track failed", "url", r.input.URL, "err", err)
+			h264Media = nil
+			h264Forma = nil
+		} else {
+			setupCount++
+		}
 	}
 
-	r.scanStreams(streams)
-
-	filtered, idxMap := filterSupportedRTMPStreams(streams)
-	if len(filtered) == 0 {
-		_ = conn.Close()
-		r.abortOpen()
-		return fmt.Errorf("rtsp reader: no supported streams in %q (need H264 or AAC)", r.input.URL)
-	}
-
-	h264Prefix := r.buildH264Prefixes(filtered)
-
-	r.mu.Lock()
-	r.conn = conn
-	r.filtered = filtered
-	r.idxMap = idxMap
-	r.h264KeyPrefixAnnexB = h264Prefix
-	r.mu.Unlock()
-
-	go r.readLoop()
-	return nil
-}
-
-// scanStreams logs discovered tracks and captures the AAC config for ADTS wrapping.
-func (r *RTSPReader) scanStreams(streams []joyav.CodecData) {
-	for i, s := range streams {
-		supported := s.Type() == joyav.H264 || s.Type() == joyav.AAC
-		slog.Info("rtsp reader: source stream discovered",
-			"url", r.input.URL,
-			"source_stream_idx", i,
-			"codec", s.Type().String(),
-			"supported", supported,
-		)
-		if s.Type() == joyav.AAC {
-			if cd, ok := s.(aacparser.CodecData); ok {
-				cfg := cd.Config
-				r.aacCfg = &cfg
+	// --- H.265 video (fallback when no H.264 track) ---
+	var h265Forma *format.H265
+	var h265Media *description.Media
+	if h264Media == nil {
+		h265Media = desc.FindFormat(&h265Forma)
+		if h265Media != nil {
+			if _, err := c.Setup(desc.BaseURL, h265Media, 0, 0); err != nil {
+				slog.Warn("rtsp reader: setup H265 track failed", "url", r.input.URL, "err", err)
+				h265Media = nil
+				h265Forma = nil
+			} else {
+				setupCount++
 			}
 		}
 	}
-}
 
-// buildH264Prefixes constructs the Annex-B SPS+PPS prefix for each H.264 filtered track.
-func (r *RTSPReader) buildH264Prefixes(filtered []joyav.CodecData) [][]byte {
-	out := make([][]byte, len(filtered))
-	for i, s := range filtered {
-		if s.Type() != joyav.H264 {
-			continue
-		}
-		cd, ok := s.(joyh264.CodecData)
-		if !ok {
-			slog.Warn("rtsp reader: H264 track has no h264parser.CodecData — SPS/PPS injection disabled",
-				"url", r.input.URL, "es_stream_idx", i)
-			continue
-		}
-		sps, pps := cd.SPS(), cd.PPS()
-		if len(sps) == 0 || len(pps) == 0 {
-			continue
-		}
-		var b []byte
-		b = append(b, 0, 0, 0, 1)
-		b = append(b, sps...)
-		b = append(b, 0, 0, 0, 1)
-		b = append(b, pps...)
-		out[i] = b
-	}
-	return out
-}
-
-func (r *RTSPReader) abortOpen() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.pkts != nil {
-		close(r.pkts)
-	}
-	r.pkts = nil
-	r.done = nil
-	r.conn = nil
-}
-
-func (r *RTSPReader) readLoop() {
-	defer r.teardownAfterReadLoop()
-	defer func() {
-		if rec := recover(); rec != nil {
-			slog.Error("rtsp reader: panic in joy4, closing connection",
-				"url", r.input.URL, "panic", rec)
-		}
-	}()
-
-	for {
-		r.mu.Lock()
-		c := r.conn
-		r.mu.Unlock()
-		if c == nil {
-			return
-		}
-		if stop := r.readOnce(c); stop {
-			return
+	// --- AAC audio ---
+	var aacForma *format.MPEG4Audio
+	var aacMedia *description.Media
+	aacMedia = desc.FindFormat(&aacForma)
+	if aacMedia != nil {
+		if _, err := c.Setup(desc.BaseURL, aacMedia, 0, 0); err != nil {
+			slog.Warn("rtsp reader: setup AAC track failed", "url", r.input.URL, "err", err)
+			aacMedia = nil
+			aacForma = nil
+		} else {
+			setupCount++
 		}
 	}
-}
 
-// readOnce reads one packet from the RTSP client and emits it.
-// Returns true when the read loop should stop.
-func (r *RTSPReader) readOnce(c *joyrtsp.Client) bool {
-	pkt, err := c.ReadPacket()
-	if err != nil {
-		if err == joyrtsp.ErrCodecDataChange {
-			return !r.handleCodecDataChange(c)
-		}
-		slog.Warn("rtsp reader: read packet ended",
-			"url", r.input.URL, "err", err)
-		return true
+	if setupCount == 0 {
+		c.Close()
+		r.abortOpen(pkts, done)
+		return fmt.Errorf("rtsp reader: no supported tracks in %q (need H264, H265, or AAC)", r.input.URL)
 	}
-	return r.emitJoyRTSPPacket(pkt)
-}
 
-// emitJoyRTSPPacket converts one joy4 av.Packet to domain.AVPacket and sends it.
-// Returns true when the caller should stop the read loop.
-func (r *RTSPReader) emitJoyRTSPPacket(pkt joyav.Packet) bool {
-	mapped, ok := r.idxMap[int(pkt.Idx)]
-	if !ok || mapped < 0 || mapped >= len(r.filtered) {
-		return false
+	// Register callbacks before Play.
+	r.registerH264Callback(c, h264Media, h264Forma, pkts, done)
+	r.registerH265Callback(c, h265Media, h265Forma, pkts, done)
+	r.registerAACCallback(c, aacMedia, aacForma, pkts, done)
+
+	if _, err := c.Play(nil); err != nil {
+		c.Close()
+		r.abortOpen(pkts, done)
+		return fmt.Errorf("rtsp reader: play %q: %w", r.input.URL, err)
 	}
-	codec := r.filtered[mapped].Type()
-	dtsMS := uint64(pkt.Time / time.Millisecond)
-	ptsMS := dtsMS + uint64(pkt.CompositionTime/time.Millisecond)
 
 	r.mu.Lock()
-	outCh := r.pkts
-	doneCh := r.done
+	r.conn = c
 	r.mu.Unlock()
-	if outCh == nil {
-		return true
+
+	slog.Info("rtsp reader: connected",
+		"url", r.input.URL,
+		"h264", h264Media != nil,
+		"h265", h265Media != nil,
+		"aac", aacMedia != nil,
+	)
+
+	go r.waitLoop(c, pkts, done)
+	return nil
+}
+
+// registerH264Callback sets up OnPacketRTP for an H.264 track.
+func (r *RTSPReader) registerH264Callback(
+	c *gortsplib.Client,
+	medi *description.Media,
+	forma *format.H264,
+	pkts chan domain.AVPacket,
+	done chan struct{},
+) {
+	if medi == nil || forma == nil {
+		return
 	}
 
-	switch codec {
-	case joyav.H264:
-		annexB := h264ForTSMuxer(pkt.Data)
-		data := h264AccessUnitForTS(pkt.IsKeyFrame, r.h264KeyPrefixAnnexB[mapped], annexB)
-		if len(data) == 0 {
-			return false
+	rtpDec, err := forma.CreateDecoder()
+	if err != nil {
+		slog.Warn("rtsp reader: create H264 RTP decoder failed", "url", r.input.URL, "err", err)
+		return
+	}
+
+	// Build Annex-B SPS+PPS prefix from SDP parameters.
+	spsPrefix := buildH264SPSPrefix(forma.SPS, forma.PPS)
+
+	var dtsEx mch264.DTSExtractor
+	dtsEx.Initialize()
+
+	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+		pts, ok := c.PacketPTS(medi, pkt)
+		if !ok {
+			return
 		}
-		p := domain.AVPacket{
+
+		au, err := rtpDec.Decode(pkt)
+		if err != nil {
+			if !errors.Is(err, rtph264.ErrNonStartingPacketAndNoPrevious) &&
+				!errors.Is(err, rtph264.ErrMorePacketsNeeded) {
+				slog.Debug("rtsp reader: H264 RTP decode", "url", r.input.URL, "err", err)
+			}
+			return
+		}
+
+		isIDR := mch264.IsRandomAccess(au)
+
+		dts, err := dtsEx.Extract(au, pts)
+		if err != nil {
+			return
+		}
+
+		// Convert [][]byte NAL units to Annex-B byte stream.
+		annexB := nalusToAnnexB(au)
+		data := h264AccessUnitForTS(isIDR, spsPrefix, annexB)
+		if len(data) == 0 {
+			return
+		}
+
+		select {
+		case pkts <- domain.AVPacket{
 			Codec:    domain.AVCodecH264,
 			Data:     data,
-			PTSms:    ptsMS,
-			DTSms:    dtsMS,
-			KeyFrame: gocodec.IsH264IDRFrame(data),
+			PTSms:    uint64(pts / 90),
+			DTSms:    uint64(dts / 90),
+			KeyFrame: isIDR,
+		}:
+		case <-done:
 		}
-		select {
-		case outCh <- p:
-		case <-doneCh:
-			return true
+	})
+}
+
+// registerH265Callback sets up OnPacketRTP for an H.265 track.
+func (r *RTSPReader) registerH265Callback(
+	c *gortsplib.Client,
+	medi *description.Media,
+	forma *format.H265,
+	pkts chan domain.AVPacket,
+	done chan struct{},
+) {
+	if medi == nil || forma == nil {
+		return
+	}
+
+	rtpDec, err := forma.CreateDecoder()
+	if err != nil {
+		slog.Warn("rtsp reader: create H265 RTP decoder failed", "url", r.input.URL, "err", err)
+		return
+	}
+
+	vps := forma.VPS
+	sps := forma.SPS
+	pps := forma.PPS
+
+	var dtsEx mch265.DTSExtractor
+	dtsEx.Initialize()
+
+	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+		pts, ok := c.PacketPTS(medi, pkt)
+		if !ok {
+			return
 		}
 
-	case joyav.AAC:
-		data := aacFrameToADTS(r.aacCfg, pkt.Data)
+		au, err := rtpDec.Decode(pkt)
+		if err != nil {
+			if !errors.Is(err, rtph265.ErrNonStartingPacketAndNoPrevious) &&
+				!errors.Is(err, rtph265.ErrMorePacketsNeeded) {
+				slog.Debug("rtsp reader: H265 RTP decode", "url", r.input.URL, "err", err)
+			}
+			return
+		}
+
+		isIDR := mch265.IsRandomAccess(au)
+
+		dts, err := dtsEx.Extract(au, pts)
+		if err != nil {
+			return
+		}
+
+		// Prepend VPS/SPS/PPS on IDR so decoders can initialise without SDP.
+		if isIDR && len(vps) > 0 && len(sps) > 0 && len(pps) > 0 {
+			au = append([][]byte{vps, sps, pps}, au...)
+		}
+
+		data := nalusToAnnexB(au)
 		if len(data) == 0 {
-			return false
+			return
 		}
-		p := domain.AVPacket{
-			Codec: domain.AVCodecAAC,
-			Data:  data,
-			PTSms: dtsMS,
-			DTSms: dtsMS,
-		}
+
 		select {
-		case outCh <- p:
-		case <-doneCh:
-			return true
+		case pkts <- domain.AVPacket{
+			Codec:    domain.AVCodecH265,
+			Data:     data,
+			PTSms:    uint64(pts / 90),
+			DTSms:    uint64(dts / 90),
+			KeyFrame: isIDR,
+		}:
+		case <-done:
+		}
+	})
+}
+
+// registerAACCallback sets up OnPacketRTP for an AAC track.
+func (r *RTSPReader) registerAACCallback(
+	c *gortsplib.Client,
+	medi *description.Media,
+	forma *format.MPEG4Audio,
+	pkts chan domain.AVPacket,
+	done chan struct{},
+) {
+	if medi == nil || forma == nil {
+		return
+	}
+
+	rtpDec, err := forma.CreateDecoder()
+	if err != nil {
+		slog.Warn("rtsp reader: create AAC RTP decoder failed", "url", r.input.URL, "err", err)
+		return
+	}
+
+	aacCfg := forma.Config
+	clockRate := int64(forma.ClockRate())
+
+	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+		pts, ok := c.PacketPTS(medi, pkt)
+		if !ok {
+			return
 		}
 
-	default:
-		return false
-	}
-	return false
+		aus, err := rtpDec.Decode(pkt)
+		if err != nil {
+			slog.Debug("rtsp reader: AAC RTP decode", "url", r.input.URL, "err", err)
+			return
+		}
+
+		ptsMS := pts * 1000 / clockRate
+
+		for _, au := range aus {
+			data := aacRawToADTS(aacCfg, au)
+			if len(data) == 0 {
+				continue
+			}
+			select {
+			case pkts <- domain.AVPacket{
+				Codec: domain.AVCodecAAC,
+				Data:  data,
+				PTSms: uint64(ptsMS),
+				DTSms: uint64(ptsMS),
+			}:
+			case <-done:
+				return
+			}
+		}
+	})
 }
 
-// handleCodecDataChange handles a mid-stream SPS/PPS rotation.
-// It re-reads stream codec data and rebuilds the H.264 SPS/PPS prefix table
-// so that subsequent IDR frames carry the updated parameter sets.
-// Returns true to continue the read loop, false to abort.
-func (r *RTSPReader) handleCodecDataChange(c *joyrtsp.Client) bool {
-	newConn, err := c.HandleCodecDataChange()
+// waitLoop blocks on c.Wait() and tears down channels when the connection ends.
+func (r *RTSPReader) waitLoop(c *gortsplib.Client, pkts chan domain.AVPacket, done chan struct{}) {
+	err := c.Wait()
 	if err != nil {
-		slog.Warn("rtsp reader: HandleCodecDataChange failed",
-			"url", r.input.URL, "err", err)
-		return false
+		slog.Warn("rtsp reader: connection ended", "url", r.input.URL, "err", err)
 	}
-
-	streams, err := newConn.Streams()
-	if err != nil {
-		slog.Warn("rtsp reader: re-read streams after codec change failed",
-			"url", r.input.URL, "err", err)
-		_ = newConn.Close()
-		return false
-	}
-
-	filtered, idxMap := filterSupportedRTMPStreams(streams)
-	h264Prefix := r.buildH264Prefixes(filtered)
-
 	r.mu.Lock()
-	r.conn = newConn
-	r.filtered = filtered
-	r.idxMap = idxMap
-	r.h264KeyPrefixAnnexB = h264Prefix
-	r.mu.Unlock()
-
-	slog.Info("rtsp reader: codec data updated", "url", r.input.URL)
-	return true
-}
-
-func (r *RTSPReader) teardownAfterReadLoop() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.conn != nil {
-		_ = r.conn.Close()
+	if r.conn == c {
 		r.conn = nil
 	}
-	if r.done != nil {
-		close(r.done)
-		r.done = nil
+	r.mu.Unlock()
+	// Signal done before draining pkts so ReadPackets sees EOF.
+	select {
+	case <-done:
+	default:
+		close(done)
 	}
-	if r.pkts != nil {
-		close(r.pkts)
-		r.pkts = nil
-	}
+	close(pkts)
+}
+
+func (r *RTSPReader) abortOpen(pkts chan domain.AVPacket, done chan struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	close(done)
+	close(pkts)
+	r.pkts = nil
+	r.done = nil
 }
 
 // ReadPackets blocks until at least one AVPacket is available or the source ends.
@@ -349,14 +435,73 @@ func (r *RTSPReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error)
 	}
 }
 
-// Close closes the RTSP connection; the readLoop then closes the packet channels.
+// Close closes the RTSP connection and waits for the read loop to stop.
 func (r *RTSPReader) Close() error {
 	r.mu.Lock()
 	c := r.conn
 	r.conn = nil
 	r.mu.Unlock()
 	if c != nil {
-		return c.Close()
+		c.Close()
 	}
 	return nil
+}
+
+// --- helpers ---
+
+// buildH264SPSPrefix returns a 4-byte-SC+SPS+4-byte-SC+PPS Annex-B blob.
+func buildH264SPSPrefix(sps, pps []byte) []byte {
+	if len(sps) == 0 || len(pps) == 0 {
+		return nil
+	}
+	b := make([]byte, 0, 8+len(sps)+len(pps))
+	b = append(b, 0, 0, 0, 1)
+	b = append(b, sps...)
+	b = append(b, 0, 0, 0, 1)
+	b = append(b, pps...)
+	return b
+}
+
+// nalusToAnnexB converts a slice of raw NAL units (no startcodes) to Annex-B
+// by prepending a 4-byte start code (0x00 0x00 0x00 0x01) before each NALU.
+func nalusToAnnexB(au [][]byte) []byte {
+	size := 0
+	for _, nalu := range au {
+		size += 4 + len(nalu)
+	}
+	if size == 0 {
+		return nil
+	}
+	b := make([]byte, 0, size)
+	for _, nalu := range au {
+		b = append(b, 0, 0, 0, 1)
+		b = append(b, nalu...)
+	}
+	return b
+}
+
+// aacRawToADTS wraps a raw MPEG-4 AAC access unit with a 7-byte ADTS header.
+// Frames that already have an ADTS sync word (0xFFF) are returned unchanged.
+func aacRawToADTS(cfg *mpeg4audio.AudioSpecificConfig, raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	// Already has ADTS header.
+	if len(raw) >= 2 && raw[0] == 0xff && raw[1]&0xf0 == 0xf0 {
+		return raw
+	}
+	if cfg == nil {
+		return raw
+	}
+	pkts := mpeg4audio.ADTSPackets{{
+		Type:          cfg.Type,
+		SampleRate:    cfg.SampleRate,
+		ChannelConfig: cfg.ChannelConfig,
+		AU:            raw,
+	}}
+	out, err := pkts.Marshal()
+	if err != nil {
+		return raw
+	}
+	return out
 }
