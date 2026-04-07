@@ -120,7 +120,7 @@ Legend for **Completion**:
 | RTSP (MPEG-TS in RTP, gortsplib) | Complete | Shared listener; `/live/<code>` |
 | RTMP play (gomedia) | Complete | Shared listener; app `live` |
 | SRT listen (gosrt) | Complete | `streamid=live/<code>` |
-| RTMP push out (re-stream to platform) | Partial | `rtmp://` destinations supported; other schemes (RTMPS, WebRTC) return clear error |
+| RTMP push out (re-stream to platform) | Complete | `rtmp://` destinations; auto-reconnect with backoff; RTMPS/WebRTC return clear error |
 | RTS / WebRTC (WHEP) | Stub | Logs "not implemented"; use HLS/DASH for browsers |
 
 ---

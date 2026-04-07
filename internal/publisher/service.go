@@ -139,7 +139,14 @@ func (s *Service) spawnOutputs(
 		}
 	}
 
-	// TODO: push destinations not yet implemented
+	mediaBuf := s.mediaBufferForLocked(code)
+	for _, dest := range stream.Push {
+		if !dest.Enabled {
+			continue
+		}
+		d := dest // capture for goroutine
+		go s.serveRTMPPush(workerCtx, code, mediaBuf, d)
+	}
 }
 
 func publisherABRActive(stream *domain.Stream) bool {
