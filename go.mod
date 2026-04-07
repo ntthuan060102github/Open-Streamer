@@ -5,11 +5,13 @@ go 1.25.8
 require (
 	github.com/Eyevinn/mp4ff v0.51.0
 	github.com/bluenviron/gortsplib/v5 v5.5.1
+	github.com/bluenviron/mediacommon/v2 v2.8.3
 	github.com/datarhei/gosrt v0.10.0
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/jackc/pgx/v5 v5.7.4
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/nareix/joy4 v0.0.0-20200507095837-05a4ffbb5369
+	github.com/pion/rtp v1.10.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/samber/do/v2 v2.0.0
 	github.com/spf13/viper v1.21.0
@@ -30,7 +32,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/benburkert/openpgp v0.0.0-20160410205803-c2471f86866c // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bluenviron/mediacommon/v2 v2.8.3 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
@@ -80,7 +81,6 @@ require (
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.16 // indirect
-	github.com/pion/rtp v1.10.1 // indirect
 	github.com/pion/sdp/v3 v3.0.18 // indirect
 	github.com/pion/srtp/v3 v3.0.10 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
