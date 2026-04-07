@@ -192,10 +192,10 @@ Legend for **Completion**:
 | Unit tests — buffer ring / fan-out | Complete | |
 | Unit tests — ingestor dispatch + registry | Complete | |
 | Unit tests — pull readers (File, HTTP, UDP, RTMP packet parsing) | Complete | |
-| Unit tests — manager state machine | Partial | Core cases covered |
-| Unit tests — transcoder args construction | Partial | |
-| Unit tests — publisher HLS segmenter | Partial | |
-| Unit tests — dvr playlist parsing | Partial | |
+| Unit tests — manager state machine | Complete | selectBest, collectTimeoutIfNeeded, collectProbeIfNeeded |
+| Unit tests — transcoder args construction | Complete | buildScaleFilter, normalizeVideoEncoder, gopFrames, audioEncodeArgs, MaxBitrate/Framerate/CodecProfile |
+| Unit tests — publisher HLS segmenter | Complete | windowTailEntries, hlsCodecString, manifest generation, discontinuity, context cancel |
+| Unit tests — dvr playlist parsing | Complete | parsePlaylist (single/multi/disc/skip), loadIndex/saveIndex round-trip, atomic write |
 | CI (GitHub Actions) | Complete | `build`, `test`, `lint` (allow-fail), `govulncheck` jobs |
 | golangci-lint (`.golangci.yml`) | Complete | 0 issues |
 | gofumpt formatting | Complete | Enforced via CI formatter step |

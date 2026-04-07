@@ -75,6 +75,174 @@ func TestBuildFFmpegArgs_ExtraArgs(t *testing.T) {
 	require.Equal(t, "0", args[idx+1])
 }
 
+func TestBuildFFmpegArgs_MaxBitrateAndFramerate(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "3000k",
+		Codec: "h264", Preset: "fast",
+		MaxBitrate: 4000, Framerate: 30,
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+	require.Contains(t, args, "-maxrate")
+	require.Contains(t, args, "4000k")
+	require.Contains(t, args, "-bufsize")
+	require.Contains(t, args, "8000k")
+	require.Contains(t, args, "-r")
+	require.Contains(t, args, "30.000")
+}
+
+func TestBuildFFmpegArgs_CodecProfileAndLevel(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	p := []Profile{{
+		Bitrate: "2000k", Codec: "h264", Preset: "fast",
+		CodecProfile: "high", CodecLevel: "4.1",
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+	require.Contains(t, args, "-profile:v")
+	require.Contains(t, args, "high")
+	require.Contains(t, args, "-level")
+	require.Contains(t, args, "4.1")
+}
+
+func TestBuildFFmpegArgs_NoProfiles(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{}
+	_, err := buildFFmpegArgs(nil, tc)
+	require.Error(t, err)
+}
+
+func TestBuildFFmpegArgs_NilTranscoderConfig(t *testing.T) {
+	t.Parallel()
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k", Codec: "h264"}}, nil)
+	require.NoError(t, err)
+	require.Contains(t, args, "pipe:1")
+}
+
+func TestBuildScaleFilter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		w, h    int
+		wantPfx string
+		wantNil bool
+	}{
+		{0, 0, "", true},
+		{1280, 720, "scale=1280:720:", false},
+		{1280, 0, "scale=1280:-2:", false},
+		{0, 720, "scale=-2:720:", false},
+	}
+	for _, tt := range tests {
+		got := buildScaleFilter(tt.w, tt.h)
+		if tt.wantNil {
+			require.Empty(t, got)
+		} else {
+			require.Contains(t, got, tt.wantPfx)
+		}
+	}
+}
+
+func TestNormalizeVideoEncoder(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		codec string
+		hw    domain.HWAccel
+		want  string
+	}{
+		{"", domain.HWAccelNone, "libx264"},
+		{"h264", domain.HWAccelNone, "libx264"},
+		{"avc", domain.HWAccelNone, "libx264"},
+		{"h264", domain.HWAccelNVENC, "h264_nvenc"},
+		{"h265", domain.HWAccelNone, "libx265"},
+		{"hevc", domain.HWAccelNVENC, "hevc_nvenc"},
+		{"vp9", domain.HWAccelNone, "libvpx-vp9"},
+		{"av1", domain.HWAccelNone, "libsvtav1"},
+		{"h264_nvenc", domain.HWAccelNone, "h264_nvenc"}, // passthrough
+	}
+	for _, tt := range cases {
+		got := normalizeVideoEncoder(tt.codec, tt.hw)
+		require.Equal(t, tt.want, got, "codec=%q hw=%v", tt.codec, tt.hw)
+	}
+}
+
+func TestGopFrames(t *testing.T) {
+	t.Parallel()
+	// Global GOP takes precedence.
+	tc := &domain.TranscoderConfig{Global: domain.TranscoderGlobalConfig{GOP: 50}}
+	require.Equal(t, 50, gopFrames(tc, Profile{}))
+
+	// KeyframeInterval × fps.
+	tc2 := &domain.TranscoderConfig{}
+	p := Profile{KeyframeInterval: 2, Framerate: 25}
+	require.Equal(t, 50, gopFrames(tc2, p))
+
+	// KeyframeInterval with global fps fallback.
+	tc3 := &domain.TranscoderConfig{Global: domain.TranscoderGlobalConfig{FPS: 30}}
+	p3 := Profile{KeyframeInterval: 2}
+	require.Equal(t, 60, gopFrames(tc3, p3))
+
+	// No info → 0 (encoder default).
+	tc4 := &domain.TranscoderConfig{}
+	require.Equal(t, 0, gopFrames(tc4, Profile{}))
+}
+
+func TestAudioEncodeArgs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		cfg     domain.AudioTranscodeConfig
+		wantEnc string
+		wantBr  string
+	}{
+		{domain.AudioTranscodeConfig{Codec: domain.AudioCodecAAC, Bitrate: 192}, "aac", "192k"},
+		{domain.AudioTranscodeConfig{Codec: "mp3", Bitrate: 128}, "libmp3lame", "128k"},
+		{domain.AudioTranscodeConfig{Codec: "opus", Bitrate: 96}, "libopus", "96k"},
+		{domain.AudioTranscodeConfig{Codec: "ac3", Bitrate: 384}, "ac3", "384k"},
+		{domain.AudioTranscodeConfig{}, "aac", "128k"}, // defaults
+	}
+	for _, tt := range cases {
+		tc := &domain.TranscoderConfig{Audio: tt.cfg}
+		args := audioEncodeArgs(tc)
+		require.Contains(t, args, tt.wantEnc)
+		require.Contains(t, args, tt.wantBr)
+	}
+}
+
+func TestAudioEncodeArgs_SampleRateAndChannels(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Audio: domain.AudioTranscodeConfig{
+			Codec:      domain.AudioCodecAAC,
+			Bitrate:    128,
+			SampleRate: 48000,
+			Channels:   2,
+		},
+	}
+	args := audioEncodeArgs(tc)
+	require.Contains(t, args, "-ar")
+	require.Contains(t, args, "48000")
+	require.Contains(t, args, "-ac")
+	require.Contains(t, args, "2")
+}
+
+func TestAudioEncodeArgs_Normalize(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Audio: domain.AudioTranscodeConfig{Codec: domain.AudioCodecAAC, Normalize: true},
+	}
+	args := audioEncodeArgs(tc)
+	require.Contains(t, args, "-af")
+	normalize := args[indexOf(args, "-af")+1]
+	require.Contains(t, normalize, "loudnorm")
+}
+
 func indexOf(s []string, v string) int {
 	for i, x := range s {
 		if x == v {
