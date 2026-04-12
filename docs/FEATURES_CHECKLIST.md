@@ -3,7 +3,7 @@
 Legend for **Completion**:
 
 | Level | Meaning |
-|-------|---------|
+| ------- | --------- |
 | **Complete** | Implemented and usable for the described scope |
 | **Partial** | Works with known limitations or narrow codec/path support |
 | **Stub** | Registered in config/API but no real implementation |
@@ -15,7 +15,7 @@ Legend for **Completion**:
 ## Core Platform
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Configuration (`config/`, viper/env) | Complete | Single `Config` loaded at startup; OPEN_STREAMER_ env prefix |
 | Dependency injection (`samber/do/v2`) | Complete | All services wired in `cmd/server/main.go` |
 | Structured logging (`slog`, `pkg/logger`) | Complete | `text` / `json` format; configurable level |
@@ -27,7 +27,7 @@ Legend for **Completion**:
 ## Storage & API
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Stream repository — JSON file | Complete | Default store; configurable dir |
 | Stream repository — SQL (Postgres/MySQL) | Complete | pgx + sqlx; JSONB storage; auto-migrate on startup |
 | Stream repository — MongoDB | Complete | mongo-driver v2; BSON+JSON; indexes created on startup |
@@ -50,7 +50,7 @@ Legend for **Completion**:
 ## Buffer Hub
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | In-memory ring buffer per stream ID | Complete | Fan-out via independent subscribers; write never blocks |
 | Raw ingest buffer (`$raw$<code>`) | Complete | Created when internal transcoding is active |
 | Rendition buffers (`$r$<code>$track_N`) | Complete | One buffer per ABR ladder rung |
@@ -62,7 +62,7 @@ Legend for **Completion**:
 ## Ingest
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Pull — HLS | Complete | M3U8 parser, segment fetch, retry + backoff |
 | Pull — HTTP (raw MPEG-TS) | Complete | |
 | Pull — RTSP | Complete | Rewritten with gortsplib v5: RTCP A/V sync, RTP reorder buffer, proper DTS extraction (DTSExtractor), H.264 + H.265 + AAC |
@@ -81,7 +81,7 @@ Legend for **Completion**:
 ## Stream Manager (Failover)
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Multi-input registration with priority | Complete | Lower priority value = higher priority |
 | Packet timestamp health tracking | Complete | `RecordPacket` called on every ingest packet |
 | Input timeout detection | Complete | Configurable via `manager.input_packet_timeout_sec` |
@@ -95,7 +95,7 @@ Legend for **Completion**:
 ## Transcoder
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | FFmpeg subprocess (stdin TS → stdout TS) | Complete | `exec.CommandContext`; killed with context |
 | Multiple profiles = multiple FFmpeg processes | Complete | One encoder per `track_N`; shared raw ingest buffer |
 | Bounded worker pool | Complete | Semaphore; `transcoder.max_workers` (default 4) |
@@ -114,7 +114,7 @@ Legend for **Completion**:
 ## Publisher — Delivery
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | HLS — single rendition | Complete | Native TS segmenter + media playlist |
 | HLS — ABR (master + `track_N` sub-playlists) | Complete | When transcoding ladder is active |
 | HLS — `#EXT-X-DISCONTINUITY` on failover | Complete | Per-variant generation counter; exactly one tag per failover |
@@ -130,7 +130,7 @@ Legend for **Completion**:
 ## Coordinator & Lifecycle
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Start pipeline (buffer → manager → publisher → transcoder) | Complete | Creates raw + rendition buffers as needed |
 | Auto-start DVR when `stream.dvr.enabled` | Complete | Called from `Coordinator.Start` after publisher setup |
 | Auto-stop DVR when stream stops | Complete | `Coordinator.Stop` calls `dvr.StopRecording` before teardown |
@@ -142,7 +142,7 @@ Legend for **Completion**:
 ## DVR
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Persistent recording (ID = stream code) | Complete | One recording per stream; survives restarts |
 | Segment writing (MPEG-TS, configurable duration) | Complete | PTS-based cutting; wall-clock fallback for raw-TS sources |
 | Gap detection + `#EXT-X-DISCONTINUITY` | Complete | Gap timer = 2 × segment duration; partial segment flushed on gap |
@@ -164,7 +164,7 @@ Legend for **Completion**:
 ## Events & Hooks
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | In-process event bus | Complete | Typed events; bounded queue (512); worker pool |
 | Event types | Complete | `stream.*`, `input.*`, `recording.*`, `segment.written`, `transcoder.*` — all wired and published |
 | HTTP webhook delivery | Complete | Retries, timeout, optional HMAC (`X-OpenStreamer-Signature`) |
@@ -176,7 +176,7 @@ Legend for **Completion**:
 ## Domain Extras (Not in Live Pipeline)
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Watermark config on `Stream` | Schema only | Fields exist; not applied in transcoder graph |
 | Thumbnail config on `Stream` | Schema only | Fields exist; not generated alongside outputs |
 | `TranscodeMode` (passthrough / remux) | Complete | `transcoder.mode: passthrough/remux` bypasses FFmpeg entirely |
@@ -186,7 +186,7 @@ Legend for **Completion**:
 ## Testing & Quality
 
 | Feature | Completion | Notes |
-|---------|------------|-------|
+| --------- | ------------ | ------- |
 | Unit tests — protocol detection | Complete | |
 | Unit tests — buffer ring / fan-out | Complete | |
 | Unit tests — ingestor dispatch + registry | Complete | |
@@ -208,7 +208,7 @@ Legend for **Completion**:
 ### Without internal transcoding
 
 | Ingest (pull) | HLS | DASH |
-|---------------|-----|------|
+| --------------- | ----- | ------ |
 | File | OK | OK |
 | HLS | OK | OK |
 | RTMP | OK | OK |
@@ -218,7 +218,7 @@ Legend for **Completion**:
 ### With internal transcoding (FFmpeg ABR ladder)
 
 | Ingest (pull) | HLS | DASH |
-|---------------|-----|------|
+| --------------- | ----- | ------ |
 | File | OK | OK |
 | HLS | OK | OK |
 | RTMP | OK | OK |
@@ -228,7 +228,7 @@ Legend for **Completion**:
 ### Push ingest
 
 | Ingest (push) | HLS | DASH |
-|---------------|-----|------|
+| --------------- | ----- | ------ |
 | RTMP push (OBS/FFmpeg) | OK | OK |
 | SRT push | — | — |
 
@@ -243,4 +243,4 @@ Legend for **Completion**:
 
 ---
 
-*Updated against codebase state 2026-04-07 (Kafka hooks, full event wiring, FFmpeg auto-restart, exhausted-input detection, Prometheus metrics fully wired). Update this file when feature status changes.*
+*Updated against codebase state 2026-04-11 (Kafka hooks, full event wiring, FFmpeg auto-restart, exhausted-input detection, Prometheus metrics fully wired). Update this file when feature status changes.*

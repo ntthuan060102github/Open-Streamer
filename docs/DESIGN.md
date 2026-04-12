@@ -23,7 +23,7 @@ This document describes the working principles of each major subsystem in detail
 
 ## 1. Overall Data Flow
 
-```
+```text
 ┌─────────────┐     MPEG-TS      ┌──────────────┐     fan-out     ┌─────────────┐
 │  Ingestor   │ ───────────────► │  Buffer Hub  │ ──────────────► │  Publisher  │
 │  (goroutine)│                  │  (ring buf)  │                 │  HLS/DASH/  │
@@ -42,7 +42,7 @@ Every MPEG-TS packet written by the Ingestor passes through the Buffer Hub exact
 
 **When ABR transcoding is active**, two buffer namespaces exist:
 
-```
+```text
 Ingestor → $raw$<code>  →  Transcoder → $r$<code>$track_1 → Publisher (rendition 1)
                                       → $r$<code>$track_2 → Publisher (rendition 2)
                                       → $r$<code>$track_N → Publisher (rendition N)
@@ -90,7 +90,7 @@ Each consumer calls `buf.Subscribe(bufferID)` to get a `*Subscriber` with a priv
 
 ## 3. Coordinator
 
-### Purpose
+### Responsibility
 
 Wires the full per-stream pipeline in the correct order on `Start()` and tears it down cleanly on `Stop()`.
 
@@ -122,7 +122,7 @@ DVR always records from `mediaBufID` — the best available quality after transc
 
 ## 4. Ingestor
 
-### Purpose
+### Overview
 
 Ingests live video from any source protocol and writes MPEG-TS packets into the Buffer Hub. One goroutine per stream. No FFmpeg.
 
@@ -131,7 +131,7 @@ Ingests live video from any source protocol and writes MPEG-TS packets into the 
 `protocol.Detect(url)` inspects the URL scheme and host:
 
 | Scheme | Host | Result |
-|--------|------|--------|
+| ------ | ---- | ------ |
 | `rtmp://`, `rtmps://` | non-wildcard | `KindRTMP` (pull) |
 | `rtsp://` | any | `KindRTSP` (pull) |
 | `srt://` | non-wildcard | `KindSRT` (pull) |
@@ -160,7 +160,7 @@ Push servers (`push.RTMPServer`, `push.SRTServer`) are shared singletons — one
 
 **RTMP push relay architecture:**
 
-```
+```text
 OBS/FFmpeg ──RTMP publish──► gomedia RTMPServer
                                     │ OnPublish(key):
                                     │  1. registry.Acquire(key) → streamID
@@ -252,7 +252,7 @@ A semaphore caps the total number of concurrent FFmpeg processes across all stre
 
 ### Pipeline Per Rendition
 
-```
+```text
 $raw$<code> subscriber
       │ Packet.TS or Packet.AV
       ▼
@@ -272,7 +272,7 @@ Two goroutines per FFmpeg process: one reads stdout (transcoded TS), one drains 
 The `global.hw_accel` field maps to FFmpeg flags:
 
 | Value | FFmpeg flags |
-|-------|-------------|
+| ----- | ------------ |
 | `none` | `-c:v libx264` (software) |
 | `nvenc` | `-hwaccel cuda -c:v h264_nvenc` |
 | `vaapi` | `-hwaccel vaapi -c:v h264_vaapi` |
@@ -348,7 +348,7 @@ HLS sources deliver content faster than real-time (they dump an entire 6-second 
 
 Solution: track `segStartPTSms` from the first packet's `PTSms` field. Cut condition:
 
-```
+```text
 (pktPTSms - segStartPTSms) >= segDurMS
 ```
 
@@ -385,7 +385,7 @@ On `StartRecording`, before spawning the record goroutine:
 
 `writePlaylist` iterates `sess.segments` in order and emits:
 
-```
+```text
 #EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:<max_seg_sec>
@@ -465,7 +465,7 @@ Handlers registered with `Subscribe(eventType, handler)` are called by worker go
 ### Domain Events
 
 | Event Type | Trigger | Payload |
-|------------|---------|---------|
+| ---------- | ------- | ------- |
 | `stream.created` | Stream PUT (new) | `stream_code` |
 | `stream.started` | Coordinator.Start success | `stream_code` |
 | `stream.stopped` | Coordinator.Stop | `stream_code` |
@@ -485,7 +485,7 @@ The HTTP hook dispatcher sends a POST to the registered `target` URL with:
 - Timeout: `hook.TimeoutSec`
 - Retries: `hook.MaxRetries` with exponential backoff
 
-NATS and Kafka deliverers are stubs that return `ErrNotImplemented`.
+The Kafka deliverer uses `segmentio/kafka-go` with a lazy writer per topic; brokers are configured via `hooks.kafka_brokers`. NATS is not implemented.
 
 ---
 
@@ -522,7 +522,7 @@ The `store/` package is the **only** package allowed to import database drivers.
 
 Stores each entity type as a single JSON file:
 
-```
+```text
 ./data/
   streams.json      { "<code>": Stream, ... }
   recordings.json   { "<id>": Recording, ... }
@@ -618,4 +618,4 @@ Graceful shutdown calls `injector.Shutdown()`, which invokes `HealthCheck` / `Sh
 
 ---
 
-*Updated 2026-04-06. Keep this document in sync when changing subsystem behaviour.*
+*Updated 2026-04-11. Keep this document in sync when changing subsystem behaviour.*
