@@ -59,7 +59,15 @@ jobs:
         run: go build -o /dev/null ./...
 
       - name: Test
-        run: go test -race -shuffle=on -count=1 -timeout=5m ./...
+        run: go test -race -shuffle=on -count=1 -timeout=5m -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage to Codecov
+        if: matrix.go == 'stable'
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   swagger:
     name: swagger docs
