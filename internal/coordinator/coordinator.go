@@ -25,10 +25,10 @@ import (
 // Coordinator starts and stops the full per-stream pipeline.
 type Coordinator struct {
 	buf        *buffer.Service
-	mgr        *manager.Service
-	tc         *transcoder.Service
-	pub        *publisher.Service
-	dvr        *dvr.Service
+	mgr        mgrDep
+	tc         tcDep
+	pub        pubDep
+	dvr        dvrDep
 	bus        events.Bus
 	m          *metrics.Metrics
 	streamRepo store.StreamRepository
@@ -54,6 +54,32 @@ func New(i do.Injector) (*Coordinator, error) {
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
 	c.mgr.SetRestoredCallback(c.handleInputRestored)
 	return c, nil
+}
+
+// newForTesting builds a Coordinator from pre-constructed deps, for use in tests.
+func newForTesting(
+	buf *buffer.Service,
+	mgr mgrDep,
+	tc tcDep,
+	pub pubDep,
+	dvr dvrDep,
+	bus events.Bus,
+	m *metrics.Metrics,
+) *Coordinator {
+	c := &Coordinator{
+		buf:        buf,
+		mgr:        mgr,
+		tc:         tc,
+		pub:        pub,
+		dvr:        dvr,
+		bus:        bus,
+		m:          m,
+		renditions: make(map[domain.StreamCode][]string),
+	}
+	c.tc.SetFatalCallback(c.handleTranscoderFatal)
+	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
+	c.mgr.SetRestoredCallback(c.handleInputRestored)
+	return c
 }
 
 // Start creates the buffer, registers the stream with the manager (ingest + failover),
@@ -150,7 +176,9 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		}
 	}
 
-	c.m.StreamStartTimeSeconds.WithLabelValues(string(stream.Code)).Set(float64(time.Now().Unix()))
+	if c.m != nil {
+		c.m.StreamStartTimeSeconds.WithLabelValues(string(stream.Code)).Set(float64(time.Now().Unix()))
+	}
 
 	c.bus.Publish(ctx, domain.Event{
 		Type:       domain.EventStreamStarted,
@@ -187,7 +215,9 @@ func (c *Coordinator) Stop(streamID domain.StreamCode) {
 	c.buf.Delete(buffer.RawIngestBufferID(streamID))
 	c.buf.Delete(streamID)
 
-	c.m.StreamStartTimeSeconds.DeleteLabelValues(string(streamID))
+	if c.m != nil {
+		c.m.StreamStartTimeSeconds.DeleteLabelValues(string(streamID))
+	}
 
 	c.bus.Publish(context.Background(), domain.Event{
 		Type:       domain.EventStreamStopped,
@@ -223,26 +253,33 @@ func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error
 		if err := c.reloadProfiles(new, diff.ProfilesDiff); err != nil {
 			return fmt.Errorf("coordinator: reload profiles: %w", err)
 		}
+		// Push updated profile metadata to the live HLS master playlist writer so
+		// resolution/bandwidth info reflects the new profile without a publisher restart.
+		if len(diff.ProfilesDiff.Updated) > 0 {
+			c.pub.UpdateABRMasterMeta(new.Code, abrMetaFromUpdated(new, diff.ProfilesDiff.Updated))
+		}
 	}
 
 	if diff.InputsChanged {
 		c.mgr.UpdateInputs(new.Code, diff.AddedInputs, diff.RemovedInputs, diff.UpdatedInputs)
 	}
 
-	// If profile count changed, the master playlist layout changed → publisher restart.
-	// If protocols or push destinations changed, publisher also needs restart.
-	needPubRestart := diff.ProtocolsChanged || diff.PushChanged ||
-		(diff.ProfilesDiff != nil && diff.ProfilesDiff.HasAddedOrRemoved())
-	if needPubRestart {
-		if err := c.reloadPublisher(ctx, new); err != nil {
-			return fmt.Errorf("coordinator: reload publisher: %w", err)
+	// Profile add/remove: restart only HLS+DASH (RTSP/SRT viewers unaffected).
+	if diff.ProfilesDiff != nil && diff.ProfilesDiff.HasAddedOrRemoved() {
+		if err := c.pub.RestartHLSDASH(ctx, new); err != nil {
+			return fmt.Errorf("coordinator: restart hls/dash: %w", err)
+		}
+	}
+
+	// Protocol/push changes: surgically stop/start only affected goroutines.
+	if diff.ProtocolsChanged || diff.PushChanged {
+		if err := c.pub.UpdateProtocols(ctx, old, new); err != nil {
+			return fmt.Errorf("coordinator: update protocols: %w", err)
 		}
 	}
 
 	if diff.DVRChanged {
 		c.reloadDVR(ctx, new)
-	} else if diff.TranscoderTopologyChanged {
-		// Already handled in reloadTranscoderFull
 	} else if diff.ProfilesDiff != nil && diff.ProfilesDiff.HasAddedOrRemoved() {
 		// Best rendition may have changed (profile added/removed); re-evaluate DVR buffer.
 		c.reloadDVRIfBufferChanged(ctx, old, new)
@@ -389,13 +426,28 @@ func (c *Coordinator) reloadProfiles(new *domain.Stream, pd *ProfilesDiff) error
 	return nil
 }
 
-// reloadPublisher stops and restarts the publisher with new config.
-func (c *Coordinator) reloadPublisher(ctx context.Context, new *domain.Stream) error {
-	c.pub.Stop(new.Code)
-	if err := c.pub.Start(ctx, new); err != nil {
-		return fmt.Errorf("publisher start: %w", err)
+// abrMetaFromUpdated converts ProfilesDiff.Updated entries to publisher.ABRRepMeta slices
+// so the live HLS master playlist can be rewritten without restarting the publisher.
+func abrMetaFromUpdated(stream *domain.Stream, updated []ProfileChange) []publisher.ABRRepMeta {
+	profiles := transcoderProfilesFromDomain(&stream.Transcoder.Video)
+	out := make([]publisher.ABRRepMeta, 0, len(updated))
+	for _, ch := range updated {
+		if ch.Index >= len(profiles) {
+			continue
+		}
+		p := profiles[ch.Index]
+		bwBps := 0
+		if ch.New != nil {
+			bwBps = ch.New.Bitrate * 1000
+		}
+		out = append(out, publisher.ABRRepMeta{
+			Slug:   buffer.VideoTrackSlug(ch.Index),
+			BwBps:  bwBps,
+			Width:  p.Width,
+			Height: p.Height,
+		})
 	}
-	return nil
+	return out
 }
 
 // reloadDVR stops any active recording and starts a new one when DVR is enabled.

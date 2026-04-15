@@ -89,10 +89,7 @@ func (s *Service) srtHandleConnect(req srt.ConnRequest) srt.ConnType {
 		return srt.REJECT
 	}
 
-	s.mu.Lock()
-	_, ok := s.mediaBuffer[domain.StreamCode(code)]
-	s.mu.Unlock()
-
+	_, ok := s.mediaBufferFor(domain.StreamCode(code))
 	if !ok {
 		slog.Warn("publisher: SRT connect rejected: stream not active", "streamid", req.StreamId())
 		return srt.REJECT
@@ -111,7 +108,11 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 	}
 	streamCode := domain.StreamCode(code)
 
-	bufID := s.mediaBufferFor(streamCode)
+	bufID, ok2 := s.mediaBufferFor(streamCode)
+	if !ok2 {
+		slog.Warn("publisher: SRT stream no longer active", "stream_code", streamCode)
+		return
+	}
 
 	sub, err := s.buf.Subscribe(bufID)
 	if err != nil {

@@ -29,22 +29,53 @@ var (
 	_ gortsplib.ServerHandlerOnSetup    = (*rtspHandler)(nil)
 )
 
+// ABRRepMeta carries updated metadata for one ABR rendition used in in-place master
+// playlist rewrites (e.g. after a profile bitrate/resolution change without an ABR
+// ladder structure change).
+type ABRRepMeta struct {
+	Slug   string
+	BwBps  int
+	Width  int
+	Height int
+}
+
+// streamState holds per-stream publisher lifecycle state.
+// Each output protocol has its own context so it can be stopped independently.
+type streamState struct {
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+
+	// mediaBuf is the Buffer Hub ID for single-rendition outputs (RTSP, RTMP push, SRT).
+	// When ABR is active this is the best rendition; otherwise it is the stream code.
+	mediaBuf domain.StreamCode
+
+	mu sync.Mutex
+	// protocols maps per-protocol keys ("hls", "dash", "rtsp", "push:<url>") to their
+	// cancel funcs. Cancelling one key stops only that output goroutine.
+	protocols map[string]context.CancelFunc
+
+	// hlsMaster is set by serveHLSAdaptive so UpdateABRMasterMeta can push in-place
+	// metadata updates to the running master playlist writer.
+	hlsMaster *hlsABRMaster
+}
+
 // Service manages all output workers for active streams.
 type Service struct {
 	cfg        config.PublisherConfig
 	buf        *buffer.Service
 	bus        events.Bus
 	ffmpegPath string
-	// hlsFailoverGen: incremented on each input.failover so every ABR variant segmenter can tag
-	// exactly one EXT-X-DISCONTINUITY on its next flush (bool map would only let the first variant win).
+
+	// hlsFailoverGen: incremented on each input.failover so every ABR variant segmenter
+	// can tag exactly one EXT-X-DISCONTINUITY on its next flush.
 	hlsFailoverMu  sync.Mutex
 	hlsFailoverGen map[domain.StreamCode]uint64
-	mu             sync.Mutex
-	workers        map[domain.StreamCode]context.CancelFunc
-	// streamWorkCtx is the per-stream publisher worker context (same lifetime as workers).
-	streamWorkCtx map[domain.StreamCode]context.Context
-	// mediaBuffer is the Buffer Hub id for single-rendition outputs (RTSP, RTMP, SRT, push, DVR via API).
-	// When transcoding produces an ABR ladder, this is the best rung ($r$...), not the logical stream code.
+
+	mu      sync.Mutex
+	streams map[domain.StreamCode]*streamState
+
+	// mediaBuffer mirrors streamState.mediaBuf for fast lookup from RTMP/SRT play
+	// handlers that hold s.mu but cannot access streamState fields directly.
 	mediaBuffer map[domain.StreamCode]domain.StreamCode
 
 	rtspMounts   map[string]*gortsplib.ServerStream // path -> stream
@@ -72,8 +103,7 @@ func New(i do.Injector) (*Service, error) {
 		bus:            bus,
 		ffmpegPath:     ffmpegPath,
 		hlsFailoverGen: make(map[domain.StreamCode]uint64),
-		workers:        make(map[domain.StreamCode]context.CancelFunc),
-		streamWorkCtx:  make(map[domain.StreamCode]context.Context),
+		streams:        make(map[domain.StreamCode]*streamState),
 		mediaBuffer:    make(map[domain.StreamCode]domain.StreamCode),
 		rtspMounts:     make(map[string]*gortsplib.ServerStream),
 		rtspSrvReady:   make(chan struct{}),
@@ -89,7 +119,7 @@ func New(i do.Injector) (*Service, error) {
 	return svc, nil
 }
 
-// hlsFailoverGenSnapshot returns the current failover generation for streamID (for segmenter local state).
+// hlsFailoverGenSnapshot returns the current failover generation for streamID.
 func (s *Service) hlsFailoverGenSnapshot(streamID domain.StreamCode) uint64 {
 	s.hlsFailoverMu.Lock()
 	defer s.hlsFailoverMu.Unlock()
@@ -101,7 +131,7 @@ func (s *Service) Start(ctx context.Context, stream *domain.Stream) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.workers[stream.Code]; ok {
+	if _, ok := s.streams[stream.Code]; ok {
 		return fmt.Errorf("publisher: stream %s already running", stream.Code)
 	}
 
@@ -117,49 +147,278 @@ func (s *Service) Start(ctx context.Context, stream *domain.Stream) error {
 		}
 	}
 
-	workerCtx, cancel := context.WithCancel(ctx)
-	s.workers[stream.Code] = cancel
-	s.streamWorkCtx[stream.Code] = workerCtx
-	s.mediaBuffer[stream.Code] = buffer.PlaybackBufferID(stream.Code, stream.Transcoder)
+	baseCtx, baseCancel := context.WithCancel(ctx)
+	ss := &streamState{
+		baseCtx:    baseCtx,
+		baseCancel: baseCancel,
+		mediaBuf:   buffer.PlaybackBufferID(stream.Code, stream.Transcoder),
+		protocols:  make(map[string]context.CancelFunc),
+	}
+	s.streams[stream.Code] = ss
+	s.mediaBuffer[stream.Code] = ss.mediaBuf
 
-	s.spawnOutputs(workerCtx, stream, p)
+	//nolint:contextcheck // goroutines derive from ss.baseCtx (stream lifetime), not request ctx; by design
+	s.spawnOutputsLocked(ss, stream, p)
 
 	return nil
 }
 
-func (s *Service) spawnOutputs(
-	workerCtx context.Context,
-	stream *domain.Stream,
-	p domain.OutputProtocols,
-) {
-	code := stream.Code
+// spawnOutputsLocked launches goroutines for each enabled protocol.
+// Caller must hold s.mu.
+func (s *Service) spawnOutputsLocked(ss *streamState, stream *domain.Stream, p domain.OutputProtocols) {
 	if p.HLS {
-		if publisherABRActive(stream) {
-			go s.serveHLSAdaptive(workerCtx, stream)
-		} else {
-			go s.serveHLS(workerCtx, s.mediaBufferForLocked(code))
-		}
+		s.spawnProtocolLocked(ss, "hls", s.hlsFunc(ss, stream))
 	}
 	if p.DASH {
-		if publisherABRActive(stream) {
-			go s.serveDASHAdaptive(workerCtx, stream)
-		} else {
-			go s.serveDASH(workerCtx, s.mediaBufferForLocked(code))
-		}
+		s.spawnProtocolLocked(ss, "dash", s.dashFunc(stream))
 	}
-
-	mediaBuf := s.mediaBufferForLocked(code)
-
 	if p.RTSP {
-		go s.serveRTSP(workerCtx, code, mediaBuf)
+		mediaBuf := ss.mediaBuf
+		code := stream.Code
+		s.spawnProtocolLocked(ss, "rtsp", func(ctx context.Context) {
+			s.serveRTSP(ctx, code, mediaBuf)
+		})
 	}
-
 	for _, dest := range stream.Push {
 		if !dest.Enabled {
 			continue
 		}
-		d := dest // capture for goroutine
-		go s.serveRTMPPush(workerCtx, code, mediaBuf, d)
+		d := dest
+		mediaBuf := ss.mediaBuf
+		code := stream.Code
+		s.spawnProtocolLocked(ss, "push:"+d.URL, func(ctx context.Context) {
+			s.serveRTMPPush(ctx, code, mediaBuf, d)
+		})
+	}
+}
+
+// spawnProtocolLocked starts fn in a new goroutine with a child context derived from
+// ss.baseCtx. If a goroutine with the same key is already running, it is cancelled first.
+// Caller must hold s.mu (which serialises modifications to ss.protocols).
+func (s *Service) spawnProtocolLocked(ss *streamState, key string, fn func(context.Context)) {
+	ss.mu.Lock()
+	if cancel, ok := ss.protocols[key]; ok {
+		cancel()
+	}
+	ctx, cancel := context.WithCancel(ss.baseCtx)
+	ss.protocols[key] = cancel
+	ss.mu.Unlock()
+	go fn(ctx)
+}
+
+// stopProtocol cancels the goroutine for a single protocol key without affecting others.
+func (s *Service) stopProtocol(streamID domain.StreamCode, key string) {
+	s.mu.Lock()
+	ss := s.streams[streamID]
+	s.mu.Unlock()
+	if ss == nil {
+		return
+	}
+	ss.mu.Lock()
+	if cancel, ok := ss.protocols[key]; ok {
+		cancel()
+		delete(ss.protocols, key)
+	}
+	ss.mu.Unlock()
+}
+
+// hlsFunc returns a closure that runs the HLS output for stream, wiring hlsMaster
+// back into ss so UpdateABRMasterMeta can reach it.
+func (s *Service) hlsFunc(ss *streamState, stream *domain.Stream) func(context.Context) {
+	return func(ctx context.Context) {
+		if publisherABRActive(stream) {
+			s.serveHLSAdaptive(ctx, stream, ss)
+		} else {
+			// Single-rendition: mediaBuf is stable; read without lock.
+			s.serveHLS(ctx, ss.mediaBuf)
+		}
+	}
+}
+
+// dashFunc returns a closure that runs the DASH output for stream.
+func (s *Service) dashFunc(stream *domain.Stream) func(context.Context) {
+	return func(ctx context.Context) {
+		if publisherABRActive(stream) {
+			s.serveDASHAdaptive(ctx, stream)
+		} else {
+			s.serveDASH(ctx, stream.Code)
+		}
+	}
+}
+
+// Stop cancels all output workers for a stream.
+func (s *Service) Stop(streamID domain.StreamCode) {
+	s.mu.Lock()
+	ss, ok := s.streams[streamID]
+	if ok {
+		ss.baseCancel()
+		delete(s.streams, streamID)
+		delete(s.mediaBuffer, streamID)
+	}
+	s.mu.Unlock()
+
+	s.hlsFailoverMu.Lock()
+	delete(s.hlsFailoverGen, streamID)
+	s.hlsFailoverMu.Unlock()
+}
+
+// UpdateProtocols surgically stops/starts only the protocol goroutines that changed
+// between old and new stream configs. Goroutines for unchanged protocols keep running.
+// Call this when diff.ProtocolsChanged || diff.PushChanged.
+func (s *Service) UpdateProtocols(ctx context.Context, old, new *domain.Stream) error {
+	s.mu.Lock()
+	ss, ok := s.streams[new.Code]
+	if ok {
+		newBuf := buffer.PlaybackBufferID(new.Code, new.Transcoder)
+		if ss.mediaBuf != newBuf {
+			ss.mediaBuf = newBuf
+			s.mediaBuffer[new.Code] = newBuf
+		}
+	}
+	s.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("publisher: stream %s not running", new.Code)
+	}
+
+	op, np := old.Protocols, new.Protocols
+
+	// HLS: only act on OFF→ON or ON→OFF transitions.
+	// HLS+DASH restarts due to ABR ladder changes are handled by RestartHLSDASH.
+	if op.HLS && !np.HLS {
+		s.stopProtocol(new.Code, "hls")
+	} else if !op.HLS && np.HLS {
+		s.mu.Lock()
+		//nolint:contextcheck // goroutine derives from ss.baseCtx (stream lifetime); by design
+		s.spawnProtocolLocked(ss, "hls", s.hlsFunc(ss, new))
+		s.mu.Unlock()
+	}
+
+	// DASH
+	if op.DASH && !np.DASH {
+		s.stopProtocol(new.Code, "dash")
+	} else if !op.DASH && np.DASH {
+		s.mu.Lock()
+		//nolint:contextcheck // goroutine derives from ss.baseCtx (stream lifetime); by design
+		s.spawnProtocolLocked(ss, "dash", s.dashFunc(new))
+		s.mu.Unlock()
+	}
+
+	// RTSP
+	if op.RTSP && !np.RTSP {
+		s.stopProtocol(new.Code, "rtsp")
+	} else if !op.RTSP && np.RTSP {
+		mediaBuf := ss.mediaBuf
+		code := new.Code
+		s.mu.Lock()
+		//nolint:contextcheck // goroutine derives from ss.baseCtx (stream lifetime); by design
+		s.spawnProtocolLocked(ss, "rtsp", func(ctx context.Context) {
+			s.serveRTSP(ctx, code, mediaBuf)
+		})
+		s.mu.Unlock()
+	}
+
+	// Push destinations: diff by URL.
+	//nolint:contextcheck // goroutines derive from ss.baseCtx (stream lifetime); by design
+	s.updatePushDestinations(old.Push, new.Push, new.Code, ss)
+
+	return nil
+}
+
+// updatePushDestinations stops removed push goroutines and starts added ones.
+func (s *Service) updatePushDestinations(
+	oldPush, newPush []domain.PushDestination,
+	code domain.StreamCode,
+	ss *streamState,
+) {
+	oldByURL := make(map[string]domain.PushDestination, len(oldPush))
+	for _, d := range oldPush {
+		oldByURL[d.URL] = d
+	}
+	newByURL := make(map[string]domain.PushDestination, len(newPush))
+	for _, d := range newPush {
+		newByURL[d.URL] = d
+	}
+
+	// Stop removed or disabled destinations.
+	for _, od := range oldPush {
+		nd, stillExists := newByURL[od.URL]
+		if !stillExists || (!nd.Enabled && od.Enabled) {
+			s.stopProtocol(code, "push:"+od.URL)
+		}
+	}
+
+	// Start new or re-enabled destinations.
+	for _, nd := range newPush {
+		if !nd.Enabled {
+			continue
+		}
+		od, existed := oldByURL[nd.URL]
+		if !existed || (!od.Enabled && nd.Enabled) {
+			d := nd
+			mediaBuf := ss.mediaBuf
+			s.mu.Lock()
+			s.spawnProtocolLocked(ss, "push:"+d.URL, func(ctx context.Context) {
+				s.serveRTMPPush(ctx, code, mediaBuf, d)
+			})
+			s.mu.Unlock()
+		}
+	}
+}
+
+// RestartHLSDASH stops and restarts only the HLS and DASH goroutines with the new
+// stream config. Used when the ABR ladder count changes (profile added/removed) so the
+// master playlist and per-shard segmenters reflect the new rendition set.
+// RTSP, RTMP, and SRT goroutines are unaffected.
+func (s *Service) RestartHLSDASH(ctx context.Context, stream *domain.Stream) error {
+	s.mu.Lock()
+	ss, ok := s.streams[stream.Code]
+	if ok {
+		newBuf := buffer.PlaybackBufferID(stream.Code, stream.Transcoder)
+		ss.mediaBuf = newBuf
+		s.mediaBuffer[stream.Code] = newBuf
+	}
+	s.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("publisher: stream %s not running", stream.Code)
+	}
+
+	if stream.Protocols.HLS {
+		s.mu.Lock()
+		//nolint:contextcheck // goroutine derives from ss.baseCtx (stream lifetime); by design
+		s.spawnProtocolLocked(ss, "hls", s.hlsFunc(ss, stream))
+		s.mu.Unlock()
+	} else {
+		s.stopProtocol(stream.Code, "hls")
+	}
+	if stream.Protocols.DASH {
+		s.mu.Lock()
+		//nolint:contextcheck // goroutine derives from ss.baseCtx (stream lifetime); by design
+		s.spawnProtocolLocked(ss, "dash", s.dashFunc(stream))
+		s.mu.Unlock()
+	} else {
+		s.stopProtocol(stream.Code, "dash")
+	}
+	return nil
+}
+
+// UpdateABRMasterMeta applies updated bandwidth/resolution metadata to the running HLS
+// ABR master playlist writer. This avoids a full publisher restart when only a profile's
+// bitrate or resolution changes (but the ladder count stays the same).
+func (s *Service) UpdateABRMasterMeta(streamCode domain.StreamCode, updates []ABRRepMeta) {
+	s.mu.Lock()
+	ss, ok := s.streams[streamCode]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	ss.mu.Lock()
+	m := ss.hlsMaster
+	ss.mu.Unlock()
+	if m == nil {
+		return
+	}
+	for _, u := range updates {
+		m.SetRepOverride(u.Slug, u.BwBps, u.Width, u.Height)
 	}
 }
 
@@ -170,33 +429,11 @@ func publisherABRActive(stream *domain.Stream) bool {
 	return len(buffer.RenditionsForTranscoder(stream.Code, stream.Transcoder)) > 0
 }
 
-// mediaBufferForLocked returns the buffer id for MPEG-TS playout; caller must hold s.mu.
-func (s *Service) mediaBufferForLocked(code domain.StreamCode) domain.StreamCode {
-	if id, ok := s.mediaBuffer[code]; ok {
-		return id
-	}
-	return code
-}
-
-// mediaBufferFor returns the buffer id for logical stream code (RTMP play path, etc.).
-func (s *Service) mediaBufferFor(code domain.StreamCode) domain.StreamCode {
+// mediaBufferFor returns the buffer id for logical stream code (RTMP/SRT play handlers).
+// Returns ("", false) when the stream is not active.
+func (s *Service) mediaBufferFor(code domain.StreamCode) (domain.StreamCode, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mediaBufferForLocked(code)
-}
-
-// Stop cancels all output workers for a stream.
-func (s *Service) Stop(streamID domain.StreamCode) {
-	s.mu.Lock()
-	if cancel, ok := s.workers[streamID]; ok {
-		cancel()
-		delete(s.workers, streamID)
-	}
-	delete(s.streamWorkCtx, streamID)
-	delete(s.mediaBuffer, streamID)
-	s.mu.Unlock()
-
-	s.hlsFailoverMu.Lock()
-	delete(s.hlsFailoverGen, streamID)
-	s.hlsFailoverMu.Unlock()
+	id, ok := s.mediaBuffer[code]
+	return id, ok
 }

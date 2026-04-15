@@ -22,7 +22,8 @@ import (
 func (s *Service) serveDASHAdaptive(ctx context.Context, stream *domain.Stream) {
 	renditions := buffer.RenditionsForTranscoder(stream.Code, stream.Transcoder)
 	if len(renditions) == 0 {
-		s.serveDASH(ctx, s.mediaBufferFor(stream.Code))
+		mediaBuf, _ := s.mediaBufferFor(stream.Code)
+		s.serveDASH(ctx, mediaBuf)
 		return
 	}
 

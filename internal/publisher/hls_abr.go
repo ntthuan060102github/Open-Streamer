@@ -47,6 +47,11 @@ type hlsABRMaster struct {
 	streamID domain.StreamCode
 	reps     map[string]*hlsABRRep
 	debounce *time.Timer
+	// overrides holds metadata set externally (e.g. after a profile bitrate/resolution
+	// change). Values here take precedence over what segmenters report via onShardUpdated,
+	// so the master playlist reflects the new profile immediately without waiting for the
+	// next segment flush.
+	overrides sync.Map // map[string]*hlsABRRep (slug → rep override)
 }
 
 func newHLSABRMaster(rootPath string, streamID domain.StreamCode) *hlsABRMaster {
@@ -58,7 +63,17 @@ func newHLSABRMaster(rootPath string, streamID domain.StreamCode) *hlsABRMaster 
 }
 
 // onShardUpdated is called by each rendition segmenter after every segment flush.
+// If SetRepOverride was called for this slug, its values take precedence so the master
+// playlist reflects externally-set metadata (e.g. after a profile bitrate change).
 func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int) {
+	// Apply external override when present (persists across segment flushes).
+	if v, ok := m.overrides.Load(slug); ok {
+		ov := v.(*hlsABRRep)
+		bwBps = ov.bwBps
+		width = ov.width
+		height = ov.height
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -77,6 +92,27 @@ func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int) {
 		m.debounce.Stop()
 	}
 	m.debounce = time.AfterFunc(100*time.Millisecond, m.flushRoot)
+}
+
+// SetRepOverride updates the stored metadata for one ABR rendition and immediately
+// triggers a debounced master playlist rewrite. Future onShardUpdated calls for the
+// same slug will continue using these values, keeping the master playlist accurate
+// even before the first new segment arrives from the updated FFmpeg process.
+func (m *hlsABRMaster) SetRepOverride(slug string, bwBps, width, height int) {
+	ov := &hlsABRRep{slug: slug, bwBps: bwBps, width: width, height: height}
+	m.overrides.Store(slug, ov)
+
+	m.mu.Lock()
+	if r, ok := m.reps[slug]; ok && r.hasData {
+		r.bwBps = bwBps
+		r.width = width
+		r.height = height
+	}
+	if m.debounce != nil {
+		m.debounce.Stop()
+	}
+	m.debounce = time.AfterFunc(50*time.Millisecond, m.flushRoot)
+	m.mu.Unlock()
 }
 
 func (m *hlsABRMaster) flushRoot() {
@@ -130,7 +166,9 @@ func writeHLSMasterPlaylist(path string, reps []hlsABRRep) error {
 
 // serveHLSAdaptive is the ABR HLS output goroutine.  It spawns one segmenter
 // goroutine per ladder rung and waits for all of them to finish.
-func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream) {
+// ss is optional: when non-nil, the hlsABRMaster reference is stored in ss.hlsMaster
+// so that UpdateABRMasterMeta can push metadata updates without restarting the publisher.
+func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream, ss *streamState) {
 	code := stream.Code
 	hlsDir := strings.TrimSpace(s.cfg.HLS.Dir)
 	if hlsDir == "" {
@@ -141,7 +179,11 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream) {
 	rends := buffer.RenditionsForTranscoder(code, stream.Transcoder)
 	if len(rends) == 0 {
 		// Fall back to single-rendition if the transcoder has no ABR ladder.
-		s.serveHLS(ctx, s.mediaBufferForLocked(code))
+		mediaBuf := code
+		if ss != nil {
+			mediaBuf = ss.mediaBuf
+		}
+		s.serveHLS(ctx, mediaBuf)
 		return
 	}
 
@@ -154,6 +196,13 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream) {
 
 	rootManifest := filepath.Join(streamBase, "index.m3u8")
 	master := newHLSABRMaster(rootManifest, code)
+
+	// Register master in streamState so UpdateABRMasterMeta can reach it.
+	if ss != nil {
+		ss.mu.Lock()
+		ss.hlsMaster = master
+		ss.mu.Unlock()
+	}
 
 	segSec := s.cfg.HLS.LiveSegmentSec
 	win := s.cfg.HLS.LiveWindow
@@ -201,4 +250,11 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream) {
 		}(r)
 	}
 	wg.Wait()
+
+	// Clear master reference so UpdateABRMasterMeta no longer routes to a stopped master.
+	if ss != nil {
+		ss.mu.Lock()
+		ss.hlsMaster = nil
+		ss.mu.Unlock()
+	}
 }

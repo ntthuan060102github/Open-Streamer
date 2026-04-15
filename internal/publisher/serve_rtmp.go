@@ -51,9 +51,7 @@ func (s *Service) HandleRTMPPlay(
 ) error {
 	code := domain.StreamCode(key)
 
-	s.mu.Lock()
-	bufID, ok := s.mediaBuffer[code]
-	s.mu.Unlock()
+	bufID, ok := s.mediaBufferFor(code)
 	if !ok {
 		return fmt.Errorf("stream %q not active", key)
 	}
@@ -123,9 +121,7 @@ func (s *Service) handleRTMPPlayConn(ctx context.Context, conn net.Conn) {
 	})
 
 	handle.OnPlay(func(app, key string, start, duration float64, reset bool) gortmp.StatusCode {
-		s.mu.Lock()
-		_, ok := s.mediaBuffer[domain.StreamCode(key)]
-		s.mu.Unlock()
+		_, ok := s.mediaBufferFor(domain.StreamCode(key))
 		if !ok {
 			slog.Warn("publisher: RTMP play stream not found", "key", key)
 			return gortmp.NETSTREAM_PLAY_NOTFOUND
