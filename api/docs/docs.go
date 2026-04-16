@@ -1602,19 +1602,6 @@ const docTemplate = `{
                 }
             }
         },
-        "domain.TranscodeMode": {
-            "type": "string",
-            "enum": [
-                "passthrough",
-                "remux",
-                "transcode"
-            ],
-            "x-enum-varnames": [
-                "TranscodeModePassthrough",
-                "TranscodeModeRemux",
-                "TranscodeModeFull"
-            ]
-        },
         "domain.TranscoderConfig": {
             "type": "object",
             "properties": {
@@ -1633,14 +1620,6 @@ const docTemplate = `{
                 },
                 "global": {
                     "$ref": "#/definitions/domain.TranscoderGlobalConfig"
-                },
-                "mode": {
-                    "description": "Mode controls how the server processes the ingest stream.\npassthrough — skip FFmpeg entirely; raw MPEG-TS packets flow directly to the publisher.\nremux       — skip FFmpeg entirely; ingestor already rewraps to MPEG-TS on ingest.\ntranscode   — default; FFmpeg re-encodes according to Video/Audio config.\nEmpty string is treated as transcode.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.TranscodeMode"
-                        }
-                    ]
                 },
                 "video": {
                     "$ref": "#/definitions/domain.VideoTranscodeConfig"

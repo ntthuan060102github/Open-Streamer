@@ -575,16 +575,6 @@ definitions:
           0 = match source resolution.
         type: integer
     type: object
-  domain.TranscodeMode:
-    enum:
-    - passthrough
-    - remux
-    - transcode
-    type: string
-    x-enum-varnames:
-    - TranscodeModePassthrough
-    - TranscodeModeRemux
-    - TranscodeModeFull
   domain.TranscoderConfig:
     properties:
       audio:
@@ -600,15 +590,6 @@ definitions:
         type: array
       global:
         $ref: '#/definitions/domain.TranscoderGlobalConfig'
-      mode:
-        allOf:
-        - $ref: '#/definitions/domain.TranscodeMode'
-        description: |-
-          Mode controls how the server processes the ingest stream.
-          passthrough — skip FFmpeg entirely; raw MPEG-TS packets flow directly to the publisher.
-          remux       — skip FFmpeg entirely; ingestor already rewraps to MPEG-TS on ingest.
-          transcode   — default; FFmpeg re-encodes according to Video/Audio config.
-          Empty string is treated as transcode.
       video:
         $ref: '#/definitions/domain.VideoTranscodeConfig'
     type: object
