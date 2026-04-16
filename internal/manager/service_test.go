@@ -86,6 +86,76 @@ func TestSelectBest_ActiveInputIsEligible(t *testing.T) {
 	assert.Equal(t, 1, best.Input.Priority)
 }
 
+func TestSelectBestOverrideWinsOverHigherPriority(t *testing.T) {
+	t.Parallel()
+	// Override = 3 (lowest config priority), but it should win over 1 and 2.
+	p := 3
+	state := &streamState{
+		overridePriority: &p,
+		inputs: map[int]*InputHealth{
+			1: {Input: domain.Input{Priority: 1}, Status: domain.StatusIdle},
+			2: {Input: domain.Input{Priority: 2}, Status: domain.StatusIdle},
+			3: {Input: domain.Input{Priority: 3}, Status: domain.StatusIdle},
+		},
+	}
+	best := selectBest(state)
+	require.NotNil(t, best)
+	assert.Equal(t, 3, best.Input.Priority)
+}
+
+func TestSelectBestOverrideFallsBackWhenDegraded(t *testing.T) {
+	t.Parallel()
+	// Override input is degraded → falls back to normal priority ordering.
+	p := 3
+	state := &streamState{
+		overridePriority: &p,
+		inputs: map[int]*InputHealth{
+			1: {Input: domain.Input{Priority: 1}, Status: domain.StatusIdle},
+			3: {Input: domain.Input{Priority: 3}, Status: domain.StatusDegraded},
+		},
+	}
+	best := selectBest(state)
+	require.NotNil(t, best)
+	assert.Equal(t, 1, best.Input.Priority)
+}
+
+// ---- clearOverrideIfNeeded ---------------------------------------------------
+
+func TestClearOverrideIfNeededKeepsOverrideWhenBestMatches(t *testing.T) {
+	t.Parallel()
+	p := 3
+	state := &streamState{overridePriority: &p}
+	best := &InputHealth{Input: domain.Input{Priority: 3}}
+	clearOverrideIfNeeded("stream1", state, best)
+	require.NotNil(t, state.overridePriority)
+	assert.Equal(t, 3, *state.overridePriority)
+}
+
+func TestClearOverrideIfNeededClearsWhenBestDiffers(t *testing.T) {
+	t.Parallel()
+	p := 3
+	state := &streamState{overridePriority: &p}
+	best := &InputHealth{Input: domain.Input{Priority: 1}} // override lost, fell back to 1
+	clearOverrideIfNeeded("stream1", state, best)
+	assert.Nil(t, state.overridePriority)
+}
+
+func TestClearOverrideIfNeededClearsWhenBestNil(t *testing.T) {
+	t.Parallel()
+	p := 3
+	state := &streamState{overridePriority: &p}
+	clearOverrideIfNeeded("stream1", state, nil) // all inputs degraded
+	assert.Nil(t, state.overridePriority)
+}
+
+func TestClearOverrideIfNeededNoopWhenNoOverride(t *testing.T) {
+	t.Parallel()
+	state := &streamState{overridePriority: nil}
+	best := &InputHealth{Input: domain.Input{Priority: 1}}
+	clearOverrideIfNeeded("stream1", state, best)
+	assert.Nil(t, state.overridePriority)
+}
+
 // ---- collectTimeoutIfNeeded ---------------------------------------------------
 
 func TestCollectTimeoutIfNeeded_ActiveTimedOut(t *testing.T) {

@@ -1231,7 +1231,7 @@ paths:
       summary: Get stream
       tags:
       - streams
-    put:
+    post:
       consumes:
       - application/json
       parameters:
@@ -1240,7 +1240,7 @@ paths:
         name: code
         required: true
         type: string
-      - description: Full stream document
+      - description: Partial or full stream document
         in: body
         name: body
         required: true
@@ -1265,7 +1265,7 @@ paths:
           description: Internal Server Error
           schema:
             $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Create or update stream
+      summary: Create or partial-update stream
       tags:
       - streams
   /streams/{code}/inputs/switch:

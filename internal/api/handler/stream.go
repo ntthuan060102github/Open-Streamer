@@ -121,18 +121,19 @@ func (h *StreamHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": h.withStatus(stream)})
 }
 
-// Put creates or replaces a stream configuration.
-// @Summary Create or update stream
+// Put creates a new stream or partially updates an existing one.
+// Only fields present in the request body are applied; omitted fields keep their current values.
+// @Summary Create or partial-update stream
 // @Tags streams
 // @Accept json
 // @Produce json
 // @Param code path string true "Stream code"
-// @Param body body apidocs.StreamPutRequest true "Full stream document"
+// @Param body body apidocs.StreamPutRequest true "Partial or full stream document"
 // @Success 200 {object} apidocs.StreamData
 // @Success 201 {object} apidocs.StreamData
 // @Failure 400 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code} [put].
+// @Router /streams/{code} [post].
 func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	cur, exists, err := h.loadCurrentStream(r, code)
@@ -141,7 +142,7 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, validationErr := decodeStreamPutBody(r, code, cur, exists)
+	body, validationErr := decodeStreamBody(r, code, cur, exists)
 	if validationErr != nil {
 		writeError(w, http.StatusBadRequest, validationErr.code, validationErr.message)
 		return
@@ -156,8 +157,6 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if wasRunning {
-		// Hot-reload only the components that changed. Update() stops the pipeline
-		// internally when the stream transitions to Disabled.
 		if err := h.coordinator.Update(r.Context(), cur, body); err != nil {
 			writeError(w, http.StatusInternalServerError, "UPDATE_FAILED", err.Error())
 			return
@@ -194,37 +193,42 @@ func (h *StreamHandler) loadCurrentStream(
 	return nil, false, err
 }
 
-func decodeStreamPutBody(
+func decodeStreamBody(
 	r *http.Request,
 	code domain.StreamCode,
 	cur *domain.Stream,
 	exists bool,
 ) (*domain.Stream, *putValidationError) {
-	var body domain.Stream
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// Start from the existing stream so omitted fields keep their current values.
+	// For new streams, start from zero value.
+	var base domain.Stream
+	if exists {
+		base = *cur
+	}
+
+	// Unmarshal onto base — only fields present in the JSON are overwritten.
+	if err := json.NewDecoder(r.Body).Decode(&base); err != nil {
 		return nil, &putValidationError{code: "INVALID_BODY", message: err.Error()}
 	}
 
-	body.Code = code
-	if err := domain.ValidateStreamCode(string(body.Code)); err != nil {
+	base.Code = code
+	if err := domain.ValidateStreamCode(string(base.Code)); err != nil {
 		return nil, &putValidationError{code: "INVALID_CODE", message: err.Error()}
 	}
-	if err := body.ValidateInputPriorities(); err != nil {
+	if err := base.ValidateInputPriorities(); err != nil {
 		return nil, &putValidationError{code: "INVALID_INPUT_PRIORITY", message: err.Error()}
 	}
-	if err := body.ValidateUniqueInputs(); err != nil {
+	if err := base.ValidateUniqueInputs(); err != nil {
 		return nil, &putValidationError{code: "DUPLICATE_INPUT", message: err.Error()}
 	}
 
 	if exists {
-		if body.CreatedAt.IsZero() {
-			body.CreatedAt = cur.CreatedAt
-		}
+		base.CreatedAt = cur.CreatedAt
 	} else {
-		body.CreatedAt = time.Now()
+		base.CreatedAt = time.Now()
 	}
-	body.UpdatedAt = time.Now()
-	return &body, nil
+	base.UpdatedAt = time.Now()
+	return &base, nil
 }
 
 // Delete removes a stream and stops its pipeline.

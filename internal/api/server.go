@@ -84,7 +84,7 @@ func (s *Server) buildRouter(
 		r.Get("/", stream.List)
 		r.Route("/{code}", func(r chi.Router) {
 			r.Get("/", stream.Get)
-			r.Put("/", stream.Put)
+			r.Post("/", stream.Put)
 			r.Delete("/", stream.Delete)
 			r.Post("/start", stream.Start)
 			r.Post("/stop", stream.Stop)

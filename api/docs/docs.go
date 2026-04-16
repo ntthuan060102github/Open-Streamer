@@ -579,7 +579,7 @@ const docTemplate = `{
                     }
                 }
             },
-            "put": {
+            "post": {
                 "consumes": [
                     "application/json"
                 ],
@@ -589,7 +589,7 @@ const docTemplate = `{
                 "tags": [
                     "streams"
                 ],
-                "summary": "Create or update stream",
+                "summary": "Create or partial-update stream",
                 "parameters": [
                     {
                         "type": "string",
@@ -599,7 +599,7 @@ const docTemplate = `{
                         "required": true
                     },
                     {
-                        "description": "Full stream document",
+                        "description": "Partial or full stream document",
                         "name": "body",
                         "in": "body",
                         "required": true,

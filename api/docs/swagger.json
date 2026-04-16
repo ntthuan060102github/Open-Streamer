@@ -572,7 +572,7 @@
                     }
                 }
             },
-            "put": {
+            "post": {
                 "consumes": [
                     "application/json"
                 ],
@@ -582,7 +582,7 @@
                 "tags": [
                     "streams"
                 ],
-                "summary": "Create or update stream",
+                "summary": "Create or partial-update stream",
                 "parameters": [
                     {
                         "type": "string",
@@ -592,7 +592,7 @@
                         "required": true
                     },
                     {
-                        "description": "Full stream document",
+                        "description": "Partial or full stream document",
                         "name": "body",
                         "in": "body",
                         "required": true,
