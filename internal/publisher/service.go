@@ -10,6 +10,8 @@ package publisher
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -48,6 +50,10 @@ type streamState struct {
 	// mediaBuf is the Buffer Hub ID for single-rendition outputs (RTSP, RTMP push, SRT).
 	// When ABR is active this is the best rendition; otherwise it is the stream code.
 	mediaBuf domain.StreamCode
+
+	// wg tracks all protocol goroutines so Stop can wait for them to finish
+	// before cleaning up on-disk segments.
+	wg sync.WaitGroup
 
 	mu sync.Mutex
 	// protocols maps per-protocol keys ("hls", "dash", "rtsp", "push:<url>") to their
@@ -116,7 +122,26 @@ func New(i do.Injector) (*Service, error) {
 		svc.hlsFailoverMu.Unlock()
 		return nil
 	})
+
+	svc.cleanupAllOutputDirs()
+
 	return svc, nil
+}
+
+// cleanupAllOutputDirs wipes the HLS and DASH root directories on startup so
+// stale segments from a previous run are never served to clients.
+func (s *Service) cleanupAllOutputDirs() {
+	for _, dir := range []string{
+		strings.TrimSpace(s.cfg.HLS.Dir),
+		strings.TrimSpace(s.cfg.DASH.Dir),
+	} {
+		if dir == "" {
+			continue
+		}
+		if err := resetOutputDir(dir); err != nil {
+			slog.Warn("publisher: startup cleanup failed", "dir", dir, "err", err)
+		}
+	}
 }
 
 // hlsFailoverGenSnapshot returns the current failover generation for streamID.
@@ -203,7 +228,11 @@ func (s *Service) spawnProtocolLocked(ss *streamState, key string, fn func(conte
 	ctx, cancel := context.WithCancel(ss.baseCtx)
 	ss.protocols[key] = cancel
 	ss.mu.Unlock()
-	go fn(ctx)
+	ss.wg.Add(1)
+	go func() {
+		defer ss.wg.Done()
+		fn(ctx)
+	}()
 }
 
 // stopProtocol cancels the goroutine for a single protocol key without affecting others.
@@ -246,7 +275,8 @@ func (s *Service) dashFunc(stream *domain.Stream) func(context.Context) {
 	}
 }
 
-// Stop cancels all output workers for a stream.
+// Stop cancels all output workers for a stream, waits for them to finish,
+// and removes the on-disk segment directories (HLS/DASH).
 func (s *Service) Stop(streamID domain.StreamCode) {
 	s.mu.Lock()
 	ss, ok := s.streams[streamID]
@@ -260,6 +290,31 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 	s.hlsFailoverMu.Lock()
 	delete(s.hlsFailoverGen, streamID)
 	s.hlsFailoverMu.Unlock()
+
+	if ok {
+		// Wait for all protocol goroutines to finish so no writer races with
+		// the directory removal below.
+		ss.wg.Wait()
+		s.cleanupStreamDirs(streamID)
+	}
+}
+
+// cleanupStreamDirs removes the HLS and DASH output directories for a stream.
+func (s *Service) cleanupStreamDirs(streamID domain.StreamCode) {
+	if dir := strings.TrimSpace(s.cfg.HLS.Dir); dir != "" {
+		p := filepath.Join(dir, string(streamID))
+		if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("publisher: cleanup HLS dir failed",
+				"stream_code", streamID, "dir", p, "err", err)
+		}
+	}
+	if dir := strings.TrimSpace(s.cfg.DASH.Dir); dir != "" {
+		p := filepath.Join(dir, string(streamID))
+		if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("publisher: cleanup DASH dir failed",
+				"stream_code", streamID, "dir", p, "err", err)
+		}
+	}
 }
 
 // UpdateProtocols surgically stops/starts only the protocol goroutines that changed

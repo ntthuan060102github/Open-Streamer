@@ -252,16 +252,19 @@ func (h *StreamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// Start begins ingest/publish/transcode pipeline for the stream.
-// @Summary Start stream pipeline
+// Restart stops the running pipeline (if any), waits for full cleanup, then starts
+// a fresh pipeline. This guarantees all goroutines have exited and on-disk segments
+// have been removed before the new pipeline begins.
+// @Summary Restart stream pipeline
 // @Tags streams
 // @Produce json
 // @Param code path string true "Stream code"
 // @Success 200 {object} apidocs.StreamActionData
+// @Failure 400 {object} apidocs.ErrorBody
 // @Failure 404 {object} apidocs.ErrorBody
 // @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/start [post].
-func (h *StreamHandler) Start(w http.ResponseWriter, r *http.Request) {
+// @Router /streams/{code}/restart [post].
+func (h *StreamHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)
 	if err != nil {
@@ -272,6 +275,11 @@ func (h *StreamHandler) Start(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "STREAM_DISABLED", "stream is disabled; clear disabled flag before starting")
 		return
 	}
+
+	// Stop is blocking: waits for all goroutines to finish and cleans up on-disk
+	// segments before returning. Safe to call even when the pipeline is not running.
+	h.coordinator.Stop(code)
+
 	if err := h.coordinator.Start(r.Context(), stream); err != nil {
 		writeError(w, http.StatusInternalServerError, "START_FAILED", err.Error())
 		return
@@ -311,7 +319,8 @@ func (h *StreamHandler) SwitchInput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "switched"}})
 }
 
-// Stop tears down the stream pipeline.
+// Stop tears down the stream pipeline. Blocks until all goroutines have exited
+// and on-disk segments have been cleaned up.
 // @Summary Stop stream pipeline
 // @Tags streams
 // @Produce json
