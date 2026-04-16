@@ -72,6 +72,7 @@ func (s *Server) buildRouter(
 
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", readyz)
+	r.Get("/config", handler.GetConfig)
 
 	r.Get("/swagger/doc.json", serveSwaggerJSON)
 	r.Get("/swagger", http.RedirectHandler("/swagger/", http.StatusMovedPermanently).ServeHTTP)
