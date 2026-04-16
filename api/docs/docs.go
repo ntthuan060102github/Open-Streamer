@@ -1224,25 +1224,25 @@ const docTemplate = `{
         "config.CORSConfig": {
             "type": "object",
             "properties": {
-                "allowCredentials": {
+                "allow_credentials": {
                     "description": "AllowCredentials sets Access-Control-Allow-Credentials. Must be false\nwhen AllowedOrigins contains \"*\".",
                     "type": "boolean"
                 },
-                "allowedHeaders": {
+                "allowed_headers": {
                     "description": "AllowedHeaders lists Access-Control-Allow-Headers; empty uses a common API default set.",
                     "type": "array",
                     "items": {
                         "type": "string"
                     }
                 },
-                "allowedMethods": {
+                "allowed_methods": {
                     "description": "AllowedMethods lists Access-Control-Allow-Methods; empty uses a REST default set.",
                     "type": "array",
                     "items": {
                         "type": "string"
                     }
                 },
-                "allowedOrigins": {
+                "allowed_origins": {
                     "description": "AllowedOrigins lists values for Access-Control-Allow-Origin. Use \"*\"\nfor any origin (cannot be used together with AllowCredentials).",
                     "type": "array",
                     "items": {
@@ -1253,14 +1253,14 @@ const docTemplate = `{
                     "description": "Enabled turns CORS middleware on for the HTTP listener.",
                     "type": "boolean"
                 },
-                "exposedHeaders": {
+                "exposed_headers": {
                     "description": "ExposedHeaders lists Access-Control-Expose-Headers.",
                     "type": "array",
                     "items": {
                         "type": "string"
                     }
                 },
-                "maxAge": {
+                "max_age": {
                     "description": "MaxAge is the preflight cache duration in seconds (Access-Control-Max-Age).",
                     "type": "integer"
                 }
@@ -1269,14 +1269,14 @@ const docTemplate = `{
         "config.HooksConfig": {
             "type": "object",
             "properties": {
-                "kafkaBrokers": {
+                "kafka_brokers": {
                     "description": "KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.\nExample: [\"localhost:9092\", \"broker2:9092\"].\nEmpty = Kafka hooks are not available.",
                     "type": "array",
                     "items": {
                         "type": "string"
                     }
                 },
-                "workerCount": {
+                "worker_count": {
                     "description": "WorkerCount is the number of concurrent hook delivery goroutines.",
                     "type": "integer"
                 }
@@ -1285,23 +1285,23 @@ const docTemplate = `{
         "config.IngestorConfig": {
             "type": "object",
             "properties": {
-                "hlsmaxSegmentBuffer": {
+                "hls_max_segment_buffer": {
                     "description": "HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.\nThis is a server-wide memory guard, not a per-stream policy.",
                     "type": "integer"
                 },
-                "rtmpaddr": {
+                "rtmp_addr": {
                     "description": "e.g. \":1935\"",
                     "type": "string"
                 },
-                "rtmpenabled": {
+                "rtmp_enabled": {
                     "description": "RTMP push server — external encoders connect to us on this address.",
                     "type": "boolean"
                 },
-                "srtaddr": {
+                "srt_addr": {
                     "description": "e.g. \":9999\"",
                     "type": "string"
                 },
-                "srtenabled": {
+                "srt_enabled": {
                     "description": "SRT push server — external encoders connect to our SRT listener.",
                     "type": "boolean"
                 }
@@ -1323,7 +1323,7 @@ const docTemplate = `{
         "config.ManagerConfig": {
             "type": "object",
             "properties": {
-                "inputPacketTimeoutSec": {
+                "input_packet_timeout_sec": {
                     "description": "InputPacketTimeoutSec is the maximum gap without a successful read on the\nactive input before it is marked failed. Pull protocols that deliver in\nbursts (e.g. HLS: one segment per Read) need this at least as large as the\ntypical interval between reads (segment duration + playlist poll), or a\nhealthy primary will be falsely failed over to a lower priority.",
                     "type": "integer"
                 }
@@ -1366,17 +1366,17 @@ const docTemplate = `{
                 "dir": {
                     "type": "string"
                 },
-                "liveEphemeral": {
+                "live_ephemeral": {
                     "description": "Live* mirror HLS packaging semantics for the DASH muxer.",
                     "type": "boolean"
                 },
-                "liveHistory": {
+                "live_history": {
                     "type": "integer"
                 },
-                "liveSegmentSec": {
+                "live_segment_sec": {
                     "type": "integer"
                 },
-                "liveWindow": {
+                "live_window": {
                     "type": "integer"
                 }
             }
@@ -1384,25 +1384,25 @@ const docTemplate = `{
         "config.PublisherHLSConfig": {
             "type": "object",
             "properties": {
-                "baseURL": {
+                "base_url": {
                     "type": "string"
                 },
                 "dir": {
                     "type": "string"
                 },
-                "liveEphemeral": {
+                "live_ephemeral": {
                     "description": "LiveEphemeral enables bounded retention (sliding manifest, delete old segments).",
                     "type": "boolean"
                 },
-                "liveHistory": {
+                "live_history": {
                     "description": "LiveHistory is extra segments kept on disk after they leave the manifest.",
                     "type": "integer"
                 },
-                "liveSegmentSec": {
+                "live_segment_sec": {
                     "description": "LiveSegmentSec is segment duration in seconds.",
                     "type": "integer"
                 },
-                "liveWindow": {
+                "live_window": {
                     "description": "LiveWindow is the sliding window size (segments) in the playlist.",
                     "type": "integer"
                 }
@@ -1411,7 +1411,7 @@ const docTemplate = `{
         "config.PublisherRTMPServeConfig": {
             "type": "object",
             "properties": {
-                "listenHost": {
+                "listen_host": {
                     "type": "string"
                 },
                 "port": {
@@ -1423,14 +1423,14 @@ const docTemplate = `{
         "config.PublisherRTSPConfig": {
             "type": "object",
             "properties": {
-                "listenHost": {
+                "listen_host": {
                     "description": "ListenHost is the bind address (empty = 0.0.0.0).",
                     "type": "string"
                 },
-                "portMax": {
+                "port_max": {
                     "type": "integer"
                 },
-                "portMin": {
+                "port_min": {
                     "description": "PortMin is the single RTSP listen port (PortMax is unused for publisher RTSP).",
                     "type": "integer"
                 },
@@ -1443,11 +1443,11 @@ const docTemplate = `{
         "config.PublisherSRTListenerConfig": {
             "type": "object",
             "properties": {
-                "latencyMS": {
+                "latency_ms": {
                     "description": "LatencyMS is the SRT latency in milliseconds for listener URLs.",
                     "type": "integer"
                 },
-                "listenHost": {
+                "listen_host": {
                     "type": "string"
                 },
                 "port": {
@@ -1462,7 +1462,7 @@ const docTemplate = `{
                 "cors": {
                     "$ref": "#/definitions/config.CORSConfig"
                 },
-                "httpaddr": {
+                "http_addr": {
                     "type": "string"
                 }
             }
@@ -1470,14 +1470,14 @@ const docTemplate = `{
         "config.TranscoderConfig": {
             "type": "object",
             "properties": {
-                "ffmpegPath": {
+                "ffmpeg_path": {
                     "type": "string"
                 },
-                "maxRestarts": {
+                "max_restarts": {
                     "description": "MaxRestarts is the maximum number of consecutive FFmpeg crashes allowed per\nprofile before the transcoder gives up and triggers a fatal callback.\n0 = unlimited retries (not recommended for production).",
                     "type": "integer"
                 },
-                "maxWorkers": {
+                "max_workers": {
                     "description": "MaxWorkers caps the number of concurrent FFmpeg processes.",
                     "type": "integer"
                 }

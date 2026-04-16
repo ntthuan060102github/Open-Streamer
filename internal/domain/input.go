@@ -27,18 +27,18 @@ package domain
 // (0.0.0.0, ::, empty) and the scheme is rtmp or srt.
 type Input struct {
 	// URL is the source endpoint. See the package doc for supported formats.
-	URL string `json:"url"`
+	URL string `json:"url" yaml:"url"`
 
 	// Priority determines failover order. Lower value = higher priority.
 	// The Stream Manager always prefers the lowest-priority alive input.
-	Priority int `json:"priority"`
+	Priority int `json:"priority" yaml:"priority"`
 
 	// Headers are arbitrary HTTP headers sent with every request for HTTP/HLS inputs.
 	// Common uses:
 	//   "Authorization": "Bearer <token>"
 	//   "Authorization": "Basic <base64(user:pass)>"
 	//   "X-Custom-Token": "secret"
-	Headers map[string]string `json:"headers,omitempty"`
+	Headers map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
 
 	// Params are extra URL query parameters merged into the source URL before
 	// connecting. Used for protocols that carry credentials or options in the
@@ -46,14 +46,14 @@ type Input struct {
 	//   "passphrase": "my-srt-passphrase"
 	//   "access_key": "AKID..."   (S3)
 	//   "secret_key": "wJal..."   (S3)
-	Params map[string]string `json:"params,omitempty"`
+	Params map[string]string `json:"params,omitempty" yaml:"params,omitempty"`
 
 	// Net controls reconnect and timeout behaviour.
-	Net InputNetConfig `json:"net,omitempty"`
+	Net InputNetConfig `json:"net,omitempty" yaml:"net,omitempty"`
 
 	// Alive is a runtime-only field updated by the Stream Manager health checker.
 	// Not persisted to storage.
-	Alive bool `json:"-"`
+	Alive bool `json:"-" yaml:"-"`
 }
 
 // InputNetConfig controls reconnect and timeout behaviour for an input.
@@ -61,20 +61,20 @@ type InputNetConfig struct {
 	// ConnectTimeoutSec caps each HTTP round-trip (headers + full body) for pull
 	// readers that use net/http (e.g. HLS playlist and segment GETs). Zero uses
 	// the reader's default (30s for HLS).
-	ConnectTimeoutSec int `json:"connect_timeout_sec,omitempty"`
+	ConnectTimeoutSec int `json:"connect_timeout_sec,omitempty" yaml:"connect_timeout_sec,omitempty"`
 
 	// ReadTimeoutSec is the max silence duration before declaring the input dead.
-	ReadTimeoutSec int `json:"read_timeout_sec,omitempty"`
+	ReadTimeoutSec int `json:"read_timeout_sec,omitempty" yaml:"read_timeout_sec,omitempty"`
 
 	// Reconnect enables automatic reconnection when the input drops.
-	Reconnect bool `json:"reconnect,omitempty"`
+	Reconnect bool `json:"reconnect,omitempty" yaml:"reconnect,omitempty"`
 
 	// ReconnectDelaySec is the initial delay before the first reconnect attempt.
-	ReconnectDelaySec int `json:"reconnect_delay_sec,omitempty"`
+	ReconnectDelaySec int `json:"reconnect_delay_sec,omitempty" yaml:"reconnect_delay_sec,omitempty"`
 
 	// ReconnectMaxDelaySec caps the exponential backoff delay.
-	ReconnectMaxDelaySec int `json:"reconnect_max_delay_sec,omitempty"`
+	ReconnectMaxDelaySec int `json:"reconnect_max_delay_sec,omitempty" yaml:"reconnect_max_delay_sec,omitempty"`
 
 	// MaxReconnects is the total number of reconnect attempts (0 = unlimited).
-	MaxReconnects int `json:"max_reconnects,omitempty"`
+	MaxReconnects int `json:"max_reconnects,omitempty" yaml:"max_reconnects,omitempty"`
 }

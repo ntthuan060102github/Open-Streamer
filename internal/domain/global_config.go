@@ -9,15 +9,15 @@ import "github.com/ntt0601zcoder/open-streamer/config"
 // service should not start.  This allows users to enable/disable entire subsystems
 // by adding or removing config sections via the API.
 type GlobalConfig struct {
-	Server     *config.ServerConfig     `json:"server,omitempty"`
-	Ingestor   *config.IngestorConfig   `json:"ingestor,omitempty"`
-	Buffer     *config.BufferConfig     `json:"buffer,omitempty"`
-	Transcoder *config.TranscoderConfig `json:"transcoder,omitempty"`
-	Publisher  *config.PublisherConfig  `json:"publisher,omitempty"`
-	Manager    *config.ManagerConfig    `json:"manager,omitempty"`
-	Hooks      *config.HooksConfig      `json:"hooks,omitempty"`
-	Metrics    *config.MetricsConfig    `json:"metrics,omitempty"`
-	Log        *config.LogConfig        `json:"log,omitempty"`
+	Server     *config.ServerConfig     `json:"server,omitempty" yaml:"server,omitempty"`
+	Ingestor   *config.IngestorConfig   `json:"ingestor,omitempty" yaml:"ingestor,omitempty"`
+	Buffer     *config.BufferConfig     `json:"buffer,omitempty" yaml:"buffer,omitempty"`
+	Transcoder *config.TranscoderConfig `json:"transcoder,omitempty" yaml:"transcoder,omitempty"`
+	Publisher  *config.PublisherConfig  `json:"publisher,omitempty" yaml:"publisher,omitempty"`
+	Manager    *config.ManagerConfig    `json:"manager,omitempty" yaml:"manager,omitempty"`
+	Hooks      *config.HooksConfig      `json:"hooks,omitempty" yaml:"hooks,omitempty"`
+	Metrics    *config.MetricsConfig    `json:"metrics,omitempty" yaml:"metrics,omitempty"`
+	Log        *config.LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
 }
 
 // DefaultGlobalConfig returns a GlobalConfig populated with the same defaults

@@ -15,34 +15,34 @@ type ManagerConfig struct {
 	// bursts (e.g. HLS: one segment per Read) need this at least as large as the
 	// typical interval between reads (segment duration + playlist poll), or a
 	// healthy primary will be falsely failed over to a lower priority.
-	InputPacketTimeoutSec int `mapstructure:"input_packet_timeout_sec"`
+	InputPacketTimeoutSec int `mapstructure:"input_packet_timeout_sec" json:"input_packet_timeout_sec" yaml:"input_packet_timeout_sec"`
 }
 
 // ServerConfig holds HTTP/gRPC server settings.
 type ServerConfig struct {
-	HTTPAddr string     `mapstructure:"http_addr"`
-	CORS     CORSConfig `mapstructure:"cors"`
+	HTTPAddr string     `mapstructure:"http_addr" json:"http_addr" yaml:"http_addr"`
+	CORS     CORSConfig `mapstructure:"cors" json:"cors" yaml:"cors"`
 }
 
 // CORSConfig controls Cross-Origin Resource Sharing for the HTTP API and
 // static media routes mounted on the same listener.
 type CORSConfig struct {
 	// Enabled turns CORS middleware on for the HTTP listener.
-	Enabled bool `mapstructure:"enabled"`
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
 	// AllowedOrigins lists values for Access-Control-Allow-Origin. Use "*"
 	// for any origin (cannot be used together with AllowCredentials).
-	AllowedOrigins []string `mapstructure:"allowed_origins"`
+	AllowedOrigins []string `mapstructure:"allowed_origins" json:"allowed_origins" yaml:"allowed_origins"`
 	// AllowedMethods lists Access-Control-Allow-Methods; empty uses a REST default set.
-	AllowedMethods []string `mapstructure:"allowed_methods"`
+	AllowedMethods []string `mapstructure:"allowed_methods" json:"allowed_methods,omitempty" yaml:"allowed_methods,omitempty"`
 	// AllowedHeaders lists Access-Control-Allow-Headers; empty uses a common API default set.
-	AllowedHeaders []string `mapstructure:"allowed_headers"`
+	AllowedHeaders []string `mapstructure:"allowed_headers" json:"allowed_headers,omitempty" yaml:"allowed_headers,omitempty"`
 	// ExposedHeaders lists Access-Control-Expose-Headers.
-	ExposedHeaders []string `mapstructure:"exposed_headers"`
+	ExposedHeaders []string `mapstructure:"exposed_headers" json:"exposed_headers,omitempty" yaml:"exposed_headers,omitempty"`
 	// AllowCredentials sets Access-Control-Allow-Credentials. Must be false
 	// when AllowedOrigins contains "*".
-	AllowCredentials bool `mapstructure:"allow_credentials"`
+	AllowCredentials bool `mapstructure:"allow_credentials" json:"allow_credentials" yaml:"allow_credentials"`
 	// MaxAge is the preflight cache duration in seconds (Access-Control-Max-Age).
-	MaxAge int `mapstructure:"max_age"`
+	MaxAge int `mapstructure:"max_age" json:"max_age" yaml:"max_age"`
 }
 
 // StorageConfig selects the storage backend and its connection details.
@@ -62,98 +62,98 @@ type StorageConfig struct {
 // on each Input via the API and stored in the data storage.
 type IngestorConfig struct {
 	// RTMP push server — external encoders connect to us on this address.
-	RTMPEnabled bool   `mapstructure:"rtmp_enabled"`
-	RTMPAddr    string `mapstructure:"rtmp_addr"` // e.g. ":1935"
+	RTMPEnabled bool   `mapstructure:"rtmp_enabled" json:"rtmp_enabled" yaml:"rtmp_enabled"`
+	RTMPAddr    string `mapstructure:"rtmp_addr" json:"rtmp_addr" yaml:"rtmp_addr"` // e.g. ":1935"
 
 	// SRT push server — external encoders connect to our SRT listener.
-	SRTEnabled bool   `mapstructure:"srt_enabled"`
-	SRTAddr    string `mapstructure:"srt_addr"` // e.g. ":9999"
+	SRTEnabled bool   `mapstructure:"srt_enabled" json:"srt_enabled" yaml:"srt_enabled"`
+	SRTAddr    string `mapstructure:"srt_addr" json:"srt_addr" yaml:"srt_addr"` // e.g. ":9999"
 
 	// HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.
 	// This is a server-wide memory guard, not a per-stream policy.
-	HLSMaxSegmentBuffer int `mapstructure:"hls_max_segment_buffer"` // default 8
+	HLSMaxSegmentBuffer int `mapstructure:"hls_max_segment_buffer" json:"hls_max_segment_buffer" yaml:"hls_max_segment_buffer"` // default 8
 }
 
 // BufferConfig controls the in-memory ring buffer.
 type BufferConfig struct {
 	// Capacity is the number of MPEG-TS packets per stream buffer.
-	Capacity int `mapstructure:"capacity"`
+	Capacity int `mapstructure:"capacity" json:"capacity" yaml:"capacity"`
 }
 
 // TranscoderConfig controls FFmpeg worker pool behaviour.
 type TranscoderConfig struct {
 	// MaxWorkers caps the number of concurrent FFmpeg processes.
-	MaxWorkers int    `mapstructure:"max_workers"`
-	FFmpegPath string `mapstructure:"ffmpeg_path"`
+	MaxWorkers int    `mapstructure:"max_workers" json:"max_workers" yaml:"max_workers"`
+	FFmpegPath string `mapstructure:"ffmpeg_path" json:"ffmpeg_path" yaml:"ffmpeg_path"`
 	// MaxRestarts is the maximum number of consecutive FFmpeg crashes allowed per
 	// profile before the transcoder gives up and triggers a fatal callback.
 	// 0 = unlimited retries (not recommended for production).
-	MaxRestarts int `mapstructure:"max_restarts"`
+	MaxRestarts int `mapstructure:"max_restarts" json:"max_restarts" yaml:"max_restarts"`
 }
 
 // PublisherConfig controls output delivery; settings are grouped by protocol.
 type PublisherConfig struct {
-	HLS  PublisherHLSConfig         `mapstructure:"hls"`
-	DASH PublisherDASHConfig        `mapstructure:"dash"`
-	RTSP PublisherRTSPConfig        `mapstructure:"rtsp"`
-	RTMP PublisherRTMPServeConfig   `mapstructure:"rtmp"`
-	SRT  PublisherSRTListenerConfig `mapstructure:"srt"`
+	HLS  PublisherHLSConfig         `mapstructure:"hls" json:"hls" yaml:"hls"`
+	DASH PublisherDASHConfig        `mapstructure:"dash" json:"dash" yaml:"dash"`
+	RTSP PublisherRTSPConfig        `mapstructure:"rtsp" json:"rtsp" yaml:"rtsp"`
+	RTMP PublisherRTMPServeConfig   `mapstructure:"rtmp" json:"rtmp" yaml:"rtmp"`
+	SRT  PublisherSRTListenerConfig `mapstructure:"srt" json:"srt" yaml:"srt"`
 }
 
 // PublisherHLSConfig is filesystem + live packaging for Apple HLS (m3u8 + segments).
 type PublisherHLSConfig struct {
-	Dir     string `mapstructure:"dir"`
-	BaseURL string `mapstructure:"base_url"`
+	Dir     string `mapstructure:"dir" json:"dir" yaml:"dir"`
+	BaseURL string `mapstructure:"base_url" json:"base_url" yaml:"base_url"`
 	// LiveEphemeral enables bounded retention (sliding manifest, delete old segments).
-	LiveEphemeral bool `mapstructure:"live_ephemeral"`
+	LiveEphemeral bool `mapstructure:"live_ephemeral" json:"live_ephemeral" yaml:"live_ephemeral"`
 	// LiveSegmentSec is segment duration in seconds.
-	LiveSegmentSec int `mapstructure:"live_segment_sec"`
+	LiveSegmentSec int `mapstructure:"live_segment_sec" json:"live_segment_sec" yaml:"live_segment_sec"`
 	// LiveWindow is the sliding window size (segments) in the playlist.
-	LiveWindow int `mapstructure:"live_window"`
+	LiveWindow int `mapstructure:"live_window" json:"live_window" yaml:"live_window"`
 	// LiveHistory is extra segments kept on disk after they leave the manifest.
-	LiveHistory int `mapstructure:"live_history"`
+	LiveHistory int `mapstructure:"live_history" json:"live_history" yaml:"live_history"`
 }
 
 // PublisherDASHConfig is filesystem + live packaging for MPEG-DASH (dynamic MPD + ISO BMFF init/media .m4s).
 // Dir must be set and must not match PublisherHLSConfig.Dir (separate subscribers and segment files).
 type PublisherDASHConfig struct {
-	Dir string `mapstructure:"dir"`
+	Dir string `mapstructure:"dir" json:"dir" yaml:"dir"`
 	// Live* mirror HLS packaging semantics for the DASH muxer.
-	LiveEphemeral  bool `mapstructure:"live_ephemeral"`
-	LiveSegmentSec int  `mapstructure:"live_segment_sec"`
-	LiveWindow     int  `mapstructure:"live_window"`
-	LiveHistory    int  `mapstructure:"live_history"`
+	LiveEphemeral  bool `mapstructure:"live_ephemeral" json:"live_ephemeral" yaml:"live_ephemeral"`
+	LiveSegmentSec int  `mapstructure:"live_segment_sec" json:"live_segment_sec" yaml:"live_segment_sec"`
+	LiveWindow     int  `mapstructure:"live_window" json:"live_window" yaml:"live_window"`
+	LiveHistory    int  `mapstructure:"live_history" json:"live_history" yaml:"live_history"`
 }
 
 // PublisherRTSPConfig is native RTSP listen mode (protocols.rtsp).
 // All streams share PortMin; clients use rtsp://host:PortMin/live/<stream_code>.
 type PublisherRTSPConfig struct {
 	// ListenHost is the bind address (empty = 0.0.0.0).
-	ListenHost string `mapstructure:"listen_host"`
+	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
 	// PortMin is the single RTSP listen port (PortMax is unused for publisher RTSP).
-	PortMin int `mapstructure:"port_min"`
-	PortMax int `mapstructure:"port_max"`
+	PortMin int `mapstructure:"port_min" json:"port_min" yaml:"port_min"`
+	PortMax int `mapstructure:"port_max" json:"port_max" yaml:"port_max"`
 	// Transport is "tcp" (default) or "udp" for the RTSP muxer.
-	Transport string `mapstructure:"transport"`
+	Transport string `mapstructure:"transport" json:"transport" yaml:"transport"`
 }
 
 // PublisherRTMPServeConfig is native RTMP listen output for viewers (not ingestor push).
 // Clients use rtmp://host:Port/live/<stream_code>.
 // Keep Port distinct from ingestor.rtmp_addr (default :1935).
 type PublisherRTMPServeConfig struct {
-	ListenHost string `mapstructure:"listen_host"`
+	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
 	// Port is the single RTMP listen port. 0 = disabled.
-	Port int `mapstructure:"port"`
+	Port int `mapstructure:"port" json:"port" yaml:"port"`
 }
 
 // PublisherSRTListenerConfig is native SRT listener (protocols.srt).
 // Clients set streamid=live/<stream_code> (or a bare valid stream code).
 type PublisherSRTListenerConfig struct {
-	ListenHost string `mapstructure:"listen_host"`
+	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
 	// Port is the single SRT listen port. 0 = disabled.
-	Port int `mapstructure:"port"`
+	Port int `mapstructure:"port" json:"port" yaml:"port"`
 	// LatencyMS is the SRT latency in milliseconds for listener URLs.
-	LatencyMS int `mapstructure:"latency_ms"`
+	LatencyMS int `mapstructure:"latency_ms" json:"latency_ms" yaml:"latency_ms"`
 }
 
 // HooksConfig controls the hook dispatcher worker pool.
@@ -161,24 +161,24 @@ type PublisherSRTListenerConfig struct {
 // configured on each Hook via the API.
 type HooksConfig struct {
 	// WorkerCount is the number of concurrent hook delivery goroutines.
-	WorkerCount int `mapstructure:"worker_count"`
+	WorkerCount int `mapstructure:"worker_count" json:"worker_count" yaml:"worker_count"`
 
 	// KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.
 	// Example: ["localhost:9092", "broker2:9092"].
 	// Empty = Kafka hooks are not available.
-	KafkaBrokers []string `mapstructure:"kafka_brokers"`
+	KafkaBrokers []string `mapstructure:"kafka_brokers" json:"kafka_brokers,omitempty" yaml:"kafka_brokers,omitempty"`
 }
 
 // MetricsConfig controls Prometheus exposition.
 type MetricsConfig struct {
-	Addr string `mapstructure:"addr"`
-	Path string `mapstructure:"path"`
+	Addr string `mapstructure:"addr" json:"addr" yaml:"addr"`
+	Path string `mapstructure:"path" json:"path" yaml:"path"`
 }
 
 // LogConfig controls structured logging output.
 type LogConfig struct {
-	Level  string `mapstructure:"level"`  // debug | info | warn | error
-	Format string `mapstructure:"format"` // text | json
+	Level  string `mapstructure:"level" json:"level" yaml:"level"`    // debug | info | warn | error
+	Format string `mapstructure:"format" json:"format" yaml:"format"` // text | json
 }
 
 // LoadStorage reads only the StorageConfig from environment variables and an optional

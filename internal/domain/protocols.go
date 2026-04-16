@@ -7,18 +7,18 @@ package domain
 type OutputProtocols struct {
 	// HLS enables Apple HTTP Live Streaming (m3u8 + segments over HTTP).
 	// Compatible with browsers, iOS, Android, Smart TVs.
-	HLS bool `json:"hls"`
+	HLS bool `json:"hls" yaml:"hls"`
 
 	// DASH enables MPEG-DASH packaging over HTTP.
 	// Required for Widevine/PlayReady DRM.
-	DASH bool `json:"dash"`
+	DASH bool `json:"dash" yaml:"dash"`
 
 	// RTSP opens an RTSP listener for pull clients (VLC, broadcast tools).
-	RTSP bool `json:"rtsp"`
+	RTSP bool `json:"rtsp" yaml:"rtsp"`
 
 	// RTMP opens an RTMP publish endpoint for legacy players/CDNs.
-	RTMP bool `json:"rtmp"`
+	RTMP bool `json:"rtmp" yaml:"rtmp"`
 
 	// SRT opens an SRT listener port for contribution-quality pull.
-	SRT bool `json:"srt"`
+	SRT bool `json:"srt" yaml:"srt"`
 }

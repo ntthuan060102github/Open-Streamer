@@ -256,24 +256,24 @@ definitions:
     type: object
   config.CORSConfig:
     properties:
-      allowCredentials:
+      allow_credentials:
         description: |-
           AllowCredentials sets Access-Control-Allow-Credentials. Must be false
           when AllowedOrigins contains "*".
         type: boolean
-      allowedHeaders:
+      allowed_headers:
         description: AllowedHeaders lists Access-Control-Allow-Headers; empty uses
           a common API default set.
         items:
           type: string
         type: array
-      allowedMethods:
+      allowed_methods:
         description: AllowedMethods lists Access-Control-Allow-Methods; empty uses
           a REST default set.
         items:
           type: string
         type: array
-      allowedOrigins:
+      allowed_origins:
         description: |-
           AllowedOrigins lists values for Access-Control-Allow-Origin. Use "*"
           for any origin (cannot be used together with AllowCredentials).
@@ -283,18 +283,18 @@ definitions:
       enabled:
         description: Enabled turns CORS middleware on for the HTTP listener.
         type: boolean
-      exposedHeaders:
+      exposed_headers:
         description: ExposedHeaders lists Access-Control-Expose-Headers.
         items:
           type: string
         type: array
-      maxAge:
+      max_age:
         description: MaxAge is the preflight cache duration in seconds (Access-Control-Max-Age).
         type: integer
     type: object
   config.HooksConfig:
     properties:
-      kafkaBrokers:
+      kafka_brokers:
         description: |-
           KafkaBrokers is the list of Kafka broker addresses used by all Kafka-type hooks.
           Example: ["localhost:9092", "broker2:9092"].
@@ -302,27 +302,27 @@ definitions:
         items:
           type: string
         type: array
-      workerCount:
+      worker_count:
         description: WorkerCount is the number of concurrent hook delivery goroutines.
         type: integer
     type: object
   config.IngestorConfig:
     properties:
-      hlsmaxSegmentBuffer:
+      hls_max_segment_buffer:
         description: |-
           HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.
           This is a server-wide memory guard, not a per-stream policy.
         type: integer
-      rtmpaddr:
+      rtmp_addr:
         description: e.g. ":1935"
         type: string
-      rtmpenabled:
+      rtmp_enabled:
         description: RTMP push server — external encoders connect to us on this address.
         type: boolean
-      srtaddr:
+      srt_addr:
         description: e.g. ":9999"
         type: string
-      srtenabled:
+      srt_enabled:
         description: SRT push server — external encoders connect to our SRT listener.
         type: boolean
     type: object
@@ -337,7 +337,7 @@ definitions:
     type: object
   config.ManagerConfig:
     properties:
-      inputPacketTimeoutSec:
+      input_packet_timeout_sec:
         description: |-
           InputPacketTimeoutSec is the maximum gap without a successful read on the
           active input before it is marked failed. Pull protocols that deliver in
@@ -370,40 +370,40 @@ definitions:
     properties:
       dir:
         type: string
-      liveEphemeral:
+      live_ephemeral:
         description: Live* mirror HLS packaging semantics for the DASH muxer.
         type: boolean
-      liveHistory:
+      live_history:
         type: integer
-      liveSegmentSec:
+      live_segment_sec:
         type: integer
-      liveWindow:
+      live_window:
         type: integer
     type: object
   config.PublisherHLSConfig:
     properties:
-      baseURL:
+      base_url:
         type: string
       dir:
         type: string
-      liveEphemeral:
+      live_ephemeral:
         description: LiveEphemeral enables bounded retention (sliding manifest, delete
           old segments).
         type: boolean
-      liveHistory:
+      live_history:
         description: LiveHistory is extra segments kept on disk after they leave the
           manifest.
         type: integer
-      liveSegmentSec:
+      live_segment_sec:
         description: LiveSegmentSec is segment duration in seconds.
         type: integer
-      liveWindow:
+      live_window:
         description: LiveWindow is the sliding window size (segments) in the playlist.
         type: integer
     type: object
   config.PublisherRTMPServeConfig:
     properties:
-      listenHost:
+      listen_host:
         type: string
       port:
         description: Port is the single RTMP listen port. 0 = disabled.
@@ -411,12 +411,12 @@ definitions:
     type: object
   config.PublisherRTSPConfig:
     properties:
-      listenHost:
+      listen_host:
         description: ListenHost is the bind address (empty = 0.0.0.0).
         type: string
-      portMax:
+      port_max:
         type: integer
-      portMin:
+      port_min:
         description: PortMin is the single RTSP listen port (PortMax is unused for
           publisher RTSP).
         type: integer
@@ -426,10 +426,10 @@ definitions:
     type: object
   config.PublisherSRTListenerConfig:
     properties:
-      latencyMS:
+      latency_ms:
         description: LatencyMS is the SRT latency in milliseconds for listener URLs.
         type: integer
-      listenHost:
+      listen_host:
         type: string
       port:
         description: Port is the single SRT listen port. 0 = disabled.
@@ -439,20 +439,20 @@ definitions:
     properties:
       cors:
         $ref: '#/definitions/config.CORSConfig'
-      httpaddr:
+      http_addr:
         type: string
     type: object
   config.TranscoderConfig:
     properties:
-      ffmpegPath:
+      ffmpeg_path:
         type: string
-      maxRestarts:
+      max_restarts:
         description: |-
           MaxRestarts is the maximum number of consecutive FFmpeg crashes allowed per
           profile before the transcoder gives up and triggers a fatal callback.
           0 = unlimited retries (not recommended for production).
         type: integer
-      maxWorkers:
+      max_workers:
         description: MaxWorkers caps the number of concurrent FFmpeg processes.
         type: integer
     type: object

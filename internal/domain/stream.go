@@ -47,52 +47,52 @@ const (
 // It describes everything needed to ingest, process, and deliver a live stream.
 type Stream struct {
 	// Code is the unique key chosen by the user ([a-zA-Z0-9_]).
-	Code StreamCode `json:"code"`
+	Code StreamCode `json:"code" yaml:"code"`
 
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Tags        []string `json:"tags"`
+	Name        string   `json:"name" yaml:"name"`
+	Description string   `json:"description" yaml:"description"`
+	Tags        []string `json:"tags" yaml:"tags"`
 
 	// StreamKey is used to authenticate RTMP/SRT push ingest.
-	StreamKey string `json:"stream_key"`
+	StreamKey string `json:"stream_key" yaml:"stream_key"`
 
 	// Status is the runtime lifecycle state.
 	// It is never persisted — always computed from the coordinator's in-memory
 	// state and overlaid by the API layer before returning responses to clients.
-	Status StreamStatus `json:"-"`
+	Status StreamStatus `json:"-" yaml:"-"`
 
 	// Disabled when true excludes the stream from server bootstrap and rejects pipeline Start.
-	Disabled bool `json:"disabled"`
+	Disabled bool `json:"disabled" yaml:"disabled"`
 
 	// Inputs are the available ingest sources ordered by Priority.
 	// The Stream Manager monitors health and switches between them on failure.
-	Inputs []Input `json:"inputs"`
+	Inputs []Input `json:"inputs" yaml:"inputs"`
 
 	// Transcoder controls encoding/decoding settings.
 	// nil means no transcoding for this stream.
-	Transcoder *TranscoderConfig `json:"transcoder,omitempty"`
+	Transcoder *TranscoderConfig `json:"transcoder,omitempty" yaml:"transcoder,omitempty"`
 
 	// Protocols defines which delivery protocols are opened for this stream.
 	// The server opens a listener/packager for each enabled protocol.
 	// Protocol-level config (ports, segment duration, CDN URL) lives in server config.
-	Protocols OutputProtocols `json:"protocols"`
+	Protocols OutputProtocols `json:"protocols" yaml:"protocols"`
 
 	// Push is the list of external destinations the server actively pushes to.
 	// Each entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).
-	Push []PushDestination `json:"push"`
+	Push []PushDestination `json:"push" yaml:"push"`
 
 	// DVR overrides the global DVR settings for this specific stream.
 	// If nil, the global config is used (when DVR is enabled globally).
-	DVR *StreamDVRConfig `json:"dvr,omitempty"`
+	DVR *StreamDVRConfig `json:"dvr,omitempty" yaml:"dvr,omitempty"`
 
 	// Watermark is an optional text or image overlay applied before encoding.
-	Watermark *WatermarkConfig `json:"watermark,omitempty"`
+	Watermark *WatermarkConfig `json:"watermark,omitempty" yaml:"watermark,omitempty"`
 
 	// Thumbnail controls periodic screenshot generation for preview images.
-	Thumbnail *ThumbnailConfig `json:"thumbnail,omitempty"`
+	Thumbnail *ThumbnailConfig `json:"thumbnail,omitempty" yaml:"thumbnail,omitempty"`
 
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	CreatedAt time.Time `json:"created_at" yaml:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" yaml:"updated_at"`
 }
 
 // ValidateInputPriorities enforces that input priorities are contiguous and sorted.

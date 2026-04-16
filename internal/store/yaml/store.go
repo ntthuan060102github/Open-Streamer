@@ -9,7 +9,7 @@
 //	hooks:
 //	  <id>: { ... }
 //	global:
-//	  <key>: <raw JSON string>
+//	  <key>: <native YAML value>
 //
 // Writes are atomic: data is marshalled to a .tmp file then renamed into place.
 // Intended for development and lightweight single-node deployments.
@@ -37,7 +37,7 @@ type db struct {
 	Streams    map[string]*domain.Stream    `yaml:"streams,omitempty"`
 	Recordings map[string]*domain.Recording `yaml:"recordings,omitempty"`
 	Hooks      map[string]*domain.Hook      `yaml:"hooks,omitempty"`
-	Global     map[string]string            `yaml:"global,omitempty"` // raw JSON strings
+	Global     map[string]any               `yaml:"global,omitempty"` // native YAML values; converted to/from JSON at the repo layer
 }
 
 // Store is a YAML-backed implementation of all repositories.
@@ -302,6 +302,7 @@ func (r *hookRepo) Delete(_ context.Context, id domain.HookID) error {
 type settingsRepo struct{ s *Store }
 
 // Get implements store.SettingsRepository.
+// The native YAML value is marshalled back to JSON for the interface contract.
 func (r *settingsRepo) Get(_ context.Context, key string) (json.RawMessage, error) {
 	var result json.RawMessage
 	err := r.s.readAll(func(d db) error {
@@ -309,19 +310,28 @@ func (r *settingsRepo) Get(_ context.Context, key string) (json.RawMessage, erro
 		if !ok {
 			return fmt.Errorf("settings %s: %w", key, store.ErrNotFound)
 		}
-		result = json.RawMessage(v)
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("settings %s: marshal: %w", key, err)
+		}
+		result = raw
 		return nil
 	})
 	return result, err
 }
 
 // Set implements store.SettingsRepository.
+// The JSON value is unmarshalled to a native Go value so it is stored as proper YAML.
 func (r *settingsRepo) Set(_ context.Context, key string, value json.RawMessage) error {
 	return r.s.modify(func(d *db) error {
 		if d.Global == nil {
-			d.Global = make(map[string]string)
+			d.Global = make(map[string]any)
 		}
-		d.Global[key] = string(value)
+		var v any
+		if err := json.Unmarshal(value, &v); err != nil {
+			return fmt.Errorf("settings %s: unmarshal: %w", key, err)
+		}
+		d.Global[key] = v
 		return nil
 	})
 }

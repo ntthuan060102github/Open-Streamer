@@ -42,57 +42,57 @@ const (
 type VideoProfile struct {
 	// Width and Height define the output resolution.
 	// Set to 0 to keep the source dimensions (Width=0 & Height=0 = no scaling).
-	Width  int `json:"width"`
-	Height int `json:"height"`
+	Width  int `json:"width" yaml:"width"`
+	Height int `json:"height" yaml:"height"`
 
 	// Bitrate is the target video bitrate in kbps. 0 = encoder auto.
-	Bitrate int `json:"bitrate"`
+	Bitrate int `json:"bitrate" yaml:"bitrate"`
 
 	// MaxBitrate caps the peak bitrate in kbps (CBR/VBR ceiling). 0 = no cap.
-	MaxBitrate int `json:"max_bitrate"`
+	MaxBitrate int `json:"max_bitrate" yaml:"max_bitrate"`
 
 	// Framerate is the output frame rate (fps). 0 = match source.
-	Framerate float64 `json:"framerate"`
+	Framerate float64 `json:"framerate" yaml:"framerate"`
 
 	// KeyframeInterval is the GOP size in seconds.
 	// Must match or be a multiple of the HLS/DASH segment duration.
-	KeyframeInterval int `json:"keyframe_interval"`
+	KeyframeInterval int `json:"keyframe_interval" yaml:"keyframe_interval"`
 
-	Codec VideoCodec `json:"codec"`
+	Codec VideoCodec `json:"codec" yaml:"codec"`
 
 	// Preset controls the encoder speed/quality tradeoff.
 	// libx264: "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" | "medium" | "slow" | "veryslow"
 	// NVENC:   "p1" (fastest) .. "p7" (highest quality)
-	Preset string `json:"preset"`
+	Preset string `json:"preset" yaml:"preset"`
 
 	// Profile controls the H.264/H.265 encoding profile.
 	// "baseline" | "main" | "high" (H.264); "main" | "main10" (H.265)
-	Profile string `json:"profile"`
+	Profile string `json:"profile" yaml:"profile"`
 
 	// Level controls the H.264/H.265 encoding level.
 	// Common: "3.1", "4.0", "4.1", "4.2", "5.0", "5.1"
-	Level string `json:"level"`
+	Level string `json:"level" yaml:"level"`
 }
 
 // AudioConfig defines the audio encoding settings applied to all output profiles.
 type AudioConfig struct {
-	Codec AudioCodec `json:"codec"`
+	Codec AudioCodec `json:"codec" yaml:"codec"`
 
 	// Bitrate is the audio bitrate in kbps. Typical: 128 (stereo), 192 (high quality).
-	Bitrate int `json:"bitrate"`
+	Bitrate int `json:"bitrate" yaml:"bitrate"`
 
 	// SampleRate is the output sample rate in Hz. Typical: 44100, 48000.
-	SampleRate int `json:"sample_rate"`
+	SampleRate int `json:"sample_rate" yaml:"sample_rate"`
 
 	// Channels: 1 = mono, 2 = stereo, 6 = 5.1 surround.
-	Channels int `json:"channels"`
+	Channels int `json:"channels" yaml:"channels"`
 
 	// Language is the ISO 639-1 code embedded in HLS/DASH metadata, e.g. "en", "vi".
-	Language string `json:"language"`
+	Language string `json:"language" yaml:"language"`
 
 	// Normalize applies EBU R128 loudness normalization (-23 LUFS).
 	// Useful for broadcast compliance.
-	Normalize bool `json:"normalize"`
+	Normalize bool `json:"normalize" yaml:"normalize"`
 }
 
 // DecoderConfig defines decoder behavior.
@@ -100,64 +100,64 @@ type DecoderConfig struct {
 	// Name is the FFmpeg decoder name.
 	// "" = let FFmpeg choose automatically.
 	// Examples: "h264_cuvid", "h264_qsv".
-	Name string `json:"name,omitempty"`
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
 }
 
 // TranscoderGlobalConfig holds global transcoder parameters.
 type TranscoderGlobalConfig struct {
 	// HW selects the acceleration backend.
-	HW HWAccel `json:"hw"`
+	HW HWAccel `json:"hw" yaml:"hw"`
 
 	// FPS sets output framerate. 0 = source/default.
-	FPS int `json:"fps"`
+	FPS int `json:"fps" yaml:"fps"`
 
 	// GOP sets keyframe interval in frames. 0 = encoder default.
-	GOP int `json:"gop"`
+	GOP int `json:"gop" yaml:"gop"`
 
 	// DeviceID selects hardware device index.
-	DeviceID int `json:"deviceid"`
+	DeviceID int `json:"deviceid" yaml:"deviceid"`
 }
 
 // VideoTranscodeConfig defines video transcoding behavior.
 type VideoTranscodeConfig struct {
 	// Copy copies origin video without re-encoding.
-	Copy bool `json:"copy"`
+	Copy bool `json:"copy" yaml:"copy"`
 
 	// Profiles defines ABR renditions when re-encoding.
-	Profiles []VideoProfile `json:"profiles,omitempty"`
+	Profiles []VideoProfile `json:"profiles,omitempty" yaml:"profiles,omitempty"`
 }
 
 // AudioTranscodeConfig defines audio transcoding behavior.
 type AudioTranscodeConfig struct {
 	// Copy copies origin audio without re-encoding.
-	Copy bool `json:"copy"`
+	Copy bool `json:"copy" yaml:"copy"`
 
-	Codec AudioCodec `json:"codec"`
+	Codec AudioCodec `json:"codec" yaml:"codec"`
 
 	// Bitrate is the audio bitrate in kbps.
-	Bitrate int `json:"bitrate"`
+	Bitrate int `json:"bitrate" yaml:"bitrate"`
 
 	// SampleRate is output sample rate in Hz.
-	SampleRate int `json:"sample_rate"`
+	SampleRate int `json:"sample_rate" yaml:"sample_rate"`
 
 	// Channels: 1 = mono, 2 = stereo, 6 = 5.1.
-	Channels int `json:"channels"`
+	Channels int `json:"channels" yaml:"channels"`
 
 	// Language is ISO 639-1 code, e.g. "en", "vi".
-	Language string `json:"language"`
+	Language string `json:"language" yaml:"language"`
 
 	// Normalize applies EBU R128 loudness normalization.
-	Normalize bool `json:"normalize"`
+	Normalize bool `json:"normalize" yaml:"normalize"`
 }
 
 // TranscoderConfig is the complete transcoding configuration for a stream.
 type TranscoderConfig struct {
-	Video   VideoTranscodeConfig   `json:"video"`
-	Audio   AudioTranscodeConfig   `json:"audio"`
-	Decoder DecoderConfig          `json:"decoder"`
-	Global  TranscoderGlobalConfig `json:"global"`
+	Video   VideoTranscodeConfig   `json:"video" yaml:"video"`
+	Audio   AudioTranscodeConfig   `json:"audio" yaml:"audio"`
+	Decoder DecoderConfig          `json:"decoder" yaml:"decoder"`
+	Global  TranscoderGlobalConfig `json:"global" yaml:"global"`
 
 	// ExtraArgs are raw FFmpeg arguments appended after the generated command.
 	// Use with caution — may conflict with generated arguments.
-	ExtraArgs []string `json:"extra_args,omitempty"`
+	ExtraArgs []string `json:"extra_args,omitempty" yaml:"extra_args,omitempty"`
 }

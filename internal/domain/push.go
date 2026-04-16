@@ -19,24 +19,24 @@ type PushDestination struct {
 	// Supported schemes:
 	//   rtmp://  — plain TCP, default port 1935 (e.g. rtmp://a.rtmp.youtube.com/live2/{key})
 	//   rtmps:// — TLS-wrapped RTMP, default port 443 (e.g. rtmps://live-api-s.facebook.com:443/rtmp/{key})
-	URL string `json:"url"`
+	URL string `json:"url" yaml:"url"`
 
 	// Enabled controls whether this destination is active.
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// TimeoutSec is the connection/write timeout in seconds.
-	TimeoutSec int `json:"timeout_sec"`
+	TimeoutSec int `json:"timeout_sec" yaml:"timeout_sec"`
 
 	// RetryTimeoutSec is the delay between retry attempts in seconds.
-	RetryTimeoutSec int `json:"retry_timeout_sec"`
+	RetryTimeoutSec int `json:"retry_timeout_sec" yaml:"retry_timeout_sec"`
 
 	// Limit is the maximum number of retry attempts. 0 = unlimited.
-	Limit int `json:"limit"`
+	Limit int `json:"limit" yaml:"limit"`
 
 	// Comment is a human-readable note for this destination.
-	Comment string `json:"comment"`
+	Comment string `json:"comment" yaml:"comment"`
 
 	// Status is a runtime-only field updated by the publisher.
 	// Not persisted to storage.
-	Status PushStatus `json:"status,omitempty"`
+	Status PushStatus `json:"status,omitempty" yaml:"-"`
 }
