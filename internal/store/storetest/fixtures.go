@@ -15,7 +15,6 @@ func NewFullStream(code domain.StreamCode) *domain.Stream {
 		Description: "A test stream with all fields set",
 		Tags:        []string{"live", "test", "hd"},
 		StreamKey:   "secret-key-123",
-		// Status is runtime-only (json:"-") and is never persisted.
 		Disabled:    false,
 		Inputs: []domain.Input{
 			{
