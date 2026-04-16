@@ -17,7 +17,7 @@ const docTemplate = `{
     "paths": {
         "/config": {
             "get": {
-                "description": "Returns available hardware accelerators (OS-detected) and static enum lists for building configuration forms.",
+                "description": "Returns available hardware accelerators (OS-detected), static enum lists, and publisher listener ports.",
                 "produces": [
                     "application/json"
                 ],

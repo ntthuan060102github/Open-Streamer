@@ -35,6 +35,7 @@ func New(i do.Injector) (*Server, error) {
 	streamHandler := do.MustInvoke[*handler.StreamHandler](i)
 	recordingHandler := do.MustInvoke[*handler.RecordingHandler](i)
 	hookHandler := do.MustInvoke[*handler.HookHandler](i)
+	configHandler := do.MustInvoke[*handler.ConfigHandler](i)
 
 	dashDir := strings.TrimSpace(cfg.Publisher.DASH.Dir)
 	if dashDir == "" {
@@ -46,7 +47,7 @@ func New(i do.Injector) (*Server, error) {
 		hlsDir:  cfg.Publisher.HLS.Dir,
 		dashDir: dashDir,
 	}
-	s.router = s.buildRouter(streamHandler, recordingHandler, hookHandler)
+	s.router = s.buildRouter(streamHandler, recordingHandler, hookHandler, configHandler)
 	s.http = &http.Server{
 		Addr:    cfg.Server.HTTPAddr,
 		Handler: s.router,
@@ -58,6 +59,7 @@ func (s *Server) buildRouter(
 	stream *handler.StreamHandler,
 	recording *handler.RecordingHandler,
 	hook *handler.HookHandler,
+	cfg *handler.ConfigHandler,
 ) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -72,7 +74,7 @@ func (s *Server) buildRouter(
 
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", readyz)
-	r.Get("/config", handler.GetConfig)
+	r.Get("/config", cfg.GetConfig)
 
 	r.Get("/swagger/doc.json", serveSwaggerJSON)
 	r.Get("/swagger", http.RedirectHandler("/swagger/", http.StatusMovedPermanently).ServeHTTP)

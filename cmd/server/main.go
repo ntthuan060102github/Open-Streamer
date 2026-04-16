@@ -93,6 +93,7 @@ func wire(i *do.RootScope, cfg *config.Config) error {
 	do.Provide(i, handler.NewStreamHandler)
 	do.Provide(i, handler.NewRecordingHandler)
 	do.Provide(i, handler.NewHookHandler)
+	do.Provide(i, handler.NewConfigHandler)
 	do.Provide(i, api.New)
 
 	return nil
