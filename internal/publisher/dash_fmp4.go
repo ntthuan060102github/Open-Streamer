@@ -305,18 +305,29 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 	}
 }
 
-// onTSFrame is the TSDemuxer callback; it runs in the demuxer goroutine.
-func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// pendingInitWrite holds init segment data that needs to be written to disk
+// outside the hot-path mutex.
+type pendingInitWrite struct {
+	init     *mp4.InitSegment
+	filename string // e.g. "init_v.mp4"
+}
 
+// onTSFrame is the TSDemuxer callback; it runs in the demuxer goroutine.
+// Init segment file writes are deferred to outside the mutex to avoid blocking
+// the flush ticker during expensive I/O.
+func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+	var pending *pendingInitWrite
+
+	p.mu.Lock()
 	switch cid {
 	case mpeg2.TS_STREAM_AUDIO_MPEG1, mpeg2.TS_STREAM_AUDIO_MPEG2:
 		// MP3 in TS — not supported in DASH fMP4.
+		p.mu.Unlock()
 		return
 
 	case mpeg2.TS_STREAM_H264:
 		if len(frame) == 0 {
+			p.mu.Unlock()
 			return
 		}
 		// Detect source switch: timestamps should be monotonically increasing.
@@ -324,7 +335,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		// Flush accumulated frames from the old source before mixing in new ones;
 		// this prevents uint64 underflow in duration computation inside
 		// writeVideoSegmentLocked that would produce astronomically large samples.
-		if len(p.vDTS) > 0 && dts+1000 < p.vDTS[len(p.vDTS)-1] {
+		if len(p.vDTS) > 0 && int64(dts)-int64(p.vDTS[len(p.vDTS)-1]) < -1000 {
 			_ = p.flushSegmentLocked()
 		}
 		cp := append([]byte(nil), frame...)
@@ -335,7 +346,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		// Accumulate SPS/PPS until the init segment is written.
 		if p.videoInit == nil {
 			p.videoPS = append(p.videoPS, cp...)
-			p.tryInitVideoLocked()
+			pending = p.tryInitVideoLocked()
 		}
 		if p.segmentStart.IsZero() && p.videoInit != nil {
 			p.segmentStart = time.Now()
@@ -343,9 +354,10 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 
 	case mpeg2.TS_STREAM_H265:
 		if len(frame) == 0 {
+			p.mu.Unlock()
 			return
 		}
-		if len(p.vDTS) > 0 && dts+1000 < p.vDTS[len(p.vDTS)-1] {
+		if len(p.vDTS) > 0 && int64(dts)-int64(p.vDTS[len(p.vDTS)-1]) < -1000 {
 			_ = p.flushSegmentLocked()
 		}
 		cp := append([]byte(nil), frame...)
@@ -356,7 +368,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		if p.videoInit == nil {
 			p.isHEVC = true
 			p.videoPS = append(p.videoPS, cp...)
-			p.tryInitVideoH265Locked()
+			pending = p.tryInitVideoH265Locked()
 		}
 		if p.segmentStart.IsZero() && p.videoInit != nil {
 			p.segmentStart = time.Now()
@@ -364,11 +376,12 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 
 	case mpeg2.TS_STREAM_AAC:
 		if !p.packAudio {
+			p.mu.Unlock()
 			return
 		}
 		// Same backward-jump guard as for video: flush before mixing frames
 		// from two different sources in the audio queue.
-		if len(p.aPTS) > 0 && pts+1000 < p.aPTS[len(p.aPTS)-1] {
+		if len(p.aPTS) > 0 && int64(pts)-int64(p.aPTS[len(p.aPTS)-1]) < -1000 {
 			_ = p.flushSegmentLocked()
 		}
 		// A PES payload may contain multiple concatenated ADTS frames.
@@ -381,15 +394,21 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			}
 			hLen := int(hdr.HeaderLength)
 			pLen := int(hdr.PayloadLength)
+			if hLen <= 0 || pLen <= 0 {
+				pos++
+				continue
+			}
 			if pos+hLen+pLen > len(frame) {
 				break
 			}
 			raw := append([]byte(nil), frame[pos+hLen:pos+hLen+pLen]...)
 			if p.audioInit == nil {
-				if err := p.buildAudioInitLocked(hdr); err != nil {
+				pw, err := p.prepareAudioInitLocked(hdr)
+				if err != nil {
 					pos += hLen + pLen
 					continue
 				}
+				pending = pw
 			}
 			p.aRaw = append(p.aRaw, raw)
 			p.aPTS = append(p.aPTS, pts)
@@ -400,22 +419,43 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		}
 
 	default:
+		p.mu.Unlock()
 		return
+	}
+	p.mu.Unlock()
+
+	// Write init segment to disk outside the mutex — this is I/O-bound and
+	// only happens once per stream, but we must not block the flush ticker.
+	if pending != nil {
+		path := filepath.Join(p.streamDir, pending.filename)
+		if err := encodeInitToFile(path, pending.init); err != nil {
+			slog.Error("publisher: DASH write init segment failed",
+				"stream_code", p.streamID, "file", pending.filename, "err", err)
+			// Roll back: clear the init so the next frame retries.
+			p.mu.Lock()
+			switch pending.filename {
+			case "init_v.mp4":
+				p.videoInit = nil
+			case "init_a.mp4":
+				p.audioInit = nil
+			}
+			p.mu.Unlock()
+		}
 	}
 }
 
-// tryInitVideoLocked scans videoPS for SPS/PPS and, when found, writes init_v.mp4.
-// Caller must hold p.mu.
-func (p *dashFMP4Packager) tryInitVideoLocked() {
+// tryInitVideoLocked scans videoPS for SPS/PPS and, when found, prepares init_v.mp4.
+// Returns a pending write to be flushed outside the mutex. Caller must hold p.mu.
+func (p *dashFMP4Packager) tryInitVideoLocked() *pendingInitWrite {
 	if p.videoInit != nil || len(p.videoPS) < 20 {
-		return
+		return nil
 	}
 	// ExtractNalusOfTypeFromByteStream expects 3-byte start codes (0x00 0x00 0x01).
 	psBuf := annexB4To3ForPSExtract(p.videoPS)
 	spss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_SPS, psBuf, false)
 	ppss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_PPS, psBuf, false)
 	if len(spss) == 0 || len(ppss) == 0 {
-		return
+		return nil
 	}
 
 	init := mp4.CreateEmptyInit()
@@ -423,7 +463,7 @@ func (p *dashFMP4Packager) tryInitVideoLocked() {
 	if err := trak.SetAVCDescriptor("avc1", spss, ppss, true); err != nil {
 		slog.Error("publisher: DASH SetAVCDescriptor failed",
 			"stream_code", p.streamID, "err", err)
-		return
+		return nil
 	}
 
 	if sps, err := avc.ParseSPSNALUnit(spss[0], false); err == nil && sps != nil {
@@ -436,23 +476,19 @@ func (p *dashFMP4Packager) tryInitVideoLocked() {
 	p.videoTID = trak.Tkhd.TrackID
 	p.videoPS = nil // no longer needed
 
-	if err := encodeInitToFile(filepath.Join(p.streamDir, "init_v.mp4"), init); err != nil {
-		slog.Error("publisher: DASH write init_v.mp4 failed",
-			"stream_code", p.streamID, "err", err)
-		p.videoInit = nil
-	}
+	return &pendingInitWrite{init: init, filename: "init_v.mp4"}
 }
 
-// tryInitVideoH265Locked scans videoPS for VPS/SPS/PPS and, when found, writes init_v.mp4.
-// Caller must hold p.mu.
-func (p *dashFMP4Packager) tryInitVideoH265Locked() {
+// tryInitVideoH265Locked scans videoPS for VPS/SPS/PPS and, when found, prepares init_v.mp4.
+// Returns a pending write to be flushed outside the mutex. Caller must hold p.mu.
+func (p *dashFMP4Packager) tryInitVideoH265Locked() *pendingInitWrite {
 	if p.videoInit != nil || len(p.videoPS) < 20 {
-		return
+		return nil
 	}
 	psBuf := annexB4To3ForPSExtract(p.videoPS)
 	vpss, spss, ppss := hevc.GetParameterSetsFromByteStream(psBuf)
 	if len(spss) == 0 || len(ppss) == 0 {
-		return
+		return nil
 	}
 
 	init := mp4.CreateEmptyInit()
@@ -460,7 +496,7 @@ func (p *dashFMP4Packager) tryInitVideoH265Locked() {
 	if err := trak.SetHEVCDescriptor("hvc1", vpss, spss, ppss, nil, true); err != nil {
 		slog.Error("publisher: DASH SetHEVCDescriptor failed",
 			"stream_code", p.streamID, "err", err)
-		return
+		return nil
 	}
 
 	if sps, err := hevc.ParseSPSNALUnit(spss[0]); err == nil && sps != nil {
@@ -474,24 +510,20 @@ func (p *dashFMP4Packager) tryInitVideoH265Locked() {
 	p.videoTID = trak.Tkhd.TrackID
 	p.videoPS = nil
 
-	if err := encodeInitToFile(filepath.Join(p.streamDir, "init_v.mp4"), init); err != nil {
-		slog.Error("publisher: DASH write init_v.mp4 (H.265) failed",
-			"stream_code", p.streamID, "err", err)
-		p.videoInit = nil
-	}
+	return &pendingInitWrite{init: init, filename: "init_v.mp4"}
 }
 
-// buildAudioInitLocked creates and writes init_a.mp4 from the first ADTS header.
-// Caller must hold p.mu.
-func (p *dashFMP4Packager) buildAudioInitLocked(hdr *aac.ADTSHeader) error {
+// prepareAudioInitLocked creates the audio init segment from the first ADTS header.
+// Returns a pending write to be flushed outside the mutex. Caller must hold p.mu.
+func (p *dashFMP4Packager) prepareAudioInitLocked(hdr *aac.ADTSHeader) (*pendingInitWrite, error) {
 	sr := int(hdr.Frequency())
 	if sr <= 0 {
-		return fmt.Errorf("invalid AAC sample rate")
+		return nil, fmt.Errorf("invalid AAC sample rate")
 	}
 	init := mp4.CreateEmptyInit()
 	trak := init.AddEmptyTrack(uint32(sr), "audio", "und")
 	if err := trak.SetAACDescriptor(aac.AAClc, sr); err != nil {
-		return err
+		return nil, err
 	}
 	p.audioInit = init
 	p.audioTID = trak.Tkhd.TrackID
@@ -499,11 +531,7 @@ func (p *dashFMP4Packager) buildAudioInitLocked(hdr *aac.ADTSHeader) error {
 	p.audioNextDecode = 0
 	p.audioCodec = "mp4a.40.2"
 
-	if err := encodeInitToFile(filepath.Join(p.streamDir, "init_a.mp4"), init); err != nil {
-		p.audioInit = nil
-		return err
-	}
-	return nil
+	return &pendingInitWrite{init: init, filename: "init_a.mp4"}, nil
 }
 
 // audioFramesPerSegment returns the expected number of 1024-sample AAC frames per segment.
