@@ -1,22 +1,5 @@
 package domain
 
-// TranscodeMode controls how much processing is applied to the stream.
-type TranscodeMode string
-
-const (
-	// TranscodeModePassthrough copies both video and audio without any re-encoding.
-	// Lowest CPU usage; output format must match source.
-	TranscodeModePassthrough TranscodeMode = "passthrough"
-
-	// TranscodeModeRemux rewraps the stream into a new container without re-encoding.
-	// E.g. RTMP → MPEG-TS. Very low CPU usage.
-	TranscodeModeRemux TranscodeMode = "remux"
-
-	// TranscodeModeFull performs full video and audio re-encoding.
-	// Required for ABR ladder, codec conversion, or applying filters.
-	TranscodeModeFull TranscodeMode = "transcode"
-)
-
 // HWAccel selects the hardware acceleration backend for encoding/decoding.
 type HWAccel string
 
@@ -169,13 +152,6 @@ type AudioTranscodeConfig struct {
 
 // TranscoderConfig is the complete transcoding configuration for a stream.
 type TranscoderConfig struct {
-	// Mode controls how the server processes the ingest stream.
-	// passthrough — skip FFmpeg entirely; raw MPEG-TS packets flow directly to the publisher.
-	// remux       — skip FFmpeg entirely; ingestor already rewraps to MPEG-TS on ingest.
-	// transcode   — default; FFmpeg re-encodes according to Video/Audio config.
-	// Empty string is treated as transcode.
-	Mode TranscodeMode `json:"mode,omitempty"`
-
 	Video   VideoTranscodeConfig   `json:"video"`
 	Audio   AudioTranscodeConfig   `json:"audio"`
 	Decoder DecoderConfig          `json:"decoder"`

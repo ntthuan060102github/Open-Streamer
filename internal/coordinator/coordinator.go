@@ -572,13 +572,9 @@ func shouldRunTranscoder(stream *domain.Stream) bool {
 	if stream == nil || stream.Transcoder == nil {
 		return false
 	}
-	switch stream.Transcoder.Mode {
-	case domain.TranscodeModePassthrough, domain.TranscodeModeRemux:
-		return false
-	case domain.TranscodeModeFull, "":
-		return true
-	}
-	return true
+	tc := stream.Transcoder
+	// Both video and audio copy → raw MPEG-TS passes through without FFmpeg.
+	return !tc.Video.Copy || !tc.Audio.Copy
 }
 
 // transcoderProfilesFromDomain maps stream video settings to FFmpeg ladder profiles.

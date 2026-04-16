@@ -118,21 +118,20 @@ func diffTranscoder(old, new *domain.Stream, d *StreamDiff) {
 	// Both non-nil from here.
 	ot, nt := old.Transcoder, new.Transcoder
 
-	// Mode change is a topology change.
-	if effectiveMode(ot.Mode) != effectiveMode(nt.Mode) {
+	// FFmpeg on/off change is a topology change (buffer layout changes).
+	if needsFFmpeg(ot) != needsFFmpeg(nt) {
 		d.TranscoderTopologyChanged = true
 		return
 	}
 
-	// video.copy change is a topology change (switches between raw buffer and main buffer).
+	// video.copy change is a topology change (single passthrough rendition ↔ multi-profile ladder).
 	if ot.Video.Copy != nt.Video.Copy {
 		d.TranscoderTopologyChanged = true
 		return
 	}
 
-	// If mode is passthrough/remux, there are no profiles to diff.
-	if effectiveMode(nt.Mode) != domain.TranscodeModeFull {
-		d.TranscoderTopologyChanged = true
+	// If neither config needs FFmpeg, there are no profiles to diff.
+	if !needsFFmpeg(nt) {
 		return
 	}
 
@@ -178,11 +177,13 @@ func diffProfiles(oldProfiles, newProfiles []domain.VideoProfile, allChanged boo
 	return pd
 }
 
-func effectiveMode(m domain.TranscodeMode) domain.TranscodeMode {
-	if m == "" {
-		return domain.TranscodeModeFull
+// needsFFmpeg reports whether the transcoder config requires spawning an FFmpeg process.
+// Both video and audio copy means raw MPEG-TS can pass through without re-encoding.
+func needsFFmpeg(tc *domain.TranscoderConfig) bool {
+	if tc == nil {
+		return false
 	}
-	return m
+	return !tc.Video.Copy || !tc.Audio.Copy
 }
 
 func inputsEqual(a, b domain.Input) bool {

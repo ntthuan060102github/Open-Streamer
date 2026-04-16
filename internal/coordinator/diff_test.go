@@ -109,10 +109,12 @@ func TestComputeDiff_TranscoderNonNilToNil(t *testing.T) {
 	assert.True(t, d.TranscoderTopologyChanged)
 }
 
-func TestComputeDiff_TranscoderModeChange(t *testing.T) {
+func TestComputeDiffBothCopyEnabledTopologyChanged(t *testing.T) {
+	// Enabling both Video.Copy + Audio.Copy turns FFmpeg off → topology change.
 	old := baseStream()
 	new := baseStream()
-	new.Transcoder.Mode = domain.TranscodeModePassthrough
+	new.Transcoder.Video.Copy = true
+	new.Transcoder.Audio.Copy = true
 
 	d := ComputeDiff(old, new)
 
