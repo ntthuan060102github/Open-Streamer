@@ -551,6 +551,18 @@ definitions:
           "" = use "./dvr/{streamCode}".
         type: string
     type: object
+  domain.StreamStatus:
+    enum:
+    - idle
+    - active
+    - degraded
+    - stopped
+    type: string
+    x-enum-varnames:
+    - StatusIdle
+    - StatusActive
+    - StatusDegraded
+    - StatusStopped
   domain.ThumbnailConfig:
     properties:
       enabled:
@@ -752,6 +764,37 @@ definitions:
     x-enum-varnames:
     - WatermarkTypeText
     - WatermarkTypeImage
+  handler.configResponse:
+    properties:
+      audioCodecs:
+        items:
+          $ref: '#/definitions/domain.AudioCodec'
+        type: array
+      hwAccels:
+        items:
+          $ref: '#/definitions/domain.HWAccel'
+        type: array
+      outputProtocols:
+        items:
+          type: string
+        type: array
+      streamStatuses:
+        items:
+          $ref: '#/definitions/domain.StreamStatus'
+        type: array
+      videoCodecs:
+        items:
+          $ref: '#/definitions/domain.VideoCodec'
+        type: array
+      watermarkPositions:
+        items:
+          $ref: '#/definitions/domain.WatermarkPosition'
+        type: array
+      watermarkTypes:
+        items:
+          $ref: '#/definitions/domain.WatermarkType'
+        type: array
+    type: object
 info:
   contact: {}
   description: REST API for live stream configuration, ingest/publish lifecycle, DVR
@@ -759,6 +802,20 @@ info:
   title: Open Streamer API
   version: "1.0"
 paths:
+  /config:
+    get:
+      description: Returns available hardware accelerators (OS-detected) and static
+        enum lists for building configuration forms.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handler.configResponse'
+      summary: Get server configuration.
+      tags:
+      - system
   /healthz:
     get:
       description: Returns 200 if the process is up.

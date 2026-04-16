@@ -15,6 +15,26 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/config": {
+            "get": {
+                "description": "Returns available hardware accelerators (OS-detected) and static enum lists for building configuration forms.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Get server configuration.",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handler.configResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/healthz": {
             "get": {
                 "description": "Returns 200 if the process is up.",
@@ -1575,6 +1595,21 @@ const docTemplate = `{
                 }
             }
         },
+        "domain.StreamStatus": {
+            "type": "string",
+            "enum": [
+                "idle",
+                "active",
+                "degraded",
+                "stopped"
+            ],
+            "x-enum-varnames": [
+                "StatusIdle",
+                "StatusActive",
+                "StatusDegraded",
+                "StatusStopped"
+            ]
+        },
         "domain.ThumbnailConfig": {
             "type": "object",
             "properties": {
@@ -1818,6 +1853,53 @@ const docTemplate = `{
                 "WatermarkTypeText",
                 "WatermarkTypeImage"
             ]
+        },
+        "handler.configResponse": {
+            "type": "object",
+            "properties": {
+                "audioCodecs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.AudioCodec"
+                    }
+                },
+                "hwAccels": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.HWAccel"
+                    }
+                },
+                "outputProtocols": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "streamStatuses": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.StreamStatus"
+                    }
+                },
+                "videoCodecs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.VideoCodec"
+                    }
+                },
+                "watermarkPositions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.WatermarkPosition"
+                    }
+                },
+                "watermarkTypes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.WatermarkType"
+                    }
+                }
+            }
         }
     }
 }`
