@@ -204,9 +204,13 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 		return fmt.Errorf("ingestor: create packet reader: %w", err)
 	}
 
+	// Register new worker immediately so Stop() can cancel it at any time.
+	// The previous worker is NOT cancelled here; it is cancelled by onHandoff after the
+	// new source connects successfully, preventing a buffer gap during source transitions.
 	s.mu.Lock()
+	var prevCancel context.CancelFunc
 	if prev, ok := s.workers[streamID]; ok {
-		prev.cancel() // seamless source switch
+		prevCancel = prev.cancel
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	s.workers[streamID] = &pullWorkerEntry{inputPriority: input.Priority, cancel: cancel}
@@ -245,9 +249,23 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 				s.m.IngestorBytesTotal.WithLabelValues(string(id), proto).Add(float64(n))
 				s.m.IngestorPacketsTotal.WithLabelValues(string(id), proto).Inc()
 			},
+			onHandoff: func() {
+				if prevCancel != nil {
+					slog.Info("ingestor: pre-connect handoff — releasing previous source",
+						"stream_code", streamID,
+						"new_input_priority", input.Priority,
+					)
+					prevCancel()
+				}
+			},
 		}
 		s.mu.Unlock()
 		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, cb)
+		// Ensure the previous worker is always released — handles the case where Stop()
+		// is called during pre-connect before onHandoff had a chance to fire.
+		if prevCancel != nil {
+			prevCancel()
+		}
 		cancel()
 		s.m.IngestorErrorsTotal.WithLabelValues(string(streamID), "failover").Inc()
 		//nolint:contextcheck // worker ctx is cancelled; publish must outlive it for hooks/manager.

@@ -513,9 +513,15 @@ func commitSwitch(state *streamState, prevPriority int, bestInput domain.Input) 
 		// Only downgrade Active → Idle; never override StatusDegraded that triggered the switch.
 		prevH.Status = domain.StatusIdle
 	}
+	now := time.Now()
 	state.active = bestInput.Priority
-	state.lastSwitchAt = time.Now()
+	state.lastSwitchAt = now
 	state.exhausted = false
+	// Stamp LastPacketAt so the packet-timeout monitor doesn't fire on the new input
+	// before it has had a chance to connect (pre-connect handoff window).
+	if newH := state.inputs[bestInput.Priority]; newH != nil {
+		newH.LastPacketAt = now
+	}
 }
 
 // notifyRestored fires the onRestored callback when the stream recovers from exhaustion.

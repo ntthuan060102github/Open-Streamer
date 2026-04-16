@@ -29,6 +29,10 @@ type pullWorkerCallbacks struct {
 	onConnect     func(streamID domain.StreamCode, inputPriority int)
 	onReconnect   func(streamID domain.StreamCode, inputPriority int, err error)
 	onPacketBytes func(streamID domain.StreamCode, inputPriority, bytes int)
+	// onHandoff is called exactly once, after the very first successful Open.
+	// It is used by startPullWorker to cancel the previous source worker only after
+	// the new source has connected — eliminating the buffer gap during source transitions.
+	onHandoff func()
 }
 
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.
@@ -44,27 +48,11 @@ func runPullWorker(
 	cb pullWorkerCallbacks,
 ) {
 	delay := reconnectBaseDelay
+	handedOff := false // onHandoff fires at most once (first successful Open)
 
 	for {
-		if ctx.Err() != nil {
+		if !openSource(ctx, streamID, input, r, cb, &delay, &handedOff) {
 			return
-		}
-
-		if err := r.Open(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			slog.Error("ingestor: open failed",
-				"stream_code", streamID,
-				"input_priority", input.Priority,
-				"url", input.URL,
-				"err", err,
-			)
-			if !waitBackoff(ctx, delay) {
-				return
-			}
-			delay = minDur(delay*2, reconnectMaxDelay)
-			continue
 		}
 
 		slog.Info("ingestor: source connected",
@@ -84,45 +72,104 @@ func runPullWorker(
 			return
 		}
 
-		if errors.Is(readErr, io.EOF) {
-			// Source ended cleanly (file finished, live stream closed by server).
-			// Notify the manager so it can immediately failover to a backup input
-			// rather than waiting for the packet-timeout to expire.
-			slog.Info("ingestor: source ended (EOF)",
-				"stream_code", streamID,
-				"input_priority", input.Priority,
-			)
-			if cb.onInputError != nil {
-				cb.onInputError(streamID, input.Priority, io.EOF)
-			}
+		if done := handleReadError(ctx, streamID, input, readErr, cb, &delay); done {
 			return
 		}
+	}
+}
 
-		slog.Warn("ingestor: read error, reconnecting",
+// openSource tries r.Open in a backoff loop until it succeeds or ctx is cancelled.
+// On the very first successful open it fires cb.onHandoff exactly once — this is the
+// pre-connect handoff that releases the previous ingestor without a buffer gap.
+// Returns false when ctx is done (caller must return).
+func openSource(
+	ctx context.Context,
+	streamID domain.StreamCode,
+	input domain.Input,
+	r PacketReader,
+	cb pullWorkerCallbacks,
+	delay *time.Duration,
+	handedOff *bool,
+) bool {
+	for {
+		// r.Open is context-aware; if ctx is already done it returns immediately.
+		if err := r.Open(ctx); err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			slog.Error("ingestor: open failed",
+				"stream_code", streamID,
+				"input_priority", input.Priority,
+				"url", input.URL,
+				"err", err,
+			)
+			if !waitBackoff(ctx, *delay) {
+				return false
+			}
+			*delay = minDur(*delay*2, reconnectMaxDelay)
+			continue
+		}
+		// First successful open — hand off from the old source.
+		if !*handedOff {
+			*handedOff = true
+			if cb.onHandoff != nil {
+				cb.onHandoff()
+			}
+		}
+		return true
+	}
+}
+
+// handleReadError inspects the result of readLoop and decides whether to retry.
+// Returns true when the worker should stop entirely, false when it should reconnect.
+func handleReadError(
+	ctx context.Context,
+	streamID domain.StreamCode,
+	input domain.Input,
+	readErr error,
+	cb pullWorkerCallbacks,
+	delay *time.Duration,
+) bool {
+	if errors.Is(readErr, io.EOF) {
+		// Source ended cleanly (file finished, live stream closed by server).
+		// Notify the manager so it can immediately failover to a backup input
+		// rather than waiting for the packet-timeout to expire.
+		slog.Info("ingestor: source ended (EOF)",
+			"stream_code", streamID,
+			"input_priority", input.Priority,
+		)
+		if cb.onInputError != nil {
+			cb.onInputError(streamID, input.Priority, io.EOF)
+		}
+		return true
+	}
+
+	slog.Warn("ingestor: read error, reconnecting",
+		"stream_code", streamID,
+		"input_priority", input.Priority,
+		"err", readErr,
+		"backoff", *delay,
+	)
+	if shouldFailoverImmediately(readErr) {
+		slog.Warn("ingestor: non-retriable source error, stop and trigger failover",
 			"stream_code", streamID,
 			"input_priority", input.Priority,
 			"err", readErr,
-			"backoff", delay,
 		)
-		if shouldFailoverImmediately(readErr) {
-			slog.Warn("ingestor: non-retriable source error, stop and trigger failover",
-				"stream_code", streamID,
-				"input_priority", input.Priority,
-				"err", readErr,
-			)
-			if cb.onInputError != nil {
-				cb.onInputError(streamID, input.Priority, readErr)
-			}
-			return
+		if cb.onInputError != nil {
+			cb.onInputError(streamID, input.Priority, readErr)
 		}
-		if cb.onReconnect != nil {
-			cb.onReconnect(streamID, input.Priority, readErr)
-		}
-		if !waitBackoff(ctx, delay) {
-			return
-		}
-		delay = minDur(delay*2, reconnectMaxDelay)
+		return true
 	}
+
+	if cb.onReconnect != nil {
+		cb.onReconnect(streamID, input.Priority, readErr)
+	}
+	if !waitBackoff(ctx, *delay) {
+		return true
+	}
+	*delay = minDur(*delay*2, reconnectMaxDelay)
+	return false
 }
 
 // readLoop reads from reader until error or ctx cancellation.
