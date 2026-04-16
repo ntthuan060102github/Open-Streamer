@@ -24,16 +24,33 @@ type StreamHandler struct {
 	bus         events.Bus
 }
 
+// streamRuntime holds live pipeline state overlaid on the persisted stream config.
+// Fields are nil/zero when the pipeline is not running. Extended as new runtime
+// observability is added without changing the top-level response shape.
+type streamRuntime struct {
+	ActiveInputPriority int `json:"active_input_priority"`
+}
+
 // streamResponse is the API representation of a stream.
 // It embeds the persisted domain.Stream (whose Status field is json:"-") and
-// overlays a runtime-computed status so clients always see the live state.
+// overlays runtime-computed fields so clients always see the live state.
 type streamResponse struct {
 	*domain.Stream
-	Status domain.StreamStatus `json:"status"`
+	Status  domain.StreamStatus `json:"status"`
+	Runtime *streamRuntime      `json:"runtime"`
 }
 
 func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
-	return streamResponse{Stream: s, Status: h.coordinator.StreamStatus(s.Code)}
+	resp := streamResponse{
+		Stream: s,
+		Status: h.coordinator.StreamStatus(s.Code),
+	}
+	if rt, ok := h.manager.RuntimeStatus(s.Code); ok {
+		resp.Runtime = &streamRuntime{
+			ActiveInputPriority: rt.ActiveInputPriority,
+		}
+	}
+	return resp
 }
 
 // NewStreamHandler creates a StreamHandler and registers it with the DI injector.
