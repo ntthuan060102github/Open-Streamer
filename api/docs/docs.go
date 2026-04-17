@@ -79,6 +79,80 @@ const docTemplate = `{
                 }
             }
         },
+        "/config/yaml": {
+            "get": {
+                "description": "Returns the entire persisted GlobalConfig as a YAML document. Pair with PUT /config/yaml to round-trip an editor.",
+                "produces": [
+                    "application/yaml"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Get full server configuration as YAML",
+                "responses": {
+                    "200": {
+                        "description": "YAML document",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Replaces the entire GlobalConfig with the request body. Validation errors are returned as a list. On success, the runtime manager diffs against the previous config and starts/stops/restarts services accordingly.",
+                "consumes": [
+                    "application/yaml"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Replace full server configuration from YAML",
+                "parameters": [
+                    {
+                        "description": "Full GlobalConfig YAML document",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/healthz": {
             "get": {
                 "description": "Returns 200 if the process is up.",
