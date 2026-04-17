@@ -1,8 +1,12 @@
 {
     "swagger": "2.0",
     "info": {
-        "contact": {}
+        "description": "REST API for live stream configuration, ingest/publish lifecycle, DVR recordings, and event hooks.",
+        "title": "Open Streamer API",
+        "contact": {},
+        "version": "1.0"
     },
+    "basePath": "/",
     "paths": {
         "/config": {
             "get": {

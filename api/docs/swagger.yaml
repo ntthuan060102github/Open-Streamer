@@ -1,3 +1,4 @@
+basePath: /
 definitions:
   apidocs.ConfigData:
     properties:
@@ -1081,6 +1082,10 @@ definitions:
     - WatermarkTypeImage
 info:
   contact: {}
+  description: REST API for live stream configuration, ingest/publish lifecycle, DVR
+    recordings, and event hooks.
+  title: Open Streamer API
+  version: "1.0"
 paths:
   /config:
     get:
