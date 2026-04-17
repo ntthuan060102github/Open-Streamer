@@ -47,7 +47,8 @@ func newRTMPTestServer(t *testing.T) *rtmpTestServer {
 	t.Helper()
 
 	// Find a free port.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
