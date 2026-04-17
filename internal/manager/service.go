@@ -54,6 +54,8 @@ type InputHealth struct {
 	Bitrate      float64 // kbps (reserved for future bitrate estimator)
 	PacketLoss   float64 // percent (reserved)
 	Status       domain.StreamStatus
+	LastError    string    // last reason the input went degraded; cleared on recovery
+	LastErrorAt  time.Time // when LastError was set; zero value when no error
 }
 
 // streamState holds all monitoring data for a single stream.
@@ -87,19 +89,27 @@ type streamState struct {
 }
 
 // RuntimeStatus is a JSON-safe snapshot of manager state for one stream.
+// Exhausted is true when every input has degraded and no failover candidate
+// remains — the stream is effectively offline at the source.
 type RuntimeStatus struct {
 	ActiveInputPriority   int                   `json:"active_input_priority"`
 	OverrideInputPriority *int                  `json:"override_input_priority,omitempty"`
+	Exhausted             bool                  `json:"exhausted"`
 	Inputs                []InputHealthSnapshot `json:"inputs"`
 }
 
 // InputHealthSnapshot is a serialisable copy of one input's health.
+// LastError carries a human-readable reason the input most recently went
+// degraded (packet timeout, ingestor error, …); it is cleared when the input
+// recovers. Frontend should treat it as a diagnostic string, not a code.
 type InputHealthSnapshot struct {
 	InputPriority int                 `json:"input_priority"`
 	LastPacketAt  time.Time           `json:"last_packet_at"`
 	BitrateKbps   float64             `json:"bitrate_kbps"`
 	PacketLoss    float64             `json:"packet_loss"`
 	Status        domain.StreamStatus `json:"status"`
+	LastError     string              `json:"last_error,omitempty"`
+	LastErrorAt   *time.Time          `json:"last_error_at,omitempty"`
 }
 
 // probeTask carries the arguments for a background probe goroutine.
@@ -255,16 +265,23 @@ func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool
 	out := RuntimeStatus{
 		ActiveInputPriority:   state.active,
 		OverrideInputPriority: state.overridePriority,
+		Exhausted:             state.exhausted,
 		Inputs:                make([]InputHealthSnapshot, 0, len(state.inputs)),
 	}
 	for _, h := range state.inputs {
-		out.Inputs = append(out.Inputs, InputHealthSnapshot{
+		snap := InputHealthSnapshot{
 			InputPriority: h.Input.Priority,
 			LastPacketAt:  h.LastPacketAt,
 			BitrateKbps:   h.Bitrate,
 			PacketLoss:    h.PacketLoss,
 			Status:        h.Status,
-		})
+			LastError:     h.LastError,
+		}
+		if !h.LastErrorAt.IsZero() {
+			t := h.LastErrorAt
+			snap.LastErrorAt = &t
+		}
+		out.Inputs = append(out.Inputs, snap)
 	}
 	return out, true
 }
@@ -286,6 +303,8 @@ func (s *Service) RecordPacket(streamID domain.StreamCode, inputPriority int) {
 			h.LastPacketAt = now
 			if h.Status != domain.StatusActive {
 				h.Status = domain.StatusActive
+				h.LastError = ""
+				h.LastErrorAt = time.Time{}
 				delete(state.degradedAt, inputPriority)
 				s.m.ManagerInputHealth.WithLabelValues(string(streamID), strconv.Itoa(inputPriority)).Set(1)
 			}
@@ -316,6 +335,8 @@ func (s *Service) ReportInputError(streamID domain.StreamCode, inputPriority int
 		return
 	}
 	h.Status = domain.StatusDegraded
+	h.LastError = err.Error()
+	h.LastErrorAt = now
 	state.degradedAt[inputPriority] = now
 	state.mu.Unlock()
 
@@ -408,6 +429,8 @@ func (s *Service) collectTimeoutIfNeeded(
 		return
 	}
 	h.Status = domain.StatusDegraded
+	h.LastError = fmt.Sprintf("no packet for %s (timeout %s)", now.Sub(h.LastPacketAt).Truncate(time.Second), timeout)
+	h.LastErrorAt = now
 	state.degradedAt[priority] = now
 	*timedOut = priority
 }
