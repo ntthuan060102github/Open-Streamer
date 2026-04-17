@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
@@ -221,13 +220,6 @@ func decodeStreamBody(
 	if err := base.ValidateUniqueInputs(); err != nil {
 		return nil, &putValidationError{code: "DUPLICATE_INPUT", message: err.Error()}
 	}
-
-	if exists {
-		base.CreatedAt = cur.CreatedAt
-	} else {
-		base.CreatedAt = time.Now()
-	}
-	base.UpdatedAt = time.Now()
 	return &base, nil
 }
 

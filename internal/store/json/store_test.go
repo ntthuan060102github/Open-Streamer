@@ -100,9 +100,6 @@ func TestJSONStreamRepo_SaveAndFindByCode(t *testing.T) {
 	assert.Equal(t, want.DVR.SegmentDuration, got.DVR.SegmentDuration)
 	assert.Equal(t, want.DVR.StoragePath, got.DVR.StoragePath)
 	assert.Equal(t, want.DVR.MaxSizeGB, got.DVR.MaxSizeGB)
-
-	assert.Equal(t, want.CreatedAt.UTC(), got.CreatedAt.UTC())
-	assert.Equal(t, want.UpdatedAt.UTC(), got.UpdatedAt.UTC())
 }
 
 func TestJSONStreamRepo_FindByCode_NotFound(t *testing.T) {

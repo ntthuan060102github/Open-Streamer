@@ -176,8 +176,6 @@ definitions:
       code:
         description: Code is the unique key chosen by the user ([a-zA-Z0-9_]).
         type: string
-      created_at:
-        type: string
       description:
         type: string
       disabled:
@@ -235,8 +233,6 @@ definitions:
         description: |-
           Transcoder controls encoding/decoding settings.
           nil means no transcoding for this stream.
-      updated_at:
-        type: string
       watermark:
         allOf:
         - $ref: '#/definitions/domain.WatermarkConfig'

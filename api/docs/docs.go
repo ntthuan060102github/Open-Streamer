@@ -1197,9 +1197,6 @@ const docTemplate = `{
                     "description": "Code is the unique key chosen by the user ([a-zA-Z0-9_]).",
                     "type": "string"
                 },
-                "created_at": {
-                    "type": "string"
-                },
                 "description": {
                     "type": "string"
                 },
@@ -1271,9 +1268,6 @@ const docTemplate = `{
                             "$ref": "#/definitions/domain.TranscoderConfig"
                         }
                     ]
-                },
-                "updated_at": {
-                    "type": "string"
                 },
                 "watermark": {
                     "description": "Watermark is an optional text or image overlay applied before encoding.",

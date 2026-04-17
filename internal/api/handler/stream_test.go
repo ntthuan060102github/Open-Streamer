@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
@@ -33,9 +32,6 @@ func TestDecodeStreamBodyNew(t *testing.T) {
 	}
 	if got.Code != "live1" || got.Name != "hello" {
 		t.Errorf("body=%+v", got)
-	}
-	if got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
-		t.Error("CreatedAt/UpdatedAt must be set on new stream")
 	}
 }
 
@@ -101,21 +97,5 @@ func TestDecodeStreamBodyInvalidPriority(t *testing.T) {
 	_, vErr := decodeBodyHelper(t, "x", nil, false, body)
 	if vErr == nil || vErr.code != "INVALID_INPUT_PRIORITY" {
 		t.Errorf("want INVALID_INPUT_PRIORITY, got %+v", vErr)
-	}
-}
-
-func TestDecodeStreamBodyPreservesCreatedAt(t *testing.T) {
-	created := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	cur := &domain.Stream{Code: "x", Name: "orig", CreatedAt: created}
-
-	got, vErr := decodeBodyHelper(t, "x", cur, true, map[string]any{"name": "newer"})
-	if vErr != nil {
-		t.Fatalf(validationErrFmt, vErr)
-	}
-	if !got.CreatedAt.Equal(created) {
-		t.Errorf("CreatedAt mutated: want %v, got %v", created, got.CreatedAt)
-	}
-	if got.UpdatedAt.Equal(created) {
-		t.Error("UpdatedAt must advance on edit")
 	}
 }

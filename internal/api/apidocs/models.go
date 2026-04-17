@@ -31,7 +31,7 @@ type StreamData struct {
 }
 
 // StreamPutRequest is request body for PUT /streams/{code}.
-// code is taken from path param; created_at/updated_at are server-managed.
+// code is taken from path param.
 type StreamPutRequest struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description"`

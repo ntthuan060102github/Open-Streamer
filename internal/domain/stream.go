@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"time"
 )
 
 // MaxStreamCodeLen is the maximum length of a user-defined stream code.
@@ -90,9 +89,6 @@ type Stream struct {
 
 	// Thumbnail controls periodic screenshot generation for preview images.
 	Thumbnail *ThumbnailConfig `json:"thumbnail,omitempty" yaml:"thumbnail,omitempty"`
-
-	CreatedAt time.Time `json:"created_at" yaml:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" yaml:"updated_at"`
 }
 
 // ValidateInputPriorities enforces that input priorities are contiguous and sorted.

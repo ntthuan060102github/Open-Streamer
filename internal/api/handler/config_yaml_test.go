@@ -392,36 +392,6 @@ func TestReplaceConfigYAMLDeletesRemovedHook(t *testing.T) {
 	}
 }
 
-func TestReplaceConfigYAMLPreservesCreatedAt(t *testing.T) {
-	old := &domain.Stream{
-		Code:   codeAlpha,
-		Inputs: []domain.Input{{URL: srcRTMPURL, Priority: 0}},
-	}
-	old.CreatedAt = old.CreatedAt.Add(0) // zero time → set explicitly via mutation below
-	streams := newFakeStreamRepo(old)
-	// Prime CreatedAt with a recognisable value.
-	streams.items[codeAlpha].CreatedAt = streams.items[codeAlpha].UpdatedAt
-	stamp := streams.items[codeAlpha].CreatedAt
-	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, streams, newFakeHookRepo(), newFakeCoord(codeAlpha))
-
-	body := `streams:
-  - code: alpha
-    name: renamed
-    inputs:
-      - url: rtmp://src/a
-        priority: 0
-`
-	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, putYAML(t, body))
-	if w.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-	}
-	if !streams.items[codeAlpha].CreatedAt.Equal(stamp) {
-		t.Errorf("CreatedAt must be preserved on update, got %v want %v",
-			streams.items[codeAlpha].CreatedAt, stamp)
-	}
-}
-
 // --- error paths --------------------------------------------------------------
 
 func TestReplaceConfigYAMLEmptyBody(t *testing.T) {

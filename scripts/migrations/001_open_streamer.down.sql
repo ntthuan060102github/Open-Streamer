@@ -1,3 +1,0 @@
-DROP TABLE IF EXISTS hooks;
-DROP TABLE IF EXISTS recordings;
-DROP TABLE IF EXISTS streams;

@@ -113,8 +113,6 @@ func NewFullStream(code domain.StreamCode) *domain.Stream {
 			StoragePath:     "/data/dvr/test",
 			MaxSizeGB:       10,
 		},
-		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		UpdatedAt: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
 	}
 }
 

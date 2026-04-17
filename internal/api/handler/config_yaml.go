@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -217,8 +216,6 @@ func (h *ConfigHandler) applyHooks(ctx context.Context, desired []*domain.Hook) 
 //   - Added   (missing from store)             → Save + Start (if not Disabled and has Inputs)
 //   - Updated (in both)                        → Save, then Update (if running)
 //     or Start (if was disabled/stopped and now enabled)
-//
-// CreatedAt/UpdatedAt are normalised so the editor doesn't have to manage them.
 func (h *ConfigHandler) applyStreams(ctx context.Context, desired []*domain.Stream) error {
 	existing, err := h.streamRepo.List(ctx, store.StreamFilter{})
 	if err != nil {
@@ -263,10 +260,8 @@ func (h *ConfigHandler) upsertStreams(
 	ctx context.Context,
 	existing, desired map[domain.StreamCode]*domain.Stream,
 ) error {
-	now := time.Now()
 	for code, want := range desired {
 		old, exists := existing[code]
-		stampStreamTimestamps(want, old, exists, now)
 		if err := h.streamRepo.Save(ctx, want); err != nil {
 			return fmt.Errorf("save stream %q: %w", code, err)
 		}
@@ -275,15 +270,6 @@ func (h *ConfigHandler) upsertStreams(
 		}
 	}
 	return nil
-}
-
-func stampStreamTimestamps(want, old *domain.Stream, exists bool, now time.Time) {
-	if exists {
-		want.CreatedAt = old.CreatedAt
-	} else if want.CreatedAt.IsZero() {
-		want.CreatedAt = now
-	}
-	want.UpdatedAt = now
 }
 
 func (h *ConfigHandler) reconcileStreamLifecycle(

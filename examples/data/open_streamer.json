@@ -2,7 +2,7 @@
   "streams": {
     "obs-passthrough": {
       "code": "obs-passthrough",
-      "name": "OBS Push — Passthrough (no transcoding)",
+      "name": "OBS Push \u2014 Passthrough (no transcoding)",
       "description": "OBS or any RTMP encoder pushes to :1935. Stream is forwarded as-is to HLS and DASH.",
       "inputs": [
         {
@@ -23,14 +23,11 @@
         "srt": false
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "rtmp-abr": {
       "code": "rtmp-abr",
-      "name": "RTMP Pull — ABR Transcoding (3 profiles)",
+      "name": "RTMP Pull \u2014 ABR Transcoding (3 profiles)",
       "description": "Pulls from a remote RTMP source. Transcodes to FHD/HD/SD ABR ladder with NVENC. Serves HLS, DASH, RTSP, and RTMP play. DVR enabled.",
       "inputs": [
         {
@@ -116,14 +113,11 @@
         "max_size_gb": 10
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "udp-passthrough": {
       "code": "udp-passthrough",
-      "name": "UDP MPEG-TS — Passthrough",
+      "name": "UDP MPEG-TS \u2014 Passthrough",
       "description": "Ingests multicast or unicast UDP MPEG-TS. No transcoding. Suitable for broadcast contribution links.",
       "inputs": [
         {
@@ -144,14 +138,11 @@
         "srt": false
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "hls-pull-restream": {
       "code": "hls-pull-restream",
-      "name": "HLS Pull — Transcode + Push to Platforms",
+      "name": "HLS Pull \u2014 Transcode + Push to Platforms",
       "description": "Pulls a remote HLS stream, transcodes to H.264, and simultaneously re-streams to YouTube, Facebook, and Twitch.",
       "inputs": [
         {
@@ -216,14 +207,11 @@
         }
       ],
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "rtsp-camera": {
       "code": "rtsp-camera",
-      "name": "RTSP IP Camera — Video Copy + Audio Transcode",
+      "name": "RTSP IP Camera \u2014 Video Copy + Audio Transcode",
       "description": "Ingests H.264 from an IP camera over RTSP. Copies video as-is, re-encodes audio to AAC. Serves HLS.",
       "inputs": [
         {
@@ -272,14 +260,11 @@
         "max_size_gb": 50
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "file-loop-test": {
       "code": "file-loop-test",
-      "name": "File Loop — Testing / Demo",
+      "name": "File Loop \u2014 Testing / Demo",
       "description": "Loops a local MPEG-TS file at real-time pace. Useful for load testing the publisher or demoing the server without a real encoder.",
       "inputs": [
         {
@@ -326,14 +311,11 @@
         "srt": false
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "s3-vod-loop": {
       "code": "s3-vod-loop",
-      "name": "S3 Object Loop — VOD-as-Live",
+      "name": "S3 Object Loop \u2014 VOD-as-Live",
       "description": "Streams a video file from S3 (or S3-compatible storage like MinIO / Cloudflare R2) in a loop to simulate a 24/7 live channel.",
       "inputs": [
         {
@@ -361,11 +343,8 @@
         "srt": false
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "srt-push-ingest": {
       "code": "srt-push-ingest",
       "name": "SRT Push Ingest",
@@ -409,11 +388,8 @@
         "srt": false
       },
       "status": "stopped",
-      "disabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "disabled": false
     },
-
     "disabled-example": {
       "code": "disabled-example",
       "name": "Disabled Stream Example",
@@ -432,14 +408,10 @@
         "rtmp": false,
         "srt": false
       },
-      "status": "stopped",
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "status": "stopped"
     }
   },
-
   "recordings": {},
-
   "hooks": {
     "webhook-lifecycle": {
       "id": "webhook-lifecycle",
@@ -455,21 +427,16 @@
       ],
       "enabled": false,
       "max_retries": 3,
-      "timeout_sec": 10,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "timeout_sec": 10
     },
     "kafka-all-events": {
       "id": "kafka-all-events",
-      "name": "Kafka — all events",
+      "name": "Kafka \u2014 all events",
       "type": "kafka",
       "target": "open-streamer-events",
       "event_types": [],
-      "enabled": false,
-      "created_at": "2026-01-01T00:00:00Z",
-      "updated_at": "2026-01-01T00:00:00Z"
+      "enabled": false
     }
   },
-
   "global": {}
 }
