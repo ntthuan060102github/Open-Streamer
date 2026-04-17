@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/hwdetect"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/samber/do/v2"
 )
 
@@ -14,6 +16,16 @@ import (
 type RuntimeConfigManager interface {
 	CurrentConfig() *domain.GlobalConfig
 	Apply(ctx context.Context, newCfg *domain.GlobalConfig) error
+}
+
+// streamLifecycle is the subset of *coordinator.Coordinator needed to apply
+// stream changes from the full-config YAML editor. Defined as an interface so
+// the diff/sync flow can be unit-tested without spinning up the real pipeline.
+type streamLifecycle interface {
+	Start(ctx context.Context, stream *domain.Stream) error
+	Stop(ctx context.Context, code domain.StreamCode)
+	Update(ctx context.Context, old, new *domain.Stream) error
+	IsRunning(code domain.StreamCode) bool
 }
 
 // publisherPorts exposes listener port configuration so the UI can build output URLs.
@@ -37,14 +49,27 @@ type configResponse struct {
 	GlobalConfig       *domain.GlobalConfig       `json:"global_config"`
 }
 
-// ConfigHandler serves the GET/POST /config endpoints.
+// ConfigHandler serves the GET/POST /config and GET/PUT /config/yaml endpoints.
+//
+// The /config/yaml endpoints expose every editable resource — GlobalConfig,
+// streams, and hooks — as a single YAML document, so the frontend editor can
+// round-trip the entire system configuration in one screen.
 type ConfigHandler struct {
-	rtm RuntimeConfigManager
+	rtm        RuntimeConfigManager
+	streamRepo store.StreamRepository
+	hookRepo   store.HookRepository
+	coord      streamLifecycle
 }
 
 // NewConfigHandler creates a ConfigHandler from the DI injector.
-func NewConfigHandler(_ do.Injector) (*ConfigHandler, error) {
-	return &ConfigHandler{}, nil
+// The RuntimeConfigManager is injected later via SetRuntimeManager because it
+// depends on services that themselves depend on this handler (circular DI).
+func NewConfigHandler(i do.Injector) (*ConfigHandler, error) {
+	return &ConfigHandler{
+		streamRepo: do.MustInvoke[store.StreamRepository](i),
+		hookRepo:   do.MustInvoke[store.HookRepository](i),
+		coord:      do.MustInvoke[*coordinator.Coordinator](i),
+	}, nil
 }
 
 // SetRuntimeManager injects the RuntimeManager after construction (breaks the circular DI dependency).

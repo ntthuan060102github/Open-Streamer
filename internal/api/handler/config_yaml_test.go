@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,17 +14,156 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
 )
 
-const yamlPath = "/config/yaml"
+const (
+	yamlPath        = "/config/yaml"
+	codeAlpha       = "alpha"
+	codeBeta        = "beta"
+	hookKafkaTarget = "events"
+	hookHTTPTarget  = "https://x.test"
+	srcRTMPURL      = "rtmp://src/a"
+)
 
-func TestGetConfigYAMLRoundTrips(t *testing.T) {
+// --- in-memory test doubles ----------------------------------------------------
+
+// fakeStreamRepo is an in-memory store.StreamRepository for tests.
+type fakeStreamRepo struct {
+	items   map[domain.StreamCode]*domain.Stream
+	listErr error
+	saveErr error
+	delErr  error
+}
+
+func newFakeStreamRepo(seed ...*domain.Stream) *fakeStreamRepo {
+	r := &fakeStreamRepo{items: make(map[domain.StreamCode]*domain.Stream)}
+	for _, s := range seed {
+		r.items[s.Code] = s
+	}
+	return r
+}
+
+func (r *fakeStreamRepo) Save(_ context.Context, s *domain.Stream) error {
+	if r.saveErr != nil {
+		return r.saveErr
+	}
+	r.items[s.Code] = s
+	return nil
+}
+
+func (r *fakeStreamRepo) FindByCode(_ context.Context, code domain.StreamCode) (*domain.Stream, error) {
+	s, ok := r.items[code]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return s, nil
+}
+
+func (r *fakeStreamRepo) List(_ context.Context, _ store.StreamFilter) ([]*domain.Stream, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	out := make([]*domain.Stream, 0, len(r.items))
+	for _, s := range r.items {
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (r *fakeStreamRepo) Delete(_ context.Context, code domain.StreamCode) error {
+	if r.delErr != nil {
+		return r.delErr
+	}
+	delete(r.items, code)
+	return nil
+}
+
+// seedHooks builds a fakeHookRepo (defined in hook_test.go) prefilled with the
+// given hooks so each test can express its starting state inline.
+func seedHooks(initial ...*domain.Hook) *fakeHookRepo {
+	r := newFakeHookRepo()
+	for _, h := range initial {
+		r.hooks[h.ID] = h
+	}
+	return r
+}
+
+// fakeCoord records every lifecycle call so tests can assert the exact diff.
+type fakeCoord struct {
+	running   map[domain.StreamCode]bool
+	starts    []domain.StreamCode
+	stops     []domain.StreamCode
+	updates   []domain.StreamCode
+	startErr  error
+	updateErr error
+}
+
+func newFakeCoord(running ...domain.StreamCode) *fakeCoord {
+	c := &fakeCoord{running: make(map[domain.StreamCode]bool)}
+	for _, code := range running {
+		c.running[code] = true
+	}
+	return c
+}
+
+func (c *fakeCoord) Start(_ context.Context, s *domain.Stream) error {
+	if c.startErr != nil {
+		return c.startErr
+	}
+	c.starts = append(c.starts, s.Code)
+	c.running[s.Code] = true
+	return nil
+}
+
+func (c *fakeCoord) Stop(_ context.Context, code domain.StreamCode) {
+	c.stops = append(c.stops, code)
+	delete(c.running, code)
+}
+
+func (c *fakeCoord) Update(_ context.Context, _, want *domain.Stream) error {
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+	c.updates = append(c.updates, want.Code)
+	return nil
+}
+
+func (c *fakeCoord) IsRunning(code domain.StreamCode) bool {
+	return c.running[code]
+}
+
+// newTestHandler wires the fakes into a ConfigHandler the way the production
+// DI wiring would, so each test starts from a clean slate.
+func newTestHandler(
+	rtm *fakeRuntimeManager,
+	streamRepo *fakeStreamRepo,
+	hookRepo *fakeHookRepo,
+	coord *fakeCoord,
+) *ConfigHandler {
+	return &ConfigHandler{
+		rtm:        rtm,
+		streamRepo: streamRepo,
+		hookRepo:   hookRepo,
+		coord:      coord,
+	}
+}
+
+// putYAML is a tiny helper that builds a PUT /config/yaml request from a string.
+func putYAML(t *testing.T, body string) *http.Request {
+	t.Helper()
+	return httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath, strings.NewReader(body))
+}
+
+// --- GET ----------------------------------------------------------------------
+
+func TestGetConfigYAMLBundlesAllSections(t *testing.T) {
 	rtm := &fakeRuntimeManager{cfg: &domain.GlobalConfig{
-		Server:    &config.ServerConfig{HTTPAddr: ":8080"},
-		Buffer:    &config.BufferConfig{Capacity: 1000},
-		Publisher: &config.PublisherConfig{RTMP: config.PublisherRTMPServeConfig{Port: 1936}},
+		Server: &config.ServerConfig{HTTPAddr: ":8080"},
 	}}
-	h := &ConfigHandler{rtm: rtm}
+	streams := newFakeStreamRepo(&domain.Stream{Code: codeAlpha})
+	hooks := seedHooks(&domain.Hook{ID: "h1", Type: domain.HookTypeHTTP, Target: hookHTTPTarget})
+	h := newTestHandler(rtm, streams, hooks, newFakeCoord())
 
 	w := httptest.NewRecorder()
 	h.GetConfigYAML(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, yamlPath, nil))
@@ -34,114 +174,305 @@ func TestGetConfigYAMLRoundTrips(t *testing.T) {
 		t.Errorf("content-type=%s", got)
 	}
 
-	var back domain.GlobalConfig
+	var back fullConfig
 	if err := yaml.Unmarshal(w.Body.Bytes(), &back); err != nil {
 		t.Fatalf("response not valid YAML: %v", err)
 	}
-	if back.Server == nil || back.Server.HTTPAddr != ":8080" {
-		t.Errorf("round-trip lost server config: %+v", back.Server)
+	if back.GlobalConfig == nil || back.GlobalConfig.Server.HTTPAddr != ":8080" {
+		t.Errorf("global_config not bundled: %+v", back.GlobalConfig)
 	}
-	if back.Buffer == nil || back.Buffer.Capacity != 1000 {
-		t.Errorf("round-trip lost buffer config: %+v", back.Buffer)
+	if len(back.Streams) != 1 || back.Streams[0].Code != codeAlpha {
+		t.Errorf("streams not bundled: %+v", back.Streams)
+	}
+	if len(back.Hooks) != 1 || back.Hooks[0].ID != "h1" {
+		t.Errorf("hooks not bundled: %+v", back.Hooks)
 	}
 }
 
-func TestReplaceConfigYAMLApplies(t *testing.T) {
+func TestGetConfigYAMLStreamListError(t *testing.T) {
+	rtm := &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}
+	streams := newFakeStreamRepo()
+	streams.listErr = errors.New("db down")
+	h := newTestHandler(rtm, streams, newFakeHookRepo(), newFakeCoord())
+
+	w := httptest.NewRecorder()
+	h.GetConfigYAML(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, yamlPath, nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d", w.Code)
+	}
+}
+
+func TestGetConfigYAMLHookListError(t *testing.T) {
+	rtm := &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}
+	hooks := newFakeHookRepo()
+	hooks.listErr = errors.New("db down")
+	h := newTestHandler(rtm, newFakeStreamRepo(), hooks, newFakeCoord())
+
+	w := httptest.NewRecorder()
+	h.GetConfigYAML(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, yamlPath, nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d", w.Code)
+	}
+}
+
+// --- PUT happy path -----------------------------------------------------------
+
+func TestReplaceConfigYAMLAppliesAllSections(t *testing.T) {
 	rtm := &fakeRuntimeManager{cfg: &domain.GlobalConfig{
 		Server: &config.ServerConfig{HTTPAddr: ":8080"},
 	}}
-	h := &ConfigHandler{rtm: rtm}
+	streams := newFakeStreamRepo()
+	hooks := newFakeHookRepo()
+	coord := newFakeCoord()
+	h := newTestHandler(rtm, streams, hooks, coord)
 
-	body := []byte(`server:
-  http_addr: ":9999"
-buffer:
-  capacity: 2048
-`)
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath, bytes.NewReader(body))
+	body := `global_config:
+  server:
+    http_addr: ":9999"
+  buffer:
+    capacity: 2048
+streams:
+  - code: alpha
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+hooks:
+  - id: h1
+    type: http
+    target: https://example.com/webhook
+    enabled: true
+`
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
+
 	if rtm.applied == nil || rtm.applied.Server.HTTPAddr != ":9999" {
-		t.Errorf("apply not called with new config: %+v", rtm.applied)
+		t.Errorf("global config not applied: %+v", rtm.applied)
 	}
-	if rtm.applied.Buffer == nil || rtm.applied.Buffer.Capacity != 2048 {
-		t.Errorf("buffer not propagated: %+v", rtm.applied.Buffer)
+	if _, ok := streams.items[codeAlpha]; !ok {
+		t.Error("stream alpha not saved")
+	}
+	if _, ok := hooks.hooks["h1"]; !ok {
+		t.Error("hook h1 not saved")
+	}
+	if len(coord.starts) != 1 || coord.starts[0] != codeAlpha {
+		t.Errorf("expected one Start(alpha), got starts=%v", coord.starts)
 	}
 }
 
-func TestReplaceConfigYAMLFullReplaceDropsOmittedSection(t *testing.T) {
-	// Existing config has Hooks. New body omits Hooks → must be nil after replace.
-	rtm := &fakeRuntimeManager{cfg: &domain.GlobalConfig{
-		Server: &config.ServerConfig{HTTPAddr: ":8080"},
-		Hooks:  &config.HooksConfig{WorkerCount: 4},
-	}}
-	h := &ConfigHandler{rtm: rtm}
+// --- diff/sync ---------------------------------------------------------------
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath,
-		strings.NewReader("server:\n  http_addr: \":8080\"\n"))
+func TestReplaceConfigYAMLStopsAndDeletesRemovedStream(t *testing.T) {
+	streams := newFakeStreamRepo(&domain.Stream{
+		Code:   codeAlpha,
+		Inputs: []domain.Input{{URL: srcRTMPURL, Priority: 0}},
+	})
+	coord := newFakeCoord(codeAlpha)
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, streams, newFakeHookRepo(), coord)
+
+	// Body omits alpha entirely → must be stopped + deleted.
+	body := "streams: []\n"
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, body))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
-	if rtm.applied.Hooks != nil {
-		t.Error("PUT must drop omitted sections (full replace, not merge)")
+	if _, exists := streams.items[codeAlpha]; exists {
+		t.Error("removed stream still in store")
+	}
+	if len(coord.stops) != 1 || coord.stops[0] != codeAlpha {
+		t.Errorf("expected Stop(alpha), got stops=%v", coord.stops)
 	}
 }
+
+func TestReplaceConfigYAMLUpdatesRunningStream(t *testing.T) {
+	streams := newFakeStreamRepo(&domain.Stream{
+		Code:   codeAlpha,
+		Name:   "old",
+		Inputs: []domain.Input{{URL: srcRTMPURL, Priority: 0}},
+	})
+	coord := newFakeCoord(codeAlpha)
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, streams, newFakeHookRepo(), coord)
+
+	body := `streams:
+  - code: alpha
+    name: new
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if streams.items[codeAlpha].Name != "new" {
+		t.Errorf("name not updated: %q", streams.items[codeAlpha].Name)
+	}
+	if len(coord.updates) != 1 {
+		t.Errorf("expected Update for running stream, got updates=%v starts=%v", coord.updates, coord.starts)
+	}
+}
+
+func TestReplaceConfigYAMLStartsPreviouslyDisabledStream(t *testing.T) {
+	streams := newFakeStreamRepo(&domain.Stream{
+		Code:     codeAlpha,
+		Disabled: true,
+		Inputs:   []domain.Input{{URL: srcRTMPURL, Priority: 0}},
+	})
+	coord := newFakeCoord() // not running because was disabled
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, streams, newFakeHookRepo(), coord)
+
+	body := `streams:
+  - code: alpha
+    disabled: false
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if len(coord.starts) != 1 || coord.starts[0] != codeAlpha {
+		t.Errorf("expected Start(alpha), got starts=%v", coord.starts)
+	}
+}
+
+func TestReplaceConfigYAMLDoesNotStartDisabledNewStream(t *testing.T) {
+	coord := newFakeCoord()
+	streams := newFakeStreamRepo()
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, streams, newFakeHookRepo(), coord)
+
+	body := `streams:
+  - code: alpha
+    disabled: true
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, exists := streams.items[codeAlpha]; !exists {
+		t.Error("disabled stream should still be saved")
+	}
+	if len(coord.starts) != 0 {
+		t.Errorf("disabled stream must not start, got starts=%v", coord.starts)
+	}
+}
+
+func TestReplaceConfigYAMLDeletesRemovedHook(t *testing.T) {
+	hooks := seedHooks(
+		&domain.Hook{ID: "h_keep", Type: domain.HookTypeHTTP, Target: "https://k.test"},
+		&domain.Hook{ID: "h_drop", Type: domain.HookTypeHTTP, Target: "https://d.test"},
+	)
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, newFakeStreamRepo(), hooks, newFakeCoord())
+
+	body := `hooks:
+  - id: h_keep
+    type: http
+    target: https://k.test
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, exists := hooks.hooks["h_keep"]; !exists {
+		t.Error("kept hook missing from store")
+	}
+	if _, exists := hooks.hooks["h_drop"]; exists {
+		t.Error("dropped hook still present")
+	}
+}
+
+func TestReplaceConfigYAMLPreservesCreatedAt(t *testing.T) {
+	old := &domain.Stream{
+		Code:   codeAlpha,
+		Inputs: []domain.Input{{URL: srcRTMPURL, Priority: 0}},
+	}
+	old.CreatedAt = old.CreatedAt.Add(0) // zero time → set explicitly via mutation below
+	streams := newFakeStreamRepo(old)
+	// Prime CreatedAt with a recognisable value.
+	streams.items[codeAlpha].CreatedAt = streams.items[codeAlpha].UpdatedAt
+	stamp := streams.items[codeAlpha].CreatedAt
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}}, streams, newFakeHookRepo(), newFakeCoord(codeAlpha))
+
+	body := `streams:
+  - code: alpha
+    name: renamed
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !streams.items[codeAlpha].CreatedAt.Equal(stamp) {
+		t.Errorf("CreatedAt must be preserved on update, got %v want %v",
+			streams.items[codeAlpha].CreatedAt, stamp)
+	}
+}
+
+// --- error paths --------------------------------------------------------------
 
 func TestReplaceConfigYAMLEmptyBody(t *testing.T) {
-	h := &ConfigHandler{rtm: &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}}
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath,
-		strings.NewReader("   \n  "))
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		newFakeStreamRepo(), newFakeHookRepo(), newFakeCoord())
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, "  \n  "))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d", w.Code)
 	}
 }
 
 func TestReplaceConfigYAMLInvalidYAML(t *testing.T) {
-	h := &ConfigHandler{rtm: &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}}
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath,
-		strings.NewReader("server: [unbalanced"))
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		newFakeStreamRepo(), newFakeHookRepo(), newFakeCoord())
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, "global_config: [unbalanced"))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 
 func TestReplaceConfigYAMLUnknownFieldsRejected(t *testing.T) {
-	h := &ConfigHandler{rtm: &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}}
-	body := strings.NewReader("server:\n  http_addr: \":80\"\n  totally_made_up_field: 42\n")
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath, body)
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		newFakeStreamRepo(), newFakeHookRepo(), newFakeCoord())
+	body := "global_config:\n  server:\n    http_addr: \":80\"\n    totally_made_up_field: 42\n"
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, body))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("typos must be caught, got status=%d", w.Code)
 	}
 }
 
-func TestReplaceConfigYAMLValidationCollectsAllErrors(t *testing.T) {
-	h := &ConfigHandler{rtm: &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}}
-	body := []byte(`server:
-  http_addr: ""
-buffer:
-  capacity: -1
-publisher:
-  rtmp:
-    port: 99999
+func TestReplaceConfigYAMLValidationCollectsAllSections(t *testing.T) {
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		newFakeStreamRepo(), newFakeHookRepo(), newFakeCoord())
+	body := `global_config:
+  server:
+    http_addr: ""
+  buffer:
+    capacity: -1
+streams:
+  - code: "bad code!!"
+    inputs: []
 hooks:
-  worker_count: 0
-log:
-  level: trace
-  format: xml
-`)
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath, bytes.NewReader(body))
+  - id: ""
+    type: http
+    target: not-a-url
+`
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, body))
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422, got %d body=%s", w.Code, w.Body.String())
 	}
@@ -162,12 +493,11 @@ log:
 		have[f.Path] = true
 	}
 	for _, p := range []string{
-		"server.http_addr",
-		"buffer.capacity",
-		"publisher.rtmp.port",
-		"hooks.worker_count",
-		"log.level",
-		"log.format",
+		"global_config.server.http_addr",
+		"global_config.buffer.capacity",
+		"streams[0].code",
+		"hooks[0].id",
+		"hooks[0].target",
 	} {
 		if !have[p] {
 			t.Errorf("missing validation error for path %q (got: %+v)", p, got.Error.Fields)
@@ -175,23 +505,23 @@ log:
 	}
 }
 
-func TestReplaceConfigYAMLApplyError(t *testing.T) {
+func TestReplaceConfigYAMLApplyGlobalError(t *testing.T) {
 	rtm := &fakeRuntimeManager{
 		cfg:      &domain.GlobalConfig{},
 		applyErr: errors.New("disk full"),
 	}
-	h := &ConfigHandler{rtm: rtm}
-	body := []byte("server:\n  http_addr: \":8080\"\n")
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath, bytes.NewReader(body))
+	h := newTestHandler(rtm, newFakeStreamRepo(), newFakeHookRepo(), newFakeCoord())
+	body := "global_config:\n  server:\n    http_addr: \":8080\"\n"
 	w := httptest.NewRecorder()
-	h.ReplaceConfigYAML(w, req)
+	h.ReplaceConfigYAML(w, putYAML(t, body))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d", w.Code)
 	}
 }
 
 func TestReplaceConfigYAMLBodyTooLarge(t *testing.T) {
-	h := &ConfigHandler{rtm: &fakeRuntimeManager{cfg: &domain.GlobalConfig{}}}
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		newFakeStreamRepo(), newFakeHookRepo(), newFakeCoord())
 	huge := bytes.Repeat([]byte("a"), maxYAMLBodyBytes+1)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, yamlPath, bytes.NewReader(huge))
 	w := httptest.NewRecorder()
@@ -200,6 +530,44 @@ func TestReplaceConfigYAMLBodyTooLarge(t *testing.T) {
 		t.Fatalf("status=%d", w.Code)
 	}
 }
+
+func TestReplaceConfigYAMLStreamSaveError(t *testing.T) {
+	streams := newFakeStreamRepo()
+	streams.saveErr = errors.New("boom")
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		streams, newFakeHookRepo(), newFakeCoord())
+	body := `streams:
+  - code: alpha
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplaceConfigYAMLStreamStartError(t *testing.T) {
+	coord := newFakeCoord()
+	coord.startErr = errors.New("port busy")
+	h := newTestHandler(&fakeRuntimeManager{cfg: &domain.GlobalConfig{}},
+		newFakeStreamRepo(), newFakeHookRepo(), coord)
+	body := `streams:
+  - code: alpha
+    inputs:
+      - url: rtmp://src/a
+        priority: 0
+`
+	w := httptest.NewRecorder()
+	h.ReplaceConfigYAML(w, putYAML(t, body))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// --- direct validator tests ---------------------------------------------------
 
 func TestValidateGlobalConfigPassesForValid(t *testing.T) {
 	cfg := &domain.GlobalConfig{
@@ -246,7 +614,7 @@ func TestValidateGlobalConfigSameDirHLSDASH(t *testing.T) {
 	errs := validateGlobalConfig(cfg)
 	found := false
 	for _, e := range errs {
-		if e.Path == "publisher.dash.dir" {
+		if e.Path == "global_config.publisher.dash.dir" {
 			found = true
 		}
 	}
@@ -269,17 +637,133 @@ func TestValidateGlobalConfigIngestorAddrRequiredWhenEnabled(t *testing.T) {
 	for _, e := range errs {
 		have[e.Path] = true
 	}
-	if !have["ingestor.rtmp_addr"] {
+	if !have["global_config.ingestor.rtmp_addr"] {
 		t.Error("missing ingestor.rtmp_addr error")
 	}
-	if !have["ingestor.srt_addr"] {
+	if !have["global_config.ingestor.srt_addr"] {
 		t.Error("missing ingestor.srt_addr error")
 	}
 }
 
-func TestValidateGlobalConfigNil(t *testing.T) {
-	errs := validateGlobalConfig(nil)
+func TestValidateFullConfigNil(t *testing.T) {
+	errs := validateFullConfig(nil)
 	if len(errs) != 1 {
 		t.Errorf("nil config should yield exactly one error, got %+v", errs)
+	}
+}
+
+func TestValidateStreamsDuplicateCode(t *testing.T) {
+	errs := validateStreams([]*domain.Stream{
+		{Code: codeAlpha, Inputs: []domain.Input{{URL: "rtmp://a", Priority: 0}}},
+		{Code: codeAlpha, Inputs: []domain.Input{{URL: "rtmp://b", Priority: 0}}},
+	})
+	found := false
+	for _, e := range errs {
+		if e.Path == "streams[1].code" && strings.Contains(e.Message, "duplicate") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected duplicate-code error at streams[1].code, got %+v", errs)
+	}
+}
+
+func TestValidateStreamsNullEntry(t *testing.T) {
+	errs := validateStreams([]*domain.Stream{nil, {Code: codeBeta}})
+	found := false
+	for _, e := range errs {
+		if e.Path == "streams[0]" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected null-entry error at streams[0], got %+v", errs)
+	}
+}
+
+func TestValidateHooksDuplicateID(t *testing.T) {
+	errs := validateHooks([]*domain.Hook{
+		{ID: "h1", Type: domain.HookTypeHTTP, Target: hookHTTPTarget},
+		{ID: "h1", Type: domain.HookTypeKafka, Target: hookKafkaTarget},
+	})
+	found := false
+	for _, e := range errs {
+		if e.Path == "hooks[1].id" && strings.Contains(e.Message, "duplicate") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected duplicate-id error at hooks[1].id, got %+v", errs)
+	}
+}
+
+func TestValidateHooksTypeTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		hk   *domain.Hook
+		path string
+	}{
+		{
+			name: "http target without scheme",
+			hk:   &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: "example.com"},
+			path: "hooks[0].target",
+		},
+		{
+			name: "unknown type",
+			hk:   &domain.Hook{ID: "h", Type: "smtp", Target: "x"},
+			path: "hooks[0].target",
+		},
+		{
+			name: "empty target",
+			hk:   &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: ""},
+			path: "hooks[0].target",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateHooks([]*domain.Hook{tc.hk})
+			found := false
+			for _, e := range errs {
+				if e.Path == tc.path {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("expected error at %q, got %+v", tc.path, errs)
+			}
+		})
+	}
+}
+
+func TestValidateHooksMutuallyExclusiveStreamCodes(t *testing.T) {
+	errs := validateHooks([]*domain.Hook{{
+		ID: "h", Type: domain.HookTypeHTTP, Target: hookHTTPTarget,
+		StreamCodes: &domain.StreamCodeFilter{
+			Only:   []domain.StreamCode{codeAlpha},
+			Except: []domain.StreamCode{codeBeta},
+		},
+	}})
+	found := false
+	for _, e := range errs {
+		if e.Path == "hooks[0].stream_codes" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected stream_codes error, got %+v", errs)
+	}
+}
+
+func TestValidateHooksNegativeRetriesAndTimeout(t *testing.T) {
+	errs := validateHooks([]*domain.Hook{{
+		ID: "h", Type: domain.HookTypeHTTP, Target: hookHTTPTarget,
+		MaxRetries: -1, TimeoutSec: -1,
+	}})
+	have := map[string]bool{}
+	for _, e := range errs {
+		have[e.Path] = true
+	}
+	if !have["hooks[0].max_retries"] || !have["hooks[0].timeout_sec"] {
+		t.Errorf("missing negative-int errors, got %+v", errs)
 	}
 }

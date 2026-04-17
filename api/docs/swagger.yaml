@@ -1133,8 +1133,8 @@ paths:
       - system
   /config/yaml:
     get:
-      description: Returns the entire persisted GlobalConfig as a YAML document. Pair
-        with PUT /config/yaml to round-trip an editor.
+      description: Returns global_config, streams, and hooks bundled in a single YAML
+        document. Pair with PUT /config/yaml to round-trip an editor.
       produces:
       - application/yaml
       responses:
@@ -1142,17 +1142,23 @@ paths:
           description: YAML document
           schema:
             type: string
-      summary: Get full server configuration as YAML
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get full system configuration as YAML
       tags:
       - system
     put:
       consumes:
       - application/yaml
-      description: Replaces the entire GlobalConfig with the request body. Validation
-        errors are returned as a list. On success, the runtime manager diffs against
-        the previous config and starts/stops/restarts services accordingly.
+      description: Replaces global_config, streams, and hooks with the request body.
+        Validation errors are returned as a list. On success, the runtime manager
+        + coordinator diff against the previous state and start/stop/restart services
+        accordingly.
       parameters:
-      - description: Full GlobalConfig YAML document
+      - description: Full system configuration YAML document
         in: body
         name: body
         required: true
@@ -1181,7 +1187,7 @@ paths:
           schema:
             additionalProperties: true
             type: object
-      summary: Replace full server configuration from YAML
+      summary: Replace full system configuration from YAML
       tags:
       - system
   /healthz:
