@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -149,14 +150,20 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Detach from request cancellation: the coordinator spawns goroutines whose
+	// lifetime is the stream pipeline, not the HTTP request. Without this, when
+	// the response is written and r.Context() is cancelled, every spawned worker
+	// (HLS/DASH/RTMP/transcoder/manager) is killed instantly. WithoutCancel keeps
+	// request-scoped values (logging tags) but drops the cancel signal.
+	pipelineCtx := context.WithoutCancel(r.Context())
 	if wasRunning {
-		if err := h.coordinator.Update(r.Context(), cur, body); err != nil {
+		if err := h.coordinator.Update(pipelineCtx, cur, body); err != nil {
 			serverError(w, r, "UPDATE_FAILED", "update stream pipeline", err)
 			return
 		}
 	} else if nowEnabled {
 		// Stream was disabled → re-enabled: start the pipeline.
-		if err := h.coordinator.Start(r.Context(), body); err != nil {
+		if err := h.coordinator.Start(pipelineCtx, body); err != nil {
 			serverError(w, r, "START_FAILED", "start stream pipeline", err)
 			return
 		}
@@ -232,7 +239,8 @@ func decodeStreamBody(
 // @Router /streams/{code} [delete].
 func (h *StreamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
-	h.coordinator.Stop(r.Context(), code)
+	// Detach from request cancellation so teardown completes even if the client disconnects.
+	h.coordinator.Stop(context.WithoutCancel(r.Context()), code)
 	if err := h.streamRepo.Delete(r.Context(), code); err != nil {
 		serverError(w, r, "DELETE_FAILED", "delete stream", err)
 		return
@@ -270,9 +278,12 @@ func (h *StreamHandler) Restart(w http.ResponseWriter, r *http.Request) {
 
 	// Stop is blocking: waits for all goroutines to finish and cleans up on-disk
 	// segments before returning. Safe to call even when the pipeline is not running.
-	h.coordinator.Stop(r.Context(), code)
+	// Detach from request cancellation — the new pipeline outlives this request, and
+	// teardown must complete even if the client disconnects mid-restart.
+	pipelineCtx := context.WithoutCancel(r.Context())
+	h.coordinator.Stop(pipelineCtx, code)
 
-	if err := h.coordinator.Start(r.Context(), stream); err != nil {
+	if err := h.coordinator.Start(pipelineCtx, stream); err != nil {
 		serverError(w, r, "START_FAILED", "restart stream pipeline", err)
 		return
 	}

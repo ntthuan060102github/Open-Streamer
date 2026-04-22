@@ -164,7 +164,11 @@ func (h *ConfigHandler) ReplaceConfigYAML(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := h.applyStreams(r.Context(), newCfg.Streams); err != nil {
+	// Detach from request cancellation: applyStreams calls coord.Start/Stop/Update
+	// which spawn pipeline goroutines whose lifetime is the stream, not this request.
+	// Without this, the writes complete but every freshly-started worker is killed
+	// the moment the response returns. WithoutCancel preserves request-scoped values.
+	if err := h.applyStreams(context.WithoutCancel(r.Context()), newCfg.Streams); err != nil {
 		serverError(w, r, "APPLY_STREAMS_FAILED", "apply streams from yaml", err)
 		return
 	}
