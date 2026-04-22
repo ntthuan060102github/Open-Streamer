@@ -3,9 +3,17 @@ services:
     build:
       context: ..
       dockerfile: build/Dockerfile
+    # Run the container as the host user so files written to bind-mounted volumes
+    # (./data, ./out/*) are owned by you on the host. Without this, the container
+    # uses its built-in `streamer` UID 10001 and bind mounts become unwritable
+    # because the host directory belongs to your UID (typically 1000).
+    #
+    # Usage: `UID=$(id -u) GID=$(id -g) docker-compose up -d`
+    # Or set defaults in a .env file next to this compose file.
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "8080:8080"      # REST API + HLS/DASH static serving
-      - "1935:1935"      # RTMP — shared port for push ingest + play
+      - "1936:1935"      # RTMP — shared port for push ingest + play
       # - "9999:9999/udp"  # SRT — shared port for push ingest + play
       # - "8554:8554"      # RTSP — shared port for play (and any future ingest)
       # - "9091:9091"      # Prometheus metrics

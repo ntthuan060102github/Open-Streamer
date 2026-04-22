@@ -37,7 +37,7 @@ func NewHookHandler(i do.Injector) (*HookHandler, error) {
 func (h *HookHandler) List(w http.ResponseWriter, r *http.Request) {
 	hooksList, err := h.hookRepo.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_FAILED", "failed to list hooks")
+		serverError(w, r, "LIST_FAILED", "list hooks", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": hooksList, "total": len(hooksList)})
@@ -60,7 +60,7 @@ func (h *HookHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.hookRepo.Save(r.Context(), &hook); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", "failed to save hook")
+		serverError(w, r, "SAVE_FAILED", "create hook", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"data": hook})
@@ -78,7 +78,7 @@ func (h *HookHandler) Get(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	hook, err := h.hookRepo.FindByID(r.Context(), hid)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": hook})
@@ -99,7 +99,7 @@ func (h *HookHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	if _, err := h.hookRepo.FindByID(r.Context(), hid); err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 
@@ -110,7 +110,7 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	hook.ID = hid
 	if err := h.hookRepo.Save(r.Context(), &hook); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", "failed to save hook")
+		serverError(w, r, "SAVE_FAILED", "update hook", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": hook})
@@ -126,7 +126,7 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 func (h *HookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
 	if err := h.hookRepo.Delete(r.Context(), hid); err != nil {
-		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", "failed to delete hook")
+		serverError(w, r, "DELETE_FAILED", "delete hook", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -147,7 +147,7 @@ func (h *HookHandler) Test(w http.ResponseWriter, r *http.Request) {
 	if err := h.hooks.DeliverTestEvent(r.Context(), hid); err != nil {
 		switch {
 		case errors.Is(err, store.ErrNotFound):
-			writeStoreError(w, err)
+			writeStoreError(w, r, err)
 		case errors.Is(err, hooks.ErrHookTestUnsupported):
 			writeError(w, http.StatusBadRequest, "TEST_UNSUPPORTED", err.Error())
 		default:

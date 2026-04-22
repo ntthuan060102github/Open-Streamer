@@ -27,7 +27,8 @@ RUN apk add --no-cache ffmpeg ca-certificates tzdata wget tini \
     && addgroup -S -g 10001 streamer \
     && adduser  -S -u 10001 -G streamer streamer \
     && mkdir -p /data /out/hls /out/dash /out/dvr \
-    && chown -R streamer:streamer /data /out
+    && chown -R streamer:streamer /data /out \
+    && chmod -R 0777 /data /out
 
 COPY --from=builder /out/open-streamer /usr/local/bin/open-streamer
 

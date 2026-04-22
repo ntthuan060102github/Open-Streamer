@@ -43,7 +43,7 @@ func (h *RecordingHandler) ListByStream(w http.ResponseWriter, r *http.Request) 
 	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
 	recs, err := h.recRepo.ListByStream(r.Context(), streamCode)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_FAILED", "failed to list recordings")
+		serverError(w, r, "LIST_FAILED", "list recordings", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": recs, "total": len(recs)})
@@ -61,7 +61,7 @@ func (h *RecordingHandler) Get(w http.ResponseWriter, r *http.Request) {
 	rid := domain.RecordingID(chi.URLParam(r, "rid"))
 	rec, err := h.recRepo.FindByID(r.Context(), rid)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": rec})
@@ -80,7 +80,7 @@ func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
 	rid := domain.RecordingID(chi.URLParam(r, "rid"))
 	rec, err := h.recRepo.FindByID(r.Context(), rid)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	if rec.SegmentDir == "" {
@@ -90,7 +90,7 @@ func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
 
 	idx, err := h.dvr.LoadIndex(rec.SegmentDir)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "INDEX_READ_FAILED", err.Error())
+		serverError(w, r, "INDEX_READ_FAILED", "load dvr index", err)
 		return
 	}
 	if idx == nil {
@@ -131,7 +131,7 @@ func (h *RecordingHandler) Playlist(w http.ResponseWriter, r *http.Request) {
 	rid := domain.RecordingID(chi.URLParam(r, "rid"))
 	rec, err := h.recRepo.FindByID(r.Context(), rid)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	if rec.SegmentDir == "" {
@@ -145,7 +145,7 @@ func (h *RecordingHandler) Playlist(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "NO_PLAYLIST", "playlist not yet available")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "READ_PLAYLIST_FAILED", err.Error())
+		serverError(w, r, "READ_PLAYLIST_FAILED", "read dvr playlist", err)
 		return
 	}
 
@@ -170,7 +170,7 @@ func (h *RecordingHandler) ServeSegment(w http.ResponseWriter, r *http.Request) 
 
 	rec, err := h.recRepo.FindByID(r.Context(), rid)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	if rec.SegmentDir == "" {
@@ -212,7 +212,7 @@ func (h *RecordingHandler) Timeshift(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := h.recRepo.FindByID(r.Context(), rid)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	if rec.SegmentDir == "" {

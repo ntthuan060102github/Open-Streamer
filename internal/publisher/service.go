@@ -47,6 +47,10 @@ type streamState struct {
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
 
+	// code is the StreamCode this state belongs to — duplicated here so log lines
+	// emitted by spawn/stop helpers can include it without an extra map lookup.
+	code domain.StreamCode
+
 	// mediaBuf is the Buffer Hub ID for single-rendition outputs (RTSP, RTMP push, SRT).
 	// When ABR is active this is the best rendition; otherwise it is the stream code.
 	mediaBuf domain.StreamCode
@@ -202,6 +206,7 @@ func (s *Service) Start(ctx context.Context, stream *domain.Stream) error {
 	ss := &streamState{
 		baseCtx:    baseCtx,
 		baseCancel: baseCancel,
+		code:       stream.Code,
 		mediaBuf:   buffer.PlaybackBufferID(stream.Code, stream.Transcoder),
 		protocols:  make(map[string]context.CancelFunc),
 	}
@@ -248,16 +253,24 @@ func (s *Service) spawnOutputsLocked(ss *streamState, stream *domain.Stream, p d
 // Caller must hold s.mu (which serialises modifications to ss.protocols).
 func (s *Service) spawnProtocolLocked(ss *streamState, key string, fn func(context.Context)) {
 	ss.mu.Lock()
+	respawn := false
 	if cancel, ok := ss.protocols[key]; ok {
 		cancel()
+		respawn = true
 	}
 	ctx, cancel := context.WithCancel(ss.baseCtx)
 	ss.protocols[key] = cancel
 	ss.mu.Unlock()
+
+	slog.Info("publisher: protocol started",
+		"stream_code", ss.code, "protocol", key, "respawn", respawn)
+
 	ss.wg.Add(1)
 	go func() {
 		defer ss.wg.Done()
 		fn(ctx)
+		slog.Info("publisher: protocol exited",
+			"stream_code", ss.code, "protocol", key)
 	}()
 }
 
@@ -270,11 +283,17 @@ func (s *Service) stopProtocol(streamID domain.StreamCode, key string) {
 		return
 	}
 	ss.mu.Lock()
+	stopped := false
 	if cancel, ok := ss.protocols[key]; ok {
 		cancel()
 		delete(ss.protocols, key)
+		stopped = true
 	}
 	ss.mu.Unlock()
+	if stopped {
+		slog.Info("publisher: protocol stopped",
+			"stream_code", streamID, "protocol", key)
+	}
 }
 
 // hlsFunc returns a closure that runs the HLS output for stream, wiring hlsMaster

@@ -64,7 +64,7 @@ func (h *VODHandler) resyncRegistry(ctx context.Context) error {
 func (h *VODHandler) List(w http.ResponseWriter, r *http.Request) {
 	mounts, err := h.repo.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_FAILED", "failed to list vod mounts")
+		serverError(w, r, "LIST_FAILED", "list vod mounts", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": mounts, "total": len(mounts)})
@@ -103,15 +103,15 @@ func (h *VODHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "ALREADY_EXISTS", "vod mount already exists")
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusInternalServerError, "LOOKUP_FAILED", err.Error())
+		serverError(w, r, "LOOKUP_FAILED", "lookup vod mount", err)
 		return
 	}
 	if err := h.repo.Save(r.Context(), &mount); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", err.Error())
+		serverError(w, r, "SAVE_FAILED", "create vod mount", err)
 		return
 	}
 	if err := h.resyncRegistry(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "SYNC_FAILED", err.Error())
+		serverError(w, r, "SYNC_FAILED", "resync vod registry after create", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"data": mount})
@@ -130,7 +130,7 @@ func (h *VODHandler) Get(w http.ResponseWriter, r *http.Request) {
 	name := domain.VODName(chi.URLParam(r, "name"))
 	mount, err := h.repo.FindByName(r.Context(), name)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": mount})
@@ -152,7 +152,7 @@ func (h *VODHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *VODHandler) Update(w http.ResponseWriter, r *http.Request) {
 	name := domain.VODName(chi.URLParam(r, "name"))
 	if _, err := h.repo.FindByName(r.Context(), name); err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	var mount domain.VODMount
@@ -166,11 +166,11 @@ func (h *VODHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.repo.Save(r.Context(), &mount); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", err.Error())
+		serverError(w, r, "SAVE_FAILED", "update vod mount", err)
 		return
 	}
 	if err := h.resyncRegistry(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "SYNC_FAILED", err.Error())
+		serverError(w, r, "SYNC_FAILED", "resync vod registry after update", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": mount})
@@ -187,11 +187,11 @@ func (h *VODHandler) Update(w http.ResponseWriter, r *http.Request) {
 func (h *VODHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	name := domain.VODName(chi.URLParam(r, "name"))
 	if err := h.repo.Delete(r.Context(), name); err != nil {
-		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", err.Error())
+		serverError(w, r, "DELETE_FAILED", "delete vod mount", err)
 		return
 	}
 	if err := h.resyncRegistry(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "SYNC_FAILED", err.Error())
+		serverError(w, r, "SYNC_FAILED", "resync vod registry after delete", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -224,7 +224,7 @@ func (h *VODHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, vod.ErrPathEscapesMount):
 			writeError(w, http.StatusBadRequest, "INVALID_PATH", err.Error())
 		default:
-			writeError(w, http.StatusInternalServerError, "LIST_FAILED", err.Error())
+			serverError(w, r, "LIST_FAILED", "list vod files", err)
 		}
 		return
 	}
@@ -276,7 +276,7 @@ func (h *VODHandler) Raw(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "FILE_NOT_FOUND", err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "STAT_FAILED", err.Error())
+		serverError(w, r, "STAT_FAILED", "stat vod file for raw serve", err)
 		return
 	}
 	if info.IsDir() {
@@ -352,7 +352,7 @@ func (h *VODHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, "MKDIR_FAILED", err.Error())
+		serverError(w, r, "MKDIR_FAILED", "create vod upload directory", err)
 		return
 	}
 
@@ -360,13 +360,13 @@ func (h *VODHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "FILE_EXISTS", "file already exists")
 		return
 	} else if !os.IsNotExist(err) {
-		writeError(w, http.StatusInternalServerError, "STAT_FAILED", err.Error())
+		serverError(w, r, "STAT_FAILED", "stat vod upload destination", err)
 		return
 	}
 
 	written, err := writeUploadAtomic(abs, src)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "UPLOAD_FAILED", err.Error())
+		serverError(w, r, "UPLOAD_FAILED", "write vod upload", err)
 		return
 	}
 
@@ -416,7 +416,7 @@ func (h *VODHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "FILE_NOT_FOUND", err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "STAT_FAILED", err.Error())
+		serverError(w, r, "STAT_FAILED", "stat vod file for delete", err)
 		return
 	}
 	if info.IsDir() {
@@ -425,7 +425,7 @@ func (h *VODHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := os.Remove(abs); err != nil {
-		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", err.Error())
+		serverError(w, r, "DELETE_FAILED", "remove vod file", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

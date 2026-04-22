@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -48,7 +49,8 @@ func TestWriteErrorShape(t *testing.T) {
 
 func TestWriteStoreErrorNotFoundReturns404(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeStoreError(w, store.ErrNotFound)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/streams/x", nil)
+	writeStoreError(w, r, store.ErrNotFound)
 	if w.Code != 404 {
 		t.Errorf("status=%d", w.Code)
 	}
@@ -63,7 +65,8 @@ func TestWriteStoreErrorNotFoundReturns404(t *testing.T) {
 
 func TestWriteStoreErrorWrappedNotFound(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeStoreError(w, errors.New("wrapped"))
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/streams/x", nil)
+	writeStoreError(w, r, errors.New("wrapped"))
 	if w.Code != 500 {
 		t.Errorf("non-NotFound should be 500, got %d", w.Code)
 	}

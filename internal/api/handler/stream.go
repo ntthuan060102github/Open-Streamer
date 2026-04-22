@@ -79,7 +79,7 @@ func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	streams, err := h.streamRepo.List(r.Context(), store.StreamFilter{})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_FAILED", "failed to list streams")
+		serverError(w, r, "LIST_FAILED", "list streams", err)
 		return
 	}
 
@@ -107,7 +107,7 @@ func (h *StreamHandler) Get(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": h.withStatus(stream)})
@@ -130,7 +130,7 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	cur, exists, err := h.loadCurrentStream(r, code)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 
@@ -145,19 +145,19 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 
 	// Save first so the pipeline continues with the old config if persistence fails.
 	if err := h.streamRepo.Save(r.Context(), body); err != nil {
-		writeError(w, http.StatusInternalServerError, "SAVE_FAILED", "failed to save stream")
+		serverError(w, r, "SAVE_FAILED", "save stream", err)
 		return
 	}
 
 	if wasRunning {
 		if err := h.coordinator.Update(r.Context(), cur, body); err != nil {
-			writeError(w, http.StatusInternalServerError, "UPDATE_FAILED", err.Error())
+			serverError(w, r, "UPDATE_FAILED", "update stream pipeline", err)
 			return
 		}
 	} else if nowEnabled {
 		// Stream was disabled → re-enabled: start the pipeline.
 		if err := h.coordinator.Start(r.Context(), body); err != nil {
-			writeError(w, http.StatusInternalServerError, "START_FAILED", err.Error())
+			serverError(w, r, "START_FAILED", "start stream pipeline", err)
 			return
 		}
 	}
@@ -234,7 +234,7 @@ func (h *StreamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	h.coordinator.Stop(r.Context(), code)
 	if err := h.streamRepo.Delete(r.Context(), code); err != nil {
-		writeError(w, http.StatusInternalServerError, "DELETE_FAILED", "failed to delete stream")
+		serverError(w, r, "DELETE_FAILED", "delete stream", err)
 		return
 	}
 	h.bus.Publish(r.Context(), domain.Event{
@@ -260,7 +260,7 @@ func (h *StreamHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 	stream, err := h.streamRepo.FindByCode(r.Context(), code)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(w, r, err)
 		return
 	}
 	if stream.Disabled {
@@ -273,7 +273,7 @@ func (h *StreamHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	h.coordinator.Stop(r.Context(), code)
 
 	if err := h.coordinator.Start(r.Context(), stream); err != nil {
-		writeError(w, http.StatusInternalServerError, "START_FAILED", err.Error())
+		serverError(w, r, "START_FAILED", "restart stream pipeline", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]string{"status": "started"}})

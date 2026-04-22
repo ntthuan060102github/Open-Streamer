@@ -221,6 +221,17 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		StreamCode: stream.Code,
 	})
 
+	slog.Info("coordinator: stream pipeline started",
+		"stream_code", stream.Code,
+		"inputs", len(stream.Inputs),
+		"transcoder", shouldRunTranscoder(stream),
+		"renditions", len(renditionSlugs),
+		"hls", stream.Protocols.HLS,
+		"dash", stream.Protocols.DASH,
+		"rtsp", stream.Protocols.RTSP,
+		"push_targets", len(stream.Push),
+		"dvr", stream.DVR != nil && stream.DVR.Enabled,
+	)
 	return nil
 }
 
@@ -233,6 +244,7 @@ func (c *Coordinator) IsRunning(streamID domain.StreamCode) bool {
 // ctx is used for the DVR stop and the EventStreamStopped publish; cleanup
 // of in-memory state always proceeds even if ctx is cancelled.
 func (c *Coordinator) Stop(ctx context.Context, streamID domain.StreamCode) {
+	slog.Info("coordinator: stopping stream pipeline", "stream_code", streamID)
 	if c.dvr.IsRecording(streamID) {
 		if err := c.dvr.StopRecording(ctx, streamID); err != nil {
 			slog.Warn("coordinator: dvr stop failed", "stream_code", streamID, "err", err)
@@ -274,6 +286,17 @@ func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error
 	}
 
 	diff := ComputeDiff(old, new)
+
+	slog.Info("coordinator: applying stream update",
+		"stream_code", new.Code,
+		"now_disabled", diff.NowDisabled,
+		"transcoder_topology_changed", diff.TranscoderTopologyChanged,
+		"transcoder_changed", diff.TranscoderChanged,
+		"inputs_changed", diff.InputsChanged,
+		"protocols_changed", diff.ProtocolsChanged,
+		"push_changed", diff.PushChanged,
+		"dvr_changed", diff.DVRChanged,
+	)
 
 	if diff.NowDisabled {
 		c.Stop(ctx, new.Code)

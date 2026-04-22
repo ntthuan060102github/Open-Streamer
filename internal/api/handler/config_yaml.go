@@ -54,17 +54,17 @@ type fieldError struct {
 func (h *ConfigHandler) GetConfigYAML(w http.ResponseWriter, r *http.Request) {
 	streams, err := h.streamRepo.List(r.Context(), store.StreamFilter{})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_STREAMS_FAILED", err.Error())
+		serverError(w, r, "LIST_STREAMS_FAILED", "list streams for yaml export", err)
 		return
 	}
 	hooks, err := h.hookRepo.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_HOOKS_FAILED", err.Error())
+		serverError(w, r, "LIST_HOOKS_FAILED", "list hooks for yaml export", err)
 		return
 	}
 	vodMounts, err := h.vodRepo.List(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "LIST_VOD_FAILED", err.Error())
+		serverError(w, r, "LIST_VOD_FAILED", "list vod mounts for yaml export", err)
 		return
 	}
 
@@ -76,7 +76,7 @@ func (h *ConfigHandler) GetConfigYAML(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := yaml.Marshal(full)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "MARSHAL_FAILED", err.Error())
+		serverError(w, r, "MARSHAL_FAILED", "marshal full config to yaml", err)
 		return
 	}
 	w.Header().Set("Content-Type", yamlContentType)
@@ -150,22 +150,22 @@ func (h *ConfigHandler) ReplaceConfigYAML(w http.ResponseWriter, r *http.Request
 		gcfg = &domain.GlobalConfig{}
 	}
 	if err := h.rtm.Apply(r.Context(), gcfg); err != nil {
-		writeError(w, http.StatusInternalServerError, "APPLY_GLOBAL_FAILED", err.Error())
+		serverError(w, r, "APPLY_GLOBAL_FAILED", "apply global config from yaml", err)
 		return
 	}
 
 	if err := h.applyHooks(r.Context(), newCfg.Hooks); err != nil {
-		writeError(w, http.StatusInternalServerError, "APPLY_HOOKS_FAILED", err.Error())
+		serverError(w, r, "APPLY_HOOKS_FAILED", "apply hooks from yaml", err)
 		return
 	}
 
 	if err := h.applyVOD(r.Context(), newCfg.VOD); err != nil {
-		writeError(w, http.StatusInternalServerError, "APPLY_VOD_FAILED", err.Error())
+		serverError(w, r, "APPLY_VOD_FAILED", "apply vod mounts from yaml", err)
 		return
 	}
 
 	if err := h.applyStreams(r.Context(), newCfg.Streams); err != nil {
-		writeError(w, http.StatusInternalServerError, "APPLY_STREAMS_FAILED", err.Error())
+		serverError(w, r, "APPLY_STREAMS_FAILED", "apply streams from yaml", err)
 		return
 	}
 

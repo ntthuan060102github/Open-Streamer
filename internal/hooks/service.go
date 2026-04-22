@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -278,7 +280,15 @@ func (s *Service) deliverHTTP(ctx context.Context, h *domain.Hook, event domain.
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		// Read up to 512 bytes of the response so the user can see *why* the webhook
+		// target rejected — without this, "unexpected status: 500" gives no hint.
+		const maxBody = 512
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+		body := strings.TrimSpace(string(snippet))
+		if body == "" {
+			return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		}
+		return fmt.Errorf("unexpected status: %d body=%q", resp.StatusCode, body)
 	}
 	return nil
 }

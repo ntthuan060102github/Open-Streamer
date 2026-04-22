@@ -174,12 +174,12 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	current := h.rtm.CurrentConfig()
 	raw, err := json.Marshal(current)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "MARSHAL_FAILED", err.Error())
+		serverError(w, r, "MARSHAL_FAILED", "marshal current config", err)
 		return
 	}
 	var merged domain.GlobalConfig
 	if err := json.Unmarshal(raw, &merged); err != nil {
-		writeError(w, http.StatusInternalServerError, "COPY_FAILED", err.Error())
+		serverError(w, r, "COPY_FAILED", "copy current config", err)
 		return
 	}
 
@@ -190,7 +190,7 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.rtm.Apply(r.Context(), &merged); err != nil {
-		writeError(w, http.StatusInternalServerError, "APPLY_FAILED", err.Error())
+		serverError(w, r, "APPLY_FAILED", "apply config", err)
 		return
 	}
 
