@@ -6,11 +6,14 @@ services:
     # Run the container as the host user so files written to bind-mounted volumes
     # (./data, ./out/*) are owned by you on the host. Without this, the container
     # uses its built-in `streamer` UID 10001 and bind mounts become unwritable
-    # because the host directory belongs to your UID (typically 1000).
+    # because the host directory belongs to your UID.
     #
-    # Usage: `UID=$(id -u) GID=$(id -g) docker-compose up -d`
-    # Or set defaults in a .env file next to this compose file.
-    user: "${UID:-1000}:${GID:-1000}"
+    # NB: do NOT use ${UID} — bash treats UID as readonly and does not export it,
+    # so docker-compose falls back to the default. Use PUID/PGID instead.
+    #
+    # Usage: `PUID=$(id -u) PGID=$(id -g) docker-compose up -d`
+    # Or set them in a .env file next to this compose file.
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "8080:8080"      # REST API + HLS/DASH static serving
       - "1936:1935"      # RTMP — shared port for push ingest + play
