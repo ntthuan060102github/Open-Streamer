@@ -1,5 +1,6 @@
 # Open Streamer — local development shortcuts.
-# Requires: Go (see go.mod), optional: golangci-lint, govulncheck, gofumpt, docker compose.
+# Requires: Go (see go.mod), optional: golangci-lint, govulncheck, gofumpt.
+# Production deploy: build/install.sh (Linux + systemd).
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -8,9 +9,7 @@ SHELL       := /usr/bin/env bash
 MAIN_PKG    := ./cmd/server
 BIN_DIR     := bin
 BIN_NAME    := open-streamer
-DOCKER_CTX  := .
-DOCKERFILE  := build/Dockerfile
-COMPOSE     := docker compose -f build/docker-compose.yml
+INSTALL_SH  := build/install.sh
 
 # --- go ---
 GO          ?= go
@@ -105,20 +104,12 @@ cover-html: cover ## Open HTML coverage (macOS: open; else print path)
 clean: ## Remove bin/, coverage artifacts
 	rm -rf $(BIN_DIR) $(COVER_OUT) coverage.html
 
-# --- docker ---
+# --- deploy (Linux systemd) ---
 
-.PHONY: docker-build
-docker-build: ## docker build -f $(DOCKERFILE) $(DOCKER_CTX)
-	docker build -f $(DOCKERFILE) -t $(BIN_NAME):local $(DOCKER_CTX)
+.PHONY: install-service
+install-service: build ## Install binary + systemd unit (requires sudo, Linux only)
+	sudo $(INSTALL_SH) install
 
-.PHONY: compose-up
-compose-up: ## docker compose up -d (needs .env)
-	$(COMPOSE) up -d
-
-.PHONY: compose-down
-compose-down: ## docker compose down
-	$(COMPOSE) down
-
-.PHONY: compose-logs
-compose-logs: ## docker compose logs -f open-streamer
-	$(COMPOSE) logs -f open-streamer
+.PHONY: uninstall-service
+uninstall-service: ## Stop service, remove binary + unit + user (data dir kept)
+	sudo $(INSTALL_SH) uninstall

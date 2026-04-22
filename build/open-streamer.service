@@ -1,0 +1,47 @@
+[Unit]
+Description=Open Streamer — live video media server
+Documentation=https://github.com/ntt0601zcoder/open-streamer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Service user. Created by install.sh as a system account.
+# Override with `systemctl edit open-streamer` if you need a different account
+# (e.g. root, when binding privileged ports below 1024 without setcap).
+User=open-streamer
+Group=open-streamer
+
+# Working directory holds the JSON store and any output trees the binary writes
+# to with relative paths. Created and chown'd by install.sh.
+WorkingDirectory=/var/lib/open-streamer
+
+# Storage backend selection. All other runtime settings (listeners, ingestor,
+# transcoder, publisher, hooks, log, ...) live in the persisted GlobalConfig
+# and are editable via REST: GET/POST /config.
+Environment=OPEN_STREAMER_STORAGE_DRIVER=json
+Environment=OPEN_STREAMER_STORAGE_JSON_DIR=/var/lib/open-streamer
+
+ExecStart=/usr/local/bin/open-streamer
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Logs go to journald — view with: journalctl -u open-streamer -f
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — disable if it conflicts with your output paths or device access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+# Allow read access to GPU device nodes for transcoding (NVIDIA, VAAPI, QSV).
+# Comment these out if not transcoding with GPU.
+DeviceAllow=/dev/nvidia* rw
+DeviceAllow=/dev/dri/* rw
+
+[Install]
+WantedBy=multi-user.target

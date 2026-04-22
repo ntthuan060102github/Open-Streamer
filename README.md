@@ -152,22 +152,6 @@ Push mode is detected automatically when the URL host is a wildcard address (`0.
 
 ## Quick Start
 
-### Docker Compose
-
-```bash
-cp .env.example .env
-docker compose -f build/docker-compose.yml up -d
-```
-
-| Service | Ports | Purpose |
-|---------|-------|---------|
-| `open-streamer` | `8080` (API), `1935` (RTMP push), `9999` (SRT push), `9091` (metrics) | Main server |
-| `postgres` | `5432` | Stream / recording / hook storage |
-| `prometheus` | `9092` | Metrics scraping |
-| `grafana` | `3000` | Dashboards (admin / admin) |
-
-Once running, the Swagger UI is available at `http://localhost:8080/swagger/`.
-
 ### Build from source
 
 ```bash
@@ -177,6 +161,30 @@ cd open-streamer
 make build       # → bin/open-streamer
 make run         # run without building binary
 ```
+
+Once running, the Swagger UI is available at `http://localhost:8080/swagger/`.
+
+Default ports: `8080` (HTTP API + HLS/DASH), `1935` (RTMP), `8554` (RTSP), `9999` (SRT). All ports
+are configurable at runtime via `POST /config`.
+
+### Production install (Linux + systemd)
+
+```bash
+sudo make install-service        # build, install binary, enable + start systemd unit
+systemctl status open-streamer
+journalctl -u open-streamer -f   # follow logs
+
+sudo make uninstall-service      # stop, remove binary + unit + user (data dir kept)
+```
+
+The installer creates a system user `open-streamer`, copies the binary to `/usr/local/bin/`,
+installs the unit at `/etc/systemd/system/open-streamer.service`, and uses
+`/var/lib/open-streamer/` as the JSON store. To customize storage backend, log level, or
+service user, edit the unit with `sudo systemctl edit open-streamer`.
+
+GPU transcoding (NVENC / VAAPI / QSV) works out of the box — the binary uses the host's
+ffmpeg and GPU drivers directly. Make sure `ffmpeg -hwaccels` shows the backend you want
+before starting the service.
 
 ### First stream (30 seconds)
 
@@ -558,7 +566,8 @@ OPEN_STREAMER_LOG_FORMAT=text    # text | json
 | ----------- | ------- | ----- |
 | Go | 1.25.9+ | |
 | FFmpeg | any recent | Only needed for transcoding; not needed for passthrough/ingest-only |
-| Docker | any | Optional — only needed for Postgres, Prometheus, Grafana, and testcontainer tests |
+| systemd | any | Linux production deploy via `make install-service` |
+| Docker | any | Optional — only needed for testcontainer-based integration tests (Postgres / MongoDB / RTMP) |
 
 ### Commands
 
@@ -573,8 +582,8 @@ make tidy           # go mod tidy
 make check          # tidy + vet + lint + test (full local CI)
 make cover          # generate coverage.out
 make cover-html     # open HTML coverage report
-make docker-build   # build open-streamer:local Docker image
-make compose-up     # docker compose up
+make install-service   # build + install as systemd service (Linux, sudo)
+make uninstall-service # stop and remove systemd service (sudo)
 ```
 
 Run a single test:
@@ -660,8 +669,8 @@ GitHub Actions runs on every push / PR to `main`:
 │   ├── logger/         # structured logger initialisation
 │   └── protocol/       # URL → protocol Kind detection
 └── build/
-    ├── Dockerfile          # Multi-stage build (Go 1.25 → alpine)
-    └── docker-compose.yml
+    ├── open-streamer.service  # systemd unit for production deploy
+    └── install.sh             # build + install/uninstall helper (Linux)
 ```
 
 ---
