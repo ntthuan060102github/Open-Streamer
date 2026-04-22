@@ -1825,22 +1825,20 @@ const docTemplate = `{
                 "hls_max_segment_buffer": {
                     "description": "HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.\nThis is a server-wide memory guard, not a per-stream policy.",
                     "type": "integer"
+                }
+            }
+        },
+        "config.ListenersConfig": {
+            "type": "object",
+            "properties": {
+                "rtmp": {
+                    "$ref": "#/definitions/config.RTMPListenerConfig"
                 },
-                "rtmp_addr": {
-                    "description": "e.g. \":1935\"",
-                    "type": "string"
+                "rtsp": {
+                    "$ref": "#/definitions/config.RTSPListenerConfig"
                 },
-                "rtmp_enabled": {
-                    "description": "RTMP push server — external encoders connect to us on this address.",
-                    "type": "boolean"
-                },
-                "srt_addr": {
-                    "description": "e.g. \":9999\"",
-                    "type": "string"
-                },
-                "srt_enabled": {
-                    "description": "SRT push server — external encoders connect to our SRT listener.",
-                    "type": "boolean"
+                "srt": {
+                    "$ref": "#/definitions/config.SRTListenerConfig"
                 }
             }
         },
@@ -1874,15 +1872,6 @@ const docTemplate = `{
                 },
                 "hls": {
                     "$ref": "#/definitions/config.PublisherHLSConfig"
-                },
-                "rtmp": {
-                    "$ref": "#/definitions/config.PublisherRTMPServeConfig"
-                },
-                "rtsp": {
-                    "$ref": "#/definitions/config.PublisherRTSPConfig"
-                },
-                "srt": {
-                    "$ref": "#/definitions/config.PublisherSRTListenerConfig"
                 }
             }
         },
@@ -1934,30 +1923,32 @@ const docTemplate = `{
                 }
             }
         },
-        "config.PublisherRTMPServeConfig": {
+        "config.RTMPListenerConfig": {
             "type": "object",
             "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
                 "listen_host": {
                     "type": "string"
                 },
                 "port": {
-                    "description": "Port is the single RTMP listen port. 0 = disabled.",
+                    "description": "default 1935",
                     "type": "integer"
                 }
             }
         },
-        "config.PublisherRTSPConfig": {
+        "config.RTSPListenerConfig": {
             "type": "object",
             "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
                 "listen_host": {
-                    "description": "ListenHost is the bind address (empty = 0.0.0.0).",
                     "type": "string"
                 },
-                "port_max": {
-                    "type": "integer"
-                },
-                "port_min": {
-                    "description": "PortMin is the single RTSP listen port (PortMax is unused for publisher RTSP).",
+                "port": {
+                    "description": "default 554",
                     "type": "integer"
                 },
                 "transport": {
@@ -1966,18 +1957,21 @@ const docTemplate = `{
                 }
             }
         },
-        "config.PublisherSRTListenerConfig": {
+        "config.SRTListenerConfig": {
             "type": "object",
             "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
                 "latency_ms": {
-                    "description": "LatencyMS is the SRT latency in milliseconds for listener URLs.",
+                    "description": "LatencyMS is the SRT latency in milliseconds applied to the listener.",
                     "type": "integer"
                 },
                 "listen_host": {
                     "type": "string"
                 },
                 "port": {
-                    "description": "Port is the single SRT listen port. 0 = disabled.",
+                    "description": "default 9999",
                     "type": "integer"
                 }
             }
@@ -2156,6 +2150,9 @@ const docTemplate = `{
                 },
                 "ingestor": {
                     "$ref": "#/definitions/config.IngestorConfig"
+                },
+                "listeners": {
+                    "$ref": "#/definitions/config.ListenersConfig"
                 },
                 "log": {
                     "$ref": "#/definitions/config.LogConfig"

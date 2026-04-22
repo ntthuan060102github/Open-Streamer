@@ -3,7 +3,7 @@
 // It handles two distinct output types:
 //   - Serve endpoints (HLS, DASH, RTSP, RTMP listen, SRT listen): the server listens,
 //     clients connect and pull. HLS uses MPEG-TS segments + m3u8; DASH uses fMP4 (init + .m4s) + dynamic MPD (Eyevinn mp4ff); RTSP/RTMP/SRT use gortsplib/gomedia/gosrt — no FFmpeg in this package.
-//     RTSP, RTMP play, and SRT listen each use one shared TCP/UDP port (publisher.*.port_min); streams are selected by path (/live/<code>), RTMP app "live", or SRT streamid (live/<code>).
+//     RTSP, RTMP play, and SRT listen each use one shared TCP/UDP port (configured under listeners.{rtsp,rtmp,srt}.port — same port serves both ingest and play); streams are selected by path (/live/<code>), RTMP app "live", or SRT streamid (live/<code>).
 //   - Push destinations: rtmp:// (plain TCP) and rtmps:// (TLS, default port 443) via gomedia go-rtmp client; other schemes return a clear error.
 package publisher
 
@@ -68,6 +68,7 @@ type streamState struct {
 // Service manages all output workers for active streams.
 type Service struct {
 	cfg        config.PublisherConfig
+	listeners  config.ListenersConfig
 	buf        *buffer.Service
 	bus        events.Bus
 	ffmpegPath string
@@ -94,6 +95,7 @@ type Service struct {
 // New creates a Service and registers it with the DI injector.
 func New(i do.Injector) (*Service, error) {
 	pub := do.MustInvoke[config.PublisherConfig](i)
+	listeners := do.MustInvoke[config.ListenersConfig](i)
 	tc := do.MustInvoke[config.TranscoderConfig](i)
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
@@ -105,6 +107,7 @@ func New(i do.Injector) (*Service, error) {
 
 	svc := &Service{
 		cfg:            pub,
+		listeners:      listeners,
 		buf:            buf,
 		bus:            bus,
 		ffmpegPath:     ffmpegPath,
@@ -143,6 +146,12 @@ func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus e
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
 	}
+}
+
+// SetListenersForTesting overrides the shared listeners config without going
+// through DI. Use only from tests that exercise RunRTSPPlayServer / RunSRTPlayServer.
+func (s *Service) SetListenersForTesting(l config.ListenersConfig) {
+	s.listeners = l
 }
 
 // cleanupAllOutputDirs wipes the HLS and DASH root directories on startup so

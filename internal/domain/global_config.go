@@ -10,6 +10,7 @@ import "github.com/ntt0601zcoder/open-streamer/config"
 // by adding or removing config sections via the API.
 type GlobalConfig struct {
 	Server     *config.ServerConfig     `json:"server,omitempty" yaml:"server,omitempty"`
+	Listeners  *config.ListenersConfig  `json:"listeners,omitempty" yaml:"listeners,omitempty"`
 	Ingestor   *config.IngestorConfig   `json:"ingestor,omitempty" yaml:"ingestor,omitempty"`
 	Buffer     *config.BufferConfig     `json:"buffer,omitempty" yaml:"buffer,omitempty"`
 	Transcoder *config.TranscoderConfig `json:"transcoder,omitempty" yaml:"transcoder,omitempty"`

@@ -126,9 +126,9 @@ Legend for **Completion**:
 | HLS — `#EXT-X-DISCONTINUITY` on failover | Complete | Per-variant generation counter; exactly one tag per failover |
 | DASH — single representation (fMP4 + dynamic MPD) | Complete | H.264 + H.265 + AAC supported; MP3 skipped |
 | DASH — ABR (root MPD + per-track directories) | Complete | Audio packaged only on best track folder |
-| RTSP play (H.264 + AAC) | Complete | Shared RTSP server; lazy stream mount after codec detection; clients use `rtsp://host:port_min/live/<code>` |
-| RTMP play | Complete | Shared port with ingest (:1935) via play callback; optional dedicated port via `publisher.rtmp.port`; clients use `rtmp://host:port/live/<code>` |
-| SRT listen | Complete | Shared SRT listener; per-client buffer subscriber; raw MPEG-TS output; clients use `srt://host:port?streamid=live/<code>` |
+| RTSP play (H.264 + AAC) | Complete | Shared RTSP server (default :554) configured under `listeners.rtsp.port`; lazy stream mount after codec detection; clients use `rtsp://host:port/live/<code>` |
+| RTMP play | Complete | Shared port with ingest (default :1935) via play callback configured under `listeners.rtmp.port`; clients use `rtmp://host:port/live/<code>` |
+| SRT listen | Complete | Shared SRT listener (default :9999) configured under `listeners.srt.port`; per-client buffer subscriber; raw MPEG-TS output; clients use `srt://host:port?streamid=live/<code>` |
 | RTMP push out (re-stream to platform) | Complete | `rtmp://` (plain TCP) and `rtmps://` (TLS, default :443); FMLE handshake (`releaseStream` + `FCPublish`) for strict pops (YouTube/Twitch); waits for `NetStream.Publish.Start` status before sending media; queues + drops to next keyframe on reconnect; per-input discontinuity tear-down handled in publisher `feedLoop`; auto-reconnect with backoff |
 | Per-protocol independent context | Complete | Each output goroutine (`"hls"`, `"dash"`, `"rtsp"`, `"push:<url>"`) has its own cancel func inside `streamState.protocols` |
 | `UpdateProtocols(old, new)` | Complete | Only stops/starts protocols whose ON↔OFF state changed; connected RTSP/SRT viewers unaffected |

@@ -22,7 +22,7 @@ package publisher
 //     returning it to DESCRIBE/SETUP requests.
 //  4. On stream stop, the mount is removed and the ServerStream is closed.
 //
-// Client URL: rtsp://host:port_min/live/<stream_code>
+// Client URL: rtsp://host:port/live/<stream_code> (port from listeners.rtsp.port)
 
 import (
 	"context"
@@ -54,18 +54,18 @@ func rtspLiveMountPath(code domain.StreamCode) string {
 }
 
 // RunRTSPPlayServer starts the RTSP play listener.
-// Returns nil immediately when publisher.rtsp.port_min is 0 (disabled).
+// Returns nil immediately when listeners.rtsp is disabled.
 func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
-	port := s.cfg.RTSP.PortMin
-	if port == 0 {
+	rtsp := s.listeners.RTSP
+	if !rtsp.Enabled || rtsp.Port == 0 {
 		close(s.rtspSrvReady)
 		return nil
 	}
-	host := s.cfg.RTSP.ListenHost
+	host := rtsp.ListenHost
 	if host == "" {
 		host = "0.0.0.0"
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := fmt.Sprintf("%s:%d", host, rtsp.Port)
 
 	srv := &gortsplib.Server{
 		RTSPAddress: addr,

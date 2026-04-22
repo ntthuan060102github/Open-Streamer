@@ -1,15 +1,11 @@
 package publisher
 
-// serve_rtmp.go — RTMP play server (publisher-side).
+// serve_rtmp.go — RTMP play handler (publisher-side).
 //
-// Two modes:
-//
-//  1. Shared port (recommended): the ingestor's RTMP server calls HandleRTMPPlay
-//     when an external client connects with a "play" command. Same port as ingest
-//     (default :1935). Wire via main.go: ing.SetRTMPPlayHandler(pub.HandleRTMPPlay).
-//
-//  2. Separate port (optional): RunRTMPPlayServer binds its own listener on
-//     publisher.rtmp.port. Disabled when port = 0.
+// The RTMP listener is owned by the ingestor and bound on the shared port
+// (listeners.rtmp). When an external client issues a "play" command, the
+// ingestor's RTMP server delegates to HandleRTMPPlay below. Wired in
+// runtime.Manager via ing.SetRTMPPlayHandler(pub.HandleRTMPPlay).
 //
 // Client URL: rtmp://host:port/live/<stream_code>
 //
@@ -20,20 +16,15 @@ package publisher
 //	                                                    onTSFrame (H.264 Annex-B, AAC ADTS)
 //	                                                                   │
 //	                                                  writeFrame callback → RTMP client
-//
-// gomedia WriteFrame accepts Annex-B for H.264 and ADTS for AAC — the native
-// output of mpeg2.TSDemuxer — so no conversion is needed.
 
 import (
 	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
-	gortmp "github.com/yapingcat/gomedia/go-rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -67,95 +58,6 @@ func (s *Service) HandleRTMPPlay(
 
 	runRTMPPlayPipeline(ctx, code, sub, writeFrame)
 	return nil
-}
-
-// RunRTMPPlayServer starts an optional dedicated RTMP play listener.
-// Returns nil immediately when publisher.rtmp.port is 0 (disabled).
-func (s *Service) RunRTMPPlayServer(ctx context.Context) error {
-	port := s.cfg.RTMP.Port
-	if port == 0 {
-		return nil
-	}
-	host := s.cfg.RTMP.ListenHost
-	if host == "" {
-		host = "0.0.0.0"
-	}
-	addr := fmt.Sprintf("%s:%d", host, port)
-
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
-	if err != nil {
-		return fmt.Errorf("publisher rtmp: listen %q: %w", addr, err)
-	}
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-
-	slog.Info("publisher: RTMP play server listening", "addr", addr)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-				return fmt.Errorf("publisher rtmp: accept: %w", err)
-			}
-		}
-		go s.handleRTMPPlayConn(ctx, conn)
-	}
-}
-
-// handleRTMPPlayConn drives one client on the dedicated play port.
-func (s *Service) handleRTMPPlayConn(ctx context.Context, conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-
-	connCtx, connCancel := context.WithCancel(ctx)
-	defer connCancel()
-
-	handle := gortmp.NewRtmpServerHandle()
-	handle.SetOutput(func(b []byte) error {
-		_, err := conn.Write(b)
-		return err
-	})
-
-	handle.OnPlay(func(app, key string, start, duration float64, reset bool) gortmp.StatusCode {
-		_, ok := s.mediaBufferFor(domain.StreamCode(key))
-		if !ok {
-			slog.Warn("publisher: RTMP play stream not found", "key", key)
-			return gortmp.NETSTREAM_PLAY_NOTFOUND
-		}
-		return gortmp.NETSTREAM_PLAY_START
-	})
-
-	handle.OnStateChange(func(newState gortmp.RtmpState) {
-		if newState != gortmp.STATE_RTMP_PLAY_START {
-			return
-		}
-		key := handle.GetStreamName()
-		go func() {
-			err := s.HandleRTMPPlay(connCtx, key, func(cid gocodec.CodecID, data []byte, pts, dts uint32) error {
-				return handle.WriteFrame(cid, data, pts, dts)
-			})
-			if err != nil {
-				slog.Debug("publisher: RTMP play ended", "key", key, "err", err)
-				_ = conn.Close()
-			}
-		}()
-	})
-
-	buf := make([]byte, 65536)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			break
-		}
-		if err := handle.Input(buf[:n]); err != nil {
-			slog.Debug("publisher: RTMP play handle input", "err", err)
-			break
-		}
-	}
 }
 
 // ─── pipeline ────────────────────────────────────────────────────────────────

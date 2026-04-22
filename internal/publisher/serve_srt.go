@@ -32,19 +32,19 @@ import (
 )
 
 // RunSRTPlayServer starts the SRT play listener.
-// Returns nil immediately when publisher.srt.port is 0 (disabled).
+// Returns nil immediately when listeners.srt is disabled.
 func (s *Service) RunSRTPlayServer(ctx context.Context) error {
-	port := s.cfg.SRT.Port
-	if port == 0 {
+	srtCfg := s.listeners.SRT
+	if !srtCfg.Enabled || srtCfg.Port == 0 {
 		return nil
 	}
-	host := s.cfg.SRT.ListenHost
+	host := srtCfg.ListenHost
 	if host == "" {
 		host = "0.0.0.0"
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := fmt.Sprintf("%s:%d", host, srtCfg.Port)
 
-	latency := time.Duration(s.cfg.SRT.LatencyMS) * time.Millisecond
+	latency := time.Duration(srtCfg.LatencyMS) * time.Millisecond
 	if latency <= 0 {
 		latency = 120 * time.Millisecond
 	}

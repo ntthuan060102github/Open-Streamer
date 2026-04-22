@@ -60,15 +60,11 @@ type StorageConfig struct {
 // IngestorConfig controls server-level ingestion infrastructure.
 // Per-input settings (timeouts, S3 region, SRT latency, etc.) are configured
 // on each Input via the API and stored in the data storage.
+//
+// Network listeners (RTMP, SRT, RTSP) are configured in the top-level
+// ListenersConfig and shared with the publisher, so the same port serves both
+// push (ingest) and pull (play) traffic.
 type IngestorConfig struct {
-	// RTMP push server — external encoders connect to us on this address.
-	RTMPEnabled bool   `mapstructure:"rtmp_enabled" json:"rtmp_enabled" yaml:"rtmp_enabled"`
-	RTMPAddr    string `mapstructure:"rtmp_addr" json:"rtmp_addr" yaml:"rtmp_addr"` // e.g. ":1935"
-
-	// SRT push server — external encoders connect to our SRT listener.
-	SRTEnabled bool   `mapstructure:"srt_enabled" json:"srt_enabled" yaml:"srt_enabled"`
-	SRTAddr    string `mapstructure:"srt_addr" json:"srt_addr" yaml:"srt_addr"` // e.g. ":9999"
-
 	// HLSMaxSegmentBuffer caps the number of pre-fetched HLS segments held in memory.
 	// This is a server-wide memory guard, not a per-stream policy.
 	HLSMaxSegmentBuffer int `mapstructure:"hls_max_segment_buffer" json:"hls_max_segment_buffer" yaml:"hls_max_segment_buffer"` // default 8
@@ -91,13 +87,12 @@ type TranscoderConfig struct {
 	MaxRestarts int `mapstructure:"max_restarts" json:"max_restarts" yaml:"max_restarts"`
 }
 
-// PublisherConfig controls output delivery; settings are grouped by protocol.
+// PublisherConfig controls filesystem-based output delivery (HLS, DASH).
+// Live network listeners (RTSP, RTMP, SRT) are configured in ListenersConfig
+// because the same port serves both ingest and playback.
 type PublisherConfig struct {
-	HLS  PublisherHLSConfig         `mapstructure:"hls" json:"hls" yaml:"hls"`
-	DASH PublisherDASHConfig        `mapstructure:"dash" json:"dash" yaml:"dash"`
-	RTSP PublisherRTSPConfig        `mapstructure:"rtsp" json:"rtsp" yaml:"rtsp"`
-	RTMP PublisherRTMPServeConfig   `mapstructure:"rtmp" json:"rtmp" yaml:"rtmp"`
-	SRT  PublisherSRTListenerConfig `mapstructure:"srt" json:"srt" yaml:"srt"`
+	HLS  PublisherHLSConfig  `mapstructure:"hls" json:"hls" yaml:"hls"`
+	DASH PublisherDASHConfig `mapstructure:"dash" json:"dash" yaml:"dash"`
 }
 
 // PublisherHLSConfig is filesystem + live packaging for Apple HLS (m3u8 + segments).
@@ -125,34 +120,49 @@ type PublisherDASHConfig struct {
 	LiveHistory    int  `mapstructure:"live_history" json:"live_history" yaml:"live_history"`
 }
 
-// PublisherRTSPConfig is native RTSP listen mode (protocols.rtsp).
-// All streams share PortMin; clients use rtsp://host:PortMin/live/<stream_code>.
-type PublisherRTSPConfig struct {
-	// ListenHost is the bind address (empty = 0.0.0.0).
+// ListenersConfig groups all live network listeners.
+//
+// Each protocol uses ONE port that serves both directions of traffic:
+//   - RTMP: encoders push, players pull, on the same TCP port (default 1935).
+//   - RTSP: clients pull live streams (default 554).
+//   - SRT:  encoders push or clients pull on the same UDP port (default 9999),
+//     dispatched by the SRT streamid mode flag.
+//
+// Setting Enabled=false (or leaving the section out entirely) disables that
+// protocol's listener for both ingest and playback.
+type ListenersConfig struct {
+	RTMP RTMPListenerConfig `mapstructure:"rtmp" json:"rtmp" yaml:"rtmp"`
+	RTSP RTSPListenerConfig `mapstructure:"rtsp" json:"rtsp" yaml:"rtsp"`
+	SRT  SRTListenerConfig  `mapstructure:"srt"  json:"srt"  yaml:"srt"`
+}
+
+// RTMPListenerConfig is the shared RTMP listener used by both ingest and play.
+// Encoders publish to rtmp://host:port/<key>; players pull from
+// rtmp://host:port/<app>/<key>.
+type RTMPListenerConfig struct {
+	Enabled    bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
 	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
-	// PortMin is the single RTSP listen port (PortMax is unused for publisher RTSP).
-	PortMin int `mapstructure:"port_min" json:"port_min" yaml:"port_min"`
-	PortMax int `mapstructure:"port_max" json:"port_max" yaml:"port_max"`
+	Port       int    `mapstructure:"port" json:"port" yaml:"port"` // default 1935
+}
+
+// RTSPListenerConfig is the RTSP listener (publisher-side; ingest is pull-only).
+// Clients use rtsp://host:port/live/<stream_code>.
+type RTSPListenerConfig struct {
+	Enabled    bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
+	Port       int    `mapstructure:"port" json:"port" yaml:"port"` // default 554
 	// Transport is "tcp" (default) or "udp" for the RTSP muxer.
 	Transport string `mapstructure:"transport" json:"transport" yaml:"transport"`
 }
 
-// PublisherRTMPServeConfig is native RTMP listen output for viewers (not ingestor push).
-// Clients use rtmp://host:Port/live/<stream_code>.
-// Keep Port distinct from ingestor.rtmp_addr (default :1935).
-type PublisherRTMPServeConfig struct {
+// SRTListenerConfig is the shared SRT listener.
+// Players set streamid=live/<stream_code>; publish ingest is dispatched by the
+// streamid mode flag (mode=publish vs mode=request).
+type SRTListenerConfig struct {
+	Enabled    bool   `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
 	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
-	// Port is the single RTMP listen port. 0 = disabled.
-	Port int `mapstructure:"port" json:"port" yaml:"port"`
-}
-
-// PublisherSRTListenerConfig is native SRT listener (protocols.srt).
-// Clients set streamid=live/<stream_code> (or a bare valid stream code).
-type PublisherSRTListenerConfig struct {
-	ListenHost string `mapstructure:"listen_host" json:"listen_host" yaml:"listen_host"`
-	// Port is the single SRT listen port. 0 = disabled.
-	Port int `mapstructure:"port" json:"port" yaml:"port"`
-	// LatencyMS is the SRT latency in milliseconds for listener URLs.
+	Port       int    `mapstructure:"port" json:"port" yaml:"port"` // default 9999
+	// LatencyMS is the SRT latency in milliseconds applied to the listener.
 	LatencyMS int `mapstructure:"latency_ms" json:"latency_ms" yaml:"latency_ms"`
 }
 

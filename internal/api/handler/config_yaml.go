@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -431,8 +430,8 @@ func validateGlobalConfig(c *domain.GlobalConfig) []fieldError {
 	if c.Log != nil {
 		errs = append(errs, validateLog(c.Log)...)
 	}
-	if c.Ingestor != nil {
-		errs = append(errs, validateIngestor(c.Ingestor)...)
+	if c.Listeners != nil {
+		errs = append(errs, validateListeners(c.Listeners)...)
 	}
 	return errs
 }
@@ -460,13 +459,6 @@ func validateServer(s *config.ServerConfig) []fieldError {
 
 func validatePublisher(p *config.PublisherConfig) []fieldError {
 	var errs []fieldError
-	errs = append(errs, validatePort("global_config.publisher.rtsp.port_min", p.RTSP.PortMin)...)
-	errs = append(errs, validatePort("global_config.publisher.rtmp.port", p.RTMP.Port)...)
-	errs = append(errs, validatePort("global_config.publisher.srt.port", p.SRT.Port)...)
-
-	if p.SRT.LatencyMS < 0 {
-		errs = append(errs, fieldError{Path: "global_config.publisher.srt.latency_ms", Message: msgMustBeGEZero})
-	}
 	if p.HLS.LiveSegmentSec < 0 {
 		errs = append(errs, fieldError{Path: "global_config.publisher.hls.live_segment_sec", Message: msgMustBeGEZero})
 	}
@@ -482,17 +474,31 @@ func validatePublisher(p *config.PublisherConfig) []fieldError {
 	return errs
 }
 
-func validateIngestor(i *config.IngestorConfig) []fieldError {
+// validateListeners checks the shared network-listener config that drives both
+// ingest and play traffic on a single port per protocol.
+func validateListeners(l *config.ListenersConfig) []fieldError {
+	const portRequired = "required when listener is enabled"
 	var errs []fieldError
-	if i.RTMPEnabled {
-		if err := validateListenAddr(i.RTMPAddr); err != "" {
-			errs = append(errs, fieldError{Path: "global_config.ingestor.rtmp_addr", Message: err})
+	if l.RTMP.Enabled {
+		errs = append(errs, validatePort("global_config.listeners.rtmp.port", l.RTMP.Port)...)
+		if l.RTMP.Port == 0 {
+			errs = append(errs, fieldError{Path: "global_config.listeners.rtmp.port", Message: portRequired})
 		}
 	}
-	if i.SRTEnabled {
-		if err := validateListenAddr(i.SRTAddr); err != "" {
-			errs = append(errs, fieldError{Path: "global_config.ingestor.srt_addr", Message: err})
+	if l.RTSP.Enabled {
+		errs = append(errs, validatePort("global_config.listeners.rtsp.port", l.RTSP.Port)...)
+		if l.RTSP.Port == 0 {
+			errs = append(errs, fieldError{Path: "global_config.listeners.rtsp.port", Message: portRequired})
 		}
+	}
+	if l.SRT.Enabled {
+		errs = append(errs, validatePort("global_config.listeners.srt.port", l.SRT.Port)...)
+		if l.SRT.Port == 0 {
+			errs = append(errs, fieldError{Path: "global_config.listeners.srt.port", Message: portRequired})
+		}
+	}
+	if l.SRT.LatencyMS < 0 {
+		errs = append(errs, fieldError{Path: "global_config.listeners.srt.latency_ms", Message: msgMustBeGEZero})
 	}
 	return errs
 }
@@ -625,19 +631,4 @@ func validatePort(path string, port int) []fieldError {
 		return nil
 	}
 	return []fieldError{{Path: path, Message: "must be 0 (disabled) or 1-65535"}}
-}
-
-func validateListenAddr(addr string) string {
-	if strings.TrimSpace(addr) == "" {
-		return "required when service is enabled (e.g. \":1935\")"
-	}
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "invalid host:port: " + err.Error()
-	}
-	if _, err := strconv.Atoi(port); err != nil {
-		return "port must be numeric"
-	}
-	_ = host
-	return ""
 }

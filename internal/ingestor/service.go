@@ -43,6 +43,7 @@ type pullWorkerEntry struct {
 //     the next encoder connection for that key is accepted and routed here.
 type Service struct {
 	cfg          config.IngestorConfig
+	listeners    config.ListenersConfig
 	buf          *buffer.Service
 	bus          events.Bus
 	m            *metrics.Metrics
@@ -53,26 +54,28 @@ type Service struct {
 
 	mu              sync.Mutex
 	workers         map[domain.StreamCode]*pullWorkerEntry
-	rtmpSrv         *push.RTMPServer // set during Run if RTMPEnabled
+	rtmpSrv         *push.RTMPServer // set during Run if listeners.RTMP.Enabled
 	pendingPlayFunc push.PlayFunc    // stored before Run, wired in once server is created
 }
 
 // New creates a Service and registers it with the DI injector.
 func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[config.IngestorConfig](i)
+	listeners := do.MustInvoke[config.ListenersConfig](i)
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
 	m := do.MustInvoke[*metrics.Metrics](i)
 	vods := do.MustInvoke[*vod.Registry](i)
 
 	return &Service{
-		cfg:      cfg,
-		buf:      buf,
-		bus:      bus,
-		m:        m,
-		vods:     vods,
-		registry: NewRegistry(),
-		workers:  make(map[domain.StreamCode]*pullWorkerEntry),
+		cfg:       cfg,
+		listeners: listeners,
+		buf:       buf,
+		bus:       bus,
+		m:         m,
+		vods:      vods,
+		registry:  NewRegistry(),
+		workers:   make(map[domain.StreamCode]*pullWorkerEntry),
 	}, nil
 }
 
@@ -106,14 +109,16 @@ func (s *Service) SetRTMPPlayHandler(fn push.PlayFunc) {
 	s.mu.Unlock()
 }
 
-// Run starts the push servers (RTMP, SRT) and blocks until ctx is cancelled.
-// Call this in a dedicated goroutine alongside the rest of the application.
+// Run starts the shared push/play listeners (RTMP) and blocks until ctx is
+// cancelled. Other shared listeners (SRT, RTSP) are owned by the publisher and
+// run from runtime.Manager; the same network port serves both ingest and play
+// because the listeners config is the single source of truth.
 func (s *Service) Run(ctx context.Context) error {
 	g, _ := errgroup.WithContext(ctx)
 
-	if s.cfg.RTMPEnabled {
+	if s.listeners.RTMP.Enabled {
 		rtmpSrv, err := push.NewRTMPServer(
-			s.cfg.RTMPAddr,
+			rtmpListenAddr(s.listeners.RTMP),
 			s.registry,
 			func(ctx context.Context, streamID, bufferWriteID domain.StreamCode, input domain.Input) error {
 				return s.startPullWorker(ctx, streamID, input, bufferWriteID)
@@ -133,6 +138,16 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	return g.Wait()
+}
+
+// rtmpListenAddr builds the bind address from the listeners config, applying
+// the standard 0.0.0.0 default for a missing host.
+func rtmpListenAddr(cfg config.RTMPListenerConfig) string {
+	host := cfg.ListenHost
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	return fmt.Sprintf("%s:%d", host, cfg.Port)
 }
 
 // Start activates ingest for the given input on streamID.

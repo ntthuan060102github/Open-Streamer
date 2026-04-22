@@ -30,11 +30,12 @@ type streamLifecycle interface {
 }
 
 // publisherPorts exposes listener port configuration so the UI can build output URLs.
+// All RTMP/RTSP/SRT traffic shares one port per protocol with both ingest and play.
 type publisherPorts struct {
 	HTTPAddr string `json:"http_addr"` // e.g. ":8080"
-	RTSPPort int    `json:"rtsp_port"` // e.g. 18554; 0 = disabled
-	RTMPPort int    `json:"rtmp_port"` // e.g. 1936; 0 = disabled
-	SRTPort  int    `json:"srt_port"`  // e.g. 10000; 0 = disabled
+	RTSPPort int    `json:"rtsp_port"` // e.g. 554; 0 = disabled
+	RTMPPort int    `json:"rtmp_port"` // e.g. 1935; 0 = disabled
+	SRTPort  int    `json:"srt_port"`  // e.g. 9999; 0 = disabled
 }
 
 // configResponse is the payload returned by GET /config.
@@ -87,10 +88,16 @@ func portsFromConfig(gcfg *domain.GlobalConfig) publisherPorts {
 	if gcfg.Server != nil {
 		p.HTTPAddr = gcfg.Server.HTTPAddr
 	}
-	if gcfg.Publisher != nil {
-		p.RTSPPort = gcfg.Publisher.RTSP.PortMin
-		p.RTMPPort = gcfg.Publisher.RTMP.Port
-		p.SRTPort = gcfg.Publisher.SRT.Port
+	if gcfg.Listeners != nil {
+		if gcfg.Listeners.RTSP.Enabled {
+			p.RTSPPort = gcfg.Listeners.RTSP.Port
+		}
+		if gcfg.Listeners.RTMP.Enabled {
+			p.RTMPPort = gcfg.Listeners.RTMP.Port
+		}
+		if gcfg.Listeners.SRT.Enabled {
+			p.SRTPort = gcfg.Listeners.SRT.Port
+		}
 	}
 	return p
 }

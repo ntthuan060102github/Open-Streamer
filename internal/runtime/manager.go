@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -148,23 +149,21 @@ func (m *Manager) applyAll(cfg *domain.GlobalConfig) {
 		})
 	}
 
-	if cfg.Ingestor != nil {
+	// Ingestor owns the shared RTMP listener. Even when no other ingestor
+	// settings are configured, having listeners.rtmp.enabled is reason enough
+	// to start it so external play clients work too.
+	if cfg.Ingestor != nil || rtmpListenerEnabled(cfg.Listeners) {
 		m.startService("ingestor", func(ctx context.Context) error {
 			return m.deps.Ingestor.Run(ctx)
 		})
 	}
 
-	if cfg.Publisher != nil && cfg.Publisher.RTSP.PortMin > 0 {
+	if rtspListenerEnabled(cfg.Listeners) {
 		m.startService("pub_rtsp", func(ctx context.Context) error {
 			return m.deps.Publisher.RunRTSPPlayServer(ctx)
 		})
 	}
-	if cfg.Publisher != nil && cfg.Publisher.RTMP.Port > 0 {
-		m.startService("pub_rtmp", func(ctx context.Context) error {
-			return m.deps.Publisher.RunRTMPPlayServer(ctx)
-		})
-	}
-	if cfg.Publisher != nil && cfg.Publisher.SRT.Port > 0 {
+	if srtListenerEnabled(cfg.Listeners) {
 		m.startService("pub_srt", func(ctx context.Context) error {
 			return m.deps.Publisher.RunSRTPlayServer(ctx)
 		})
@@ -179,7 +178,8 @@ func (m *Manager) applyAll(cfg *domain.GlobalConfig) {
 	// Event bus is always running (lightweight).
 	events.Start(m.rootCtx, m.deps.Bus)
 
-	// Wire ingestor → publisher RTMP play handler.
+	// Wire ingestor → publisher RTMP play handler so the shared listener can
+	// serve external play clients in addition to push ingest.
 	m.deps.Ingestor.SetRTMPPlayHandler(m.deps.Publisher.HandleRTMPPlay)
 
 	// Bootstrap persisted streams.
@@ -197,36 +197,33 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 			return m.deps.APISrv.StartWithConfig(ctx, new.Server)
 		})
 
-	// Ingestor (RTMP/SRT push listeners)
-	m.diffService("ingestor", old.Ingestor != nil, new.Ingestor != nil,
-		configChanged(old.Ingestor, new.Ingestor),
+	// Ingestor — owns the shared RTMP listener. Restart on changes to either
+	// IngestorConfig or listeners.RTMP, and treat the listener being enabled
+	// as sufficient reason to keep the service running even when IngestorConfig
+	// is nil.
+	wasIng := old.Ingestor != nil || rtmpListenerEnabled(old.Listeners)
+	nowIng := new.Ingestor != nil || rtmpListenerEnabled(new.Listeners)
+	ingChanged := configChanged(old.Ingestor, new.Ingestor) ||
+		configChanged(rtmpListenerOf(old.Listeners), rtmpListenerOf(new.Listeners))
+	m.diffService("ingestor", wasIng, nowIng, ingChanged,
 		func(ctx context.Context) error {
 			return m.deps.Ingestor.Run(ctx)
 		})
 
-	// Publisher play servers
-	oldPub := old.Publisher
-	newPub := new.Publisher
-	oldRTSP := oldPub != nil && oldPub.RTSP.PortMin > 0
-	newRTSP := newPub != nil && newPub.RTSP.PortMin > 0
+	// Publisher RTSP listener
+	oldRTSP := rtspListenerEnabled(old.Listeners)
+	newRTSP := rtspListenerEnabled(new.Listeners)
 	m.diffService("pub_rtsp", oldRTSP, newRTSP,
-		configChanged(ptrIf(oldRTSP, oldPub), ptrIf(newRTSP, newPub)),
+		configChanged(rtspListenerOf(old.Listeners), rtspListenerOf(new.Listeners)),
 		func(ctx context.Context) error {
 			return m.deps.Publisher.RunRTSPPlayServer(ctx)
 		})
 
-	oldRTMP := oldPub != nil && oldPub.RTMP.Port > 0
-	newRTMP := newPub != nil && newPub.RTMP.Port > 0
-	m.diffService("pub_rtmp", oldRTMP, newRTMP,
-		configChanged(ptrIf(oldRTMP, oldPub), ptrIf(newRTMP, newPub)),
-		func(ctx context.Context) error {
-			return m.deps.Publisher.RunRTMPPlayServer(ctx)
-		})
-
-	oldSRT := oldPub != nil && oldPub.SRT.Port > 0
-	newSRT := newPub != nil && newPub.SRT.Port > 0
+	// Publisher SRT listener
+	oldSRT := srtListenerEnabled(old.Listeners)
+	newSRT := srtListenerEnabled(new.Listeners)
 	m.diffService("pub_srt", oldSRT, newSRT,
-		configChanged(ptrIf(oldSRT, oldPub), ptrIf(newSRT, newPub)),
+		configChanged(srtListenerOf(old.Listeners), srtListenerOf(new.Listeners)),
 		func(ctx context.Context) error {
 			return m.deps.Publisher.RunSRTPlayServer(ctx)
 		})
@@ -245,6 +242,48 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 			slog.Info("runtime: log config applied", "level", new.Log.Level, "format", new.Log.Format)
 		}
 	}
+}
+
+// rtmpListenerEnabled reports whether the shared RTMP listener should run.
+func rtmpListenerEnabled(l *config.ListenersConfig) bool {
+	return l != nil && l.RTMP.Enabled && l.RTMP.Port > 0
+}
+
+// rtspListenerEnabled reports whether the publisher RTSP listener should run.
+func rtspListenerEnabled(l *config.ListenersConfig) bool {
+	return l != nil && l.RTSP.Enabled && l.RTSP.Port > 0
+}
+
+// srtListenerEnabled reports whether the shared SRT listener should run.
+func srtListenerEnabled(l *config.ListenersConfig) bool {
+	return l != nil && l.SRT.Enabled && l.SRT.Port > 0
+}
+
+// rtmpListenerOf returns the RTMP listener config (or nil) for diff comparison.
+func rtmpListenerOf(l *config.ListenersConfig) *config.RTMPListenerConfig {
+	if l == nil {
+		return nil
+	}
+	r := l.RTMP
+	return &r
+}
+
+// rtspListenerOf returns the RTSP listener config (or nil) for diff comparison.
+func rtspListenerOf(l *config.ListenersConfig) *config.RTSPListenerConfig {
+	if l == nil {
+		return nil
+	}
+	r := l.RTSP
+	return &r
+}
+
+// srtListenerOf returns the SRT listener config (or nil) for diff comparison.
+func srtListenerOf(l *config.ListenersConfig) *config.SRTListenerConfig {
+	if l == nil {
+		return nil
+	}
+	r := l.SRT
+	return &r
 }
 
 // diffService handles the transition for a single service:
@@ -319,11 +358,4 @@ func configChanged(a, b any) bool {
 		return true
 	}
 	return !reflect.DeepEqual(a, b)
-}
-
-func ptrIf[T any](cond bool, v *T) *T {
-	if cond {
-		return v
-	}
-	return nil
 }

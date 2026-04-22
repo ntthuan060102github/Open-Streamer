@@ -155,6 +155,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 // Zero-value configs are provided for nil sections so DI constructors never panic.
 func provideSubConfigs(i *do.RootScope, gcfg *domain.GlobalConfig) {
 	do.ProvideValue(i, deref(gcfg.Server))
+	do.ProvideValue(i, deref(gcfg.Listeners))
 	do.ProvideValue(i, deref(gcfg.Ingestor))
 	do.ProvideValue(i, deref(gcfg.Buffer))
 	do.ProvideValue(i, deref(gcfg.Transcoder))

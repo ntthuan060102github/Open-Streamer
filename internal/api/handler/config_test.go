@@ -44,10 +44,10 @@ func TestPortsFromConfigEmpty(t *testing.T) {
 func TestPortsFromConfigPopulated(t *testing.T) {
 	gcfg := &domain.GlobalConfig{
 		Server: &config.ServerConfig{HTTPAddr: ":8080"},
-		Publisher: &config.PublisherConfig{
-			RTSP: config.PublisherRTSPConfig{PortMin: 18554},
-			RTMP: config.PublisherRTMPServeConfig{Port: 1936},
-			SRT:  config.PublisherSRTListenerConfig{Port: 10000},
+		Listeners: &config.ListenersConfig{
+			RTSP: config.RTSPListenerConfig{Enabled: true, Port: 18554},
+			RTMP: config.RTMPListenerConfig{Enabled: true, Port: 1936},
+			SRT:  config.SRTListenerConfig{Enabled: true, Port: 10000},
 		},
 	}
 	p := portsFromConfig(gcfg)

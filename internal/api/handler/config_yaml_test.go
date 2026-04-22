@@ -596,7 +596,7 @@ func TestValidateGlobalConfigPassesForValid(t *testing.T) {
 	cfg := &domain.GlobalConfig{
 		Server:    &config.ServerConfig{HTTPAddr: ":8080"},
 		Buffer:    &config.BufferConfig{Capacity: 2000},
-		Publisher: &config.PublisherConfig{RTMP: config.PublisherRTMPServeConfig{Port: 1936}},
+		Listeners: &config.ListenersConfig{RTMP: config.RTMPListenerConfig{Enabled: true, Port: 1936}},
 		Hooks:     &config.HooksConfig{WorkerCount: 2},
 		Log:       &config.LogConfig{Level: "info", Format: "json"},
 	}
@@ -646,13 +646,11 @@ func TestValidateGlobalConfigSameDirHLSDASH(t *testing.T) {
 	}
 }
 
-func TestValidateGlobalConfigIngestorAddrRequiredWhenEnabled(t *testing.T) {
+func TestValidateGlobalConfigListenerPortRequiredWhenEnabled(t *testing.T) {
 	cfg := &domain.GlobalConfig{
-		Ingestor: &config.IngestorConfig{
-			RTMPEnabled: true,
-			RTMPAddr:    "",
-			SRTEnabled:  true,
-			SRTAddr:     "not-a-valid-addr",
+		Listeners: &config.ListenersConfig{
+			RTMP: config.RTMPListenerConfig{Enabled: true, Port: 0},
+			SRT:  config.SRTListenerConfig{Enabled: true, Port: 0, LatencyMS: -1},
 		},
 	}
 	errs := validateGlobalConfig(cfg)
@@ -660,11 +658,14 @@ func TestValidateGlobalConfigIngestorAddrRequiredWhenEnabled(t *testing.T) {
 	for _, e := range errs {
 		have[e.Path] = true
 	}
-	if !have["global_config.ingestor.rtmp_addr"] {
-		t.Error("missing ingestor.rtmp_addr error")
+	if !have["global_config.listeners.rtmp.port"] {
+		t.Error("missing listeners.rtmp.port error")
 	}
-	if !have["global_config.ingestor.srt_addr"] {
-		t.Error("missing ingestor.srt_addr error")
+	if !have["global_config.listeners.srt.port"] {
+		t.Error("missing listeners.srt.port error")
+	}
+	if !have["global_config.listeners.srt.latency_ms"] {
+		t.Error("missing listeners.srt.latency_ms error")
 	}
 }
 
