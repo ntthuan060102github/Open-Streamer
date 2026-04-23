@@ -96,10 +96,19 @@ jobs:
           cp build/open-streamer.service "$DST/build/"
           chmod +x "$DST/build/install.sh" "$DST/bin/open-streamer"
 
-      - name: Stage docs
+      - name: Stage docs and version metadata
         run: |
           DST=stage/${{ steps.version.outputs.stage }}
           cp README.md LICENSE "$DST/"
+          # VERSION file lets users (and ops scripts) identify what's installed
+          # without invoking the binary.
+          {
+            echo "version=${{ steps.version.outputs.version }}"
+            echo "commit=${GITHUB_SHA}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "os=${{ matrix.os }}"
+            echo "arch=${{ matrix.arch }}"
+          } > "$DST/VERSION"
 
       - name: Create tar.gz archive
         if: matrix.archive == 'tar.gz'
