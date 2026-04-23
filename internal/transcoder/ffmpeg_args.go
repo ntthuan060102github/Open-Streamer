@@ -136,8 +136,8 @@ func hwInputArgs(hw domain.HWAccel, encoder string) []string {
 
 // buildVideoFilter composes the full -vf chain in pipeline order:
 // deinterlace → resize/pad/crop → setsar. Skipped if all parts are no-ops.
-// Each filter is GPU- or CPU-flavored to match the active hwaccel; mixing
-// them in one chain forces hwdownload/hwupload, which we want to avoid.
+// Each filter is GPU- or CPU-flavored to match the active hwaccel; pad and
+// crop on GPU pipelines round-trip through CPU (no cuda primitives are used).
 func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) string {
 	hw := tc.Global.HW
 	_, onGPU := gpuScaleFilterName(hw, encoder)
@@ -161,8 +161,10 @@ func buildScaleFilter(w, h int, hw domain.HWAccel, encoder string) string {
 }
 
 // resizeFilter dispatches to GPU/CPU scaler chains based on the active hwaccel.
-// mode "" defaults to ResizeModePad. crop on GPU round-trips through CPU
-// (hwdownload→crop→hwupload) — the cuda filter graph has no crop primitive.
+// mode "" defaults to ResizeModePad. pad and crop on GPU round-trip through
+// CPU (hwdownload→cpu filter→hwupload) — the cuda filter graph has no crop
+// primitive, and pad_cuda was deliberately dropped for stability across
+// ffmpeg builds (Ubuntu apt skips --enable-cuda-nvcc). See gpuResizeFilter.
 func resizeFilter(w, h int, mode string, hw domain.HWAccel, encoder string) string {
 	if w <= 0 && h <= 0 {
 		return ""
@@ -218,8 +220,12 @@ func gpuScaleFilterName(hw domain.HWAccel, encoder string) (string, bool) {
 }
 
 // gpuResizeFilter builds an in-VRAM scaler chain for the active hwaccel.
-// pad mode uses pad_cuda (FFmpeg ≥5.1). crop mode round-trips through CPU
-// (hwdownload→cpu crop→hwupload_cuda) since no cuda crop filter exists.
+// stretch and fit stay fully in VRAM. pad and crop both round-trip through
+// CPU (hwdownload→cpu filter→hwupload_cuda) — pad_cuda was deliberately
+// dropped: the round-trip overhead is only paid when source/target aspects
+// differ (no-op for typical 16:9 ABR ladders), and the CPU pad filter is
+// rock-solid across every ffmpeg build, while pad_cuda needs a CUDA-enabled
+// build (Ubuntu apt skips it) and has had option-syntax bugs in the wild.
 func gpuResizeFilter(name string, w, h int, mode domain.ResizeMode) string {
 	// Single-axis specifications collapse to a fit/stretch behavior — there's
 	// no aspect to enforce when one dimension is auto.
@@ -241,12 +247,14 @@ func gpuResizeFilter(name string, w, h int, mode domain.ResizeMode) string {
 	case domain.ResizeModePad:
 		fallthrough
 	default:
-		// pad_cuda has no shorthand option list — positional `w:h:x:y` is
-		// rejected with "No option name near ...". Named params (w=…:h=…:x=…:y=…)
-		// are required so each chunk has its own key. Centered offsets must
-		// stay as expressions because source dims are not known until runtime.
-		return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2,pad_cuda=w=%d:h=%d:x=(%d-iw)/2:y=(%d-ih)/2",
-			name, w, h, w, h, w, h)
+		if name == "scale_cuda" {
+			// CPU pad round-trip — see function doc for rationale.
+			return fmt.Sprintf("hwdownload,format=nv12,%s,hwupload_cuda", cpuResizeFilter(w, h, domain.ResizeModePad))
+		}
+		// Non-CUDA GPU backends (VAAPI/QSV): no universal pad_<backend> filter
+		// and the hwupload variant is backend-specific. Degrade pad → fit
+		// (aspect-preserving scale, no letterbox bars).
+		return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", name, w, h)
 	}
 }
 

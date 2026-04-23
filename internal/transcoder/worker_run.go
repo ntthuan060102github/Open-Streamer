@@ -168,7 +168,8 @@ func (s *Service) runOnce(
 		"write_to", outBufferID,
 	)
 
-	go s.logStderr(logStream, track, stderr)
+	tail := newStderrTail(stderrTailCap)
+	go s.logStderr(logStream, track, stderr, tail)
 
 	var stdinWG sync.WaitGroup
 	stdinWG.Add(1)
@@ -235,7 +236,20 @@ func (s *Service) runOnce(
 	stdinWG.Wait()
 
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-		slog.Error("transcoder: ffmpeg exited with error", "stream_code", logStream, "profile", track, "err", err)
+		// Enrich the otherwise-opaque exit-status error with the last few
+		// warn-level stderr lines — they carry the actual cause (filter not
+		// found, codec init failure, encoder rejected option, …) that turns
+		// "exit status 8" into something actionable for ops.
+		stderrCtx := formatStderrTail(tail.snapshot())
+		slog.Error("transcoder: ffmpeg exited with error",
+			"stream_code", logStream,
+			"profile", track,
+			"err", err,
+			"stderr_tail", stderrCtx,
+		)
+		if stderrCtx != "" {
+			return true, fmt.Errorf("ffmpeg exit: %w; stderr: %s", err, stderrCtx)
+		}
 		return true, fmt.Errorf("ffmpeg exit: %w", err)
 	}
 	return false, nil

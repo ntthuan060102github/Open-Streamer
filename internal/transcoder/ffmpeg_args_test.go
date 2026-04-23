@@ -143,7 +143,7 @@ func TestBuildScaleFilter(t *testing.T) {
 		{"CPU both dims (default pad)", 1280, 720, domain.HWAccelNone, "libx264", "scale=1280:720:", false},
 		{"CPU width only", 1280, 0, domain.HWAccelNone, "libx264", "scale=1280:-2", false},
 		{"CPU height only", 0, 720, domain.HWAccelNone, "libx264", "scale=-2:720", false},
-		{"NVENC both dims → scale_cuda + pad_cuda", 1280, 720, domain.HWAccelNVENC, "h264_nvenc", "scale_cuda=1280:720:", false},
+		{"NVENC both dims (default pad → CPU round-trip)", 1280, 720, domain.HWAccelNVENC, "h264_nvenc", "hwdownload", false},
 		{"NVENC + CPU encoder mismatch → CPU scale", 1280, 720, domain.HWAccelNVENC, "libx264", "scale=1280:720:", false},
 		{"VAAPI both dims → scale_vaapi", 1920, 1080, domain.HWAccelVAAPI, "h264_vaapi", "scale_vaapi=1920:1080:", false},
 		{"QSV both dims → scale_qsv", 1280, 720, domain.HWAccelQSV, "h264_qsv", "scale_qsv=1280:720:", false},
@@ -201,14 +201,13 @@ func TestResizeFilter_Modes(t *testing.T) {
 			wantNot:  []string{"pad="},
 		},
 		{
-			name: "GPU NVENC pad → scale_cuda + pad_cuda (named params required)",
+			name: "GPU NVENC pad → CPU round-trip (no pad_cuda)",
 			w:    1920, h: 1080, mode: "pad", hw: domain.HWAccelNVENC, enc: "h264_nvenc",
-			// pad_cuda has no shorthand list, so positional `w:h:x:y` parses as
-			// one option name and FFmpeg fails with "No option name near ...".
-			wantSubs: []string{
-				"scale_cuda=1920:1080:",
-				"pad_cuda=w=1920:h=1080:x=(1920-iw)/2:y=(1080-ih)/2",
-			},
+			// pad_cuda was dropped: round-trip through CPU is universal across
+			// ffmpeg builds and the cost is paid only when source/target aspects
+			// differ. No-op for typical 16:9 ABR ladders.
+			wantSubs: []string{"hwdownload", "format=nv12", "pad=", "hwupload_cuda"},
+			wantNot:  []string{"pad_cuda", "scale_cuda"},
 		},
 		{
 			name: "GPU NVENC stretch",
@@ -244,6 +243,21 @@ func TestResizeFilter_Modes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// pad_cuda was deliberately dropped — the GPU pad mode always round-trips
+// through CPU pad (hwdownload → cpu pad → hwupload_cuda). Rationale: pad_cuda
+// requires --enable-cuda-nvcc (Ubuntu apt skips it), has had option-syntax
+// bugs in the wild, and the CPU round-trip is only paid when source/target
+// aspects differ — typical 16:9 ABR ladders never trigger pad in practice.
+func TestGpuResizeFilter_PadAlwaysRoundTripsCPU(t *testing.T) {
+	t.Parallel()
+	got := gpuResizeFilter("scale_cuda", 1280, 720, domain.ResizeModePad)
+	require.Contains(t, got, "hwdownload", "must hwdownload before CPU pad")
+	require.Contains(t, got, "format=nv12")
+	require.Contains(t, got, "pad=", "must use CPU pad filter")
+	require.Contains(t, got, "hwupload_cuda", "must re-upload to VRAM for the encoder")
+	require.NotContains(t, got, "pad_cuda", "pad_cuda is intentionally never emitted")
 }
 
 func TestDeinterlaceFilter(t *testing.T) {

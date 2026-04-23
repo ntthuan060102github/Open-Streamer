@@ -35,9 +35,9 @@ var (
 	filtersOnce sync.Once
 	filterSet   map[string]bool
 
-	cudaOnce      sync.Once
-	cudaWorks     bool
-	cudaProbeMsg  string
+	cudaOnce     sync.Once
+	cudaWorks    bool
+	cudaProbeMsg string
 )
 
 func locateFFmpeg(t *testing.T) string {

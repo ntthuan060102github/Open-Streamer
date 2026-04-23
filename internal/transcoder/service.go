@@ -345,7 +345,54 @@ func (s *Service) updateMetrics(streamID domain.StreamCode, sw *streamWorker) {
 	s.m.TranscoderQualitiesActive.WithLabelValues(string(streamID)).Set(n)
 }
 
-func (s *Service) logStderr(streamID domain.StreamCode, profile string, r io.Reader) {
+// stderrTail is a bounded ring of the last N "interesting" stderr lines —
+// the warn-level fraction that survives logStderr's noise filter. runOnce
+// reads the snapshot on crash to enrich the otherwise-opaque exit-status
+// error ("exit status 8" → plus the actual filter / encoder error message).
+type stderrTail struct {
+	mu    sync.Mutex
+	lines []string
+	cap   int
+}
+
+const stderrTailCap = 8
+
+func newStderrTail(cap int) *stderrTail {
+	return &stderrTail{cap: cap}
+}
+
+func (t *stderrTail) push(line string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.lines) >= t.cap {
+		copy(t.lines, t.lines[1:])
+		t.lines[t.cap-1] = line
+		return
+	}
+	t.lines = append(t.lines, line)
+}
+
+func (t *stderrTail) snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, len(t.lines))
+	copy(out, t.lines)
+	return out
+}
+
+// formatStderrTail joins lines with " | " for compact one-line embedding in
+// error messages. Returns "" when no lines were captured.
+func formatStderrTail(lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, " | ")
+}
+
+// logStderr scans FFmpeg stderr, filters out known-benign noise (packet/PPS/
+// MMCO debug spam) at debug level, surfaces real errors at warn, and pushes
+// every warn-level line into tail (when non-nil) for crash diagnostics.
+func (s *Service) logStderr(streamID domain.StreamCode, profile string, r io.Reader, tail *stderrTail) {
 	sc := bufio.NewScanner(r)
 	const maxLine = 64 * 1024
 	buf := make([]byte, maxLine)
@@ -380,6 +427,9 @@ func (s *Service) logStderr(streamID domain.StreamCode, profile string, r io.Rea
 			strings.Contains(line, "Missing reference picture") {
 			slog.Debug("transcoder: ffmpeg stderr", "stream_code", streamID, "profile", profile, "msg", line)
 			continue
+		}
+		if tail != nil {
+			tail.push(line)
 		}
 		slog.Warn("transcoder: ffmpeg stderr", "stream_code", streamID, "profile", profile, "msg", line)
 	}

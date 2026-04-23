@@ -146,7 +146,7 @@ func TestScenario_VideoReencodeNoHW_AudioCopy_EmptyCodecRoutesLibx264(t *testing
 		Audio:  domain.AudioTranscodeConfig{Copy: true},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
-	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}
+	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
 
@@ -288,7 +288,7 @@ func TestScenario_FullReencodeNoHW_DefaultsBothSides(t *testing.T) {
 		Audio:  domain.AudioTranscodeConfig{},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
-	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}
+	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
 	require.Equal(t, "libx264", argAfter(args, "-c:v"))
@@ -332,9 +332,11 @@ func TestScenario_MultipleProfiles_OnlyFirstUsed(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{
-		{Width: 1920, Height: 1080, Bitrate: "4500k", Codec: "h264", Preset: "p5"},
-		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "p4"},
-		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264", Preset: "p3"},
+		// fit mode keeps the chain fully in VRAM; pad mode would round-trip
+		// through CPU pad, breaking the scale_cuda assertion below.
+		{Width: 1920, Height: 1080, Bitrate: "4500k", Codec: "h264", Preset: "p5", ResizeMode: string(domain.ResizeModeFit)},
+		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "p4", ResizeMode: string(domain.ResizeModeFit)},
+		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264", Preset: "p3", ResizeMode: string(domain.ResizeModeFit)},
 	}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
@@ -380,7 +382,7 @@ func TestScenario_GlobalFPSFallback(t *testing.T) {
 		Audio:  domain.AudioTranscodeConfig{Copy: true},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone, FPS: 25},
 	}
-	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}
+	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
 	require.Equal(t, "25", argAfter(args, "-r"),
@@ -513,7 +515,7 @@ func TestScenario_NVENC_FullGPUPipeline(t *testing.T) {
 		Audio:  domain.AudioTranscodeConfig{Copy: true},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
-	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}
+	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
 
@@ -552,7 +554,7 @@ func TestScenario_NVENC_HEVC_FullGPUPipeline(t *testing.T) {
 		Audio:  domain.AudioTranscodeConfig{Copy: true},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
-	p := []Profile{{Width: 1920, Height: 1080, Bitrate: "3500k", Codec: "h265"}}
+	p := []Profile{{Width: 1920, Height: 1080, Bitrate: "3500k", Codec: "h265", ResizeMode: string(domain.ResizeModeFit)}}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
 	require.Equal(t, "cuda", argAfter(args, "-hwaccel"))
@@ -615,7 +617,7 @@ func TestScenario_NoHW_NoHWAccelFlags(t *testing.T) {
 		Audio:  domain.AudioTranscodeConfig{Copy: true},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
-	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}
+	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
 	args, err := buildFFmpegArgs(p, tc)
 	require.NoError(t, err)
 	require.NotContains(t, args, "-hwaccel")
