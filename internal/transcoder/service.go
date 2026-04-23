@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
@@ -41,9 +43,93 @@ type Profile struct {
 }
 
 // profileWorker tracks a single FFmpeg encoder process (one ABR ladder rung).
+// restartCount and errors are mutated under streamWorker.mu and read by RuntimeStatus.
+// Both reset on Stop() (the whole streamWorker is dropped).
 type profileWorker struct {
-	cancel context.CancelFunc
-	done   chan struct{} // closed when the goroutine exits
+	cancel       context.CancelFunc
+	done         chan struct{} // closed when the goroutine exits
+	restartCount int
+	errors       []domain.ErrorEntry // newest at index 0; capped at maxProfileErrorHistory
+}
+
+const maxProfileErrorHistory = 5
+
+// recordProfileErrorEntry prepends an entry, capped at maxProfileErrorHistory.
+// Caller must hold the parent streamWorker.mu.
+func recordProfileErrorEntry(pw *profileWorker, msg string, at time.Time) {
+	e := domain.ErrorEntry{Message: msg, At: at}
+	if len(pw.errors) >= maxProfileErrorHistory {
+		copy(pw.errors[1:], pw.errors[:maxProfileErrorHistory-1])
+		pw.errors[0] = e
+		return
+	}
+	pw.errors = append([]domain.ErrorEntry{e}, pw.errors...)
+}
+
+// ProfileSnapshot is a serialisable copy of one profile encoder's runtime state.
+// Errors is a bounded rolling history (newest first) of FFmpeg crash messages
+// captured for this profile since the stream started.
+type ProfileSnapshot struct {
+	Index        int                 `json:"index"` // 0-based ladder index; track label = track_<index+1>
+	Track        string              `json:"track"`
+	RestartCount int                 `json:"restart_count"`
+	Errors       []domain.ErrorEntry `json:"errors,omitempty"`
+}
+
+// RuntimeStatus is a JSON-safe snapshot of transcoder state for one stream.
+type RuntimeStatus struct {
+	Profiles []ProfileSnapshot `json:"profiles"`
+}
+
+// RuntimeStatus returns a snapshot of per-profile encoder state.
+// Returns ok=false if the stream has no transcoder pipeline running.
+func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool) {
+	s.mu.Lock()
+	sw, ok := s.workers[streamID]
+	s.mu.Unlock()
+	if !ok {
+		return RuntimeStatus{}, false
+	}
+
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
+	out := RuntimeStatus{Profiles: make([]ProfileSnapshot, 0, len(sw.profiles))}
+	for idx, pw := range sw.profiles {
+		snap := ProfileSnapshot{
+			Index:        idx,
+			Track:        buffer.VideoTrackSlug(idx),
+			RestartCount: pw.restartCount,
+		}
+		if len(pw.errors) > 0 {
+			snap.Errors = make([]domain.ErrorEntry, len(pw.errors))
+			copy(snap.Errors, pw.errors)
+		}
+		out.Profiles = append(out.Profiles, snap)
+	}
+	sort.Slice(out.Profiles, func(i, j int) bool { return out.Profiles[i].Index < out.Profiles[j].Index })
+	return out, true
+}
+
+// recordProfileError appends a crash entry to the profile's history and bumps
+// restartCount. Safe to call from runProfileEncoder's retry loop. No-op if the
+// stream worker has been stopped (sw removed from s.workers) or the profile
+// has been stopped individually (pw removed from sw.profiles).
+func (s *Service) recordProfileError(streamID domain.StreamCode, profileIndex int, msg string) {
+	s.mu.Lock()
+	sw, ok := s.workers[streamID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	pw, ok := sw.profiles[profileIndex]
+	if !ok {
+		return
+	}
+	pw.restartCount++
+	recordProfileErrorEntry(pw, msg, time.Now())
 }
 
 // streamWorker holds all profile encoders for one stream.

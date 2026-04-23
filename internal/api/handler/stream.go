@@ -13,6 +13,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/manager"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/samber/do/v2"
 )
 
@@ -21,6 +22,7 @@ type StreamHandler struct {
 	streamRepo  store.StreamRepository
 	coordinator *coordinator.Coordinator
 	manager     *manager.Service
+	transcoder  *transcoder.Service
 	bus         events.Bus
 }
 
@@ -29,9 +31,10 @@ type StreamHandler struct {
 // overlays runtime-computed fields so clients always see the live state.
 type streamResponse struct {
 	*domain.Stream
-	Status         domain.StreamStatus    `json:"status"`
-	PipelineActive bool                   `json:"pipeline_active"`
-	Runtime        *manager.RuntimeStatus `json:"runtime,omitempty"`
+	Status         domain.StreamStatus       `json:"status"`
+	PipelineActive bool                      `json:"pipeline_active"`
+	Runtime        *manager.RuntimeStatus    `json:"runtime,omitempty"`
+	Transcoder     *transcoder.RuntimeStatus `json:"transcoder,omitempty"`
 }
 
 func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
@@ -43,6 +46,9 @@ func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
 		resp.PipelineActive = true
 		resp.Runtime = &rt
 	}
+	if tc, ok := h.transcoder.RuntimeStatus(s.Code); ok {
+		resp.Transcoder = &tc
+	}
 	return resp
 }
 
@@ -52,6 +58,7 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 		streamRepo:  do.MustInvoke[store.StreamRepository](i),
 		coordinator: do.MustInvoke[*coordinator.Coordinator](i),
 		manager:     do.MustInvoke[*manager.Service](i),
+		transcoder:  do.MustInvoke[*transcoder.Service](i),
 		bus:         do.MustInvoke[events.Bus](i),
 	}, nil
 }

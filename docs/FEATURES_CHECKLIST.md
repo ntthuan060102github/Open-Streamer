@@ -72,6 +72,7 @@ Legend for **Completion**:
 | Pull — UDP / MPEG-TS | Complete | Unicast + multicast; auto-strip RTP header; OS-assigned port for tests |
 | Pull — File (`.ts`, `.mp4`, `.flv`) | Complete | Loop mode; paced playback to simulate real-time |
 | Pull — S3 | Complete | GetObject stream; S3-compatible via `?endpoint=` |
+| Pull — `copy://<code>` (in-process stream copy) | Planned | Subscribes to another stream's `PlaybackBufferID` (best rendition if ABR, raw otherwise). Cycle detection + failover via existing input priority. See [PLAN_COPY_PROTOCOL.md](./PLAN_COPY_PROTOCOL.md). |
 | Push — RTMP listen (:1935) | Complete | Shared RTMP relay → loopback pull worker → Buffer Hub |
 | Push — SRT listen (:9999) | Complete | streamid `live/<code>` → registry → Buffer Hub |
 | Configurable write target (raw vs main buffer) | Complete | `mediaBufferID` passed from coordinator |
@@ -265,4 +266,4 @@ Legend for **Completion**:
 
 ---
 
-*Updated 2026-04-21. Reflects hot-reload (coordinator.Update + diff engine), per-profile transcoder lifecycle, per-protocol publisher lifecycle, RTMP push-out hardened (FMLE handshake + RTMPS + publish.start gating), and integration test coverage.*
+*Updated 2026-04-23. Adds planned `copy://` ingest protocol (see [PLAN_COPY_PROTOCOL.md](./PLAN_COPY_PROTOCOL.md)). Previous note: hot-reload (coordinator.Update + diff engine), per-profile transcoder lifecycle, per-protocol publisher lifecycle, RTMP push-out hardened (FMLE handshake + RTMPS + publish.start gating), and integration test coverage.*

@@ -54,8 +54,24 @@ type InputHealth struct {
 	Bitrate      float64 // kbps (reserved for future bitrate estimator)
 	PacketLoss   float64 // percent (reserved)
 	Status       domain.StreamStatus
-	LastError    string    // last reason the input went degraded; cleared on recovery
-	LastErrorAt  time.Time // when LastError was set; zero value when no error
+	// Errors is a bounded rolling history (newest at index 0, max maxInputErrorHistory).
+	// Persists for the lifetime of the manager registration — cleared only when
+	// the stream pipeline is stopped/restarted (Unregister drops the whole state).
+	Errors []domain.ErrorEntry
+}
+
+const maxInputErrorHistory = 5
+
+// recordInputError prepends an entry, capped at maxInputErrorHistory.
+// Caller must hold the parent streamState.mu.
+func recordInputError(h *InputHealth, msg string, at time.Time) {
+	e := domain.ErrorEntry{Message: msg, At: at}
+	if len(h.Errors) >= maxInputErrorHistory {
+		copy(h.Errors[1:], h.Errors[:maxInputErrorHistory-1])
+		h.Errors[0] = e
+		return
+	}
+	h.Errors = append([]domain.ErrorEntry{e}, h.Errors...)
 }
 
 // streamState holds all monitoring data for a single stream.
@@ -99,17 +115,18 @@ type RuntimeStatus struct {
 }
 
 // InputHealthSnapshot is a serialisable copy of one input's health.
-// LastError carries a human-readable reason the input most recently went
-// degraded (packet timeout, ingestor error, …); it is cleared when the input
-// recovers. Frontend should treat it as a diagnostic string, not a code.
+// Errors is a bounded rolling history (newest first, max maxInputErrorHistory)
+// of human-readable failure reasons (packet timeout, ingestor error, …).
+// History persists for the lifetime of the manager registration and is only
+// cleared when the stream pipeline is stopped. Frontend should treat each
+// message as a diagnostic string, not a code.
 type InputHealthSnapshot struct {
-	InputPriority int                 `json:"input_priority"`
-	LastPacketAt  time.Time           `json:"last_packet_at"`
-	BitrateKbps   float64             `json:"bitrate_kbps"`
-	PacketLoss    float64             `json:"packet_loss"`
-	Status        domain.StreamStatus `json:"status"`
-	LastError     string              `json:"last_error,omitempty"`
-	LastErrorAt   *time.Time          `json:"last_error_at,omitempty"`
+	InputPriority int                  `json:"input_priority"`
+	LastPacketAt  time.Time            `json:"last_packet_at"`
+	BitrateKbps   float64              `json:"bitrate_kbps"`
+	PacketLoss    float64              `json:"packet_loss"`
+	Status        domain.StreamStatus  `json:"status"`
+	Errors        []domain.ErrorEntry  `json:"errors,omitempty"`
 }
 
 // probeTask carries the arguments for a background probe goroutine.
@@ -275,11 +292,11 @@ func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool
 			BitrateKbps:   h.Bitrate,
 			PacketLoss:    h.PacketLoss,
 			Status:        h.Status,
-			LastError:     h.LastError,
 		}
-		if !h.LastErrorAt.IsZero() {
-			t := h.LastErrorAt
-			snap.LastErrorAt = &t
+		if len(h.Errors) > 0 {
+			// Defensive copy — caller must not see future mutations under state.mu.
+			snap.Errors = make([]domain.ErrorEntry, len(h.Errors))
+			copy(snap.Errors, h.Errors)
 		}
 		out.Inputs = append(out.Inputs, snap)
 	}
@@ -303,8 +320,7 @@ func (s *Service) RecordPacket(streamID domain.StreamCode, inputPriority int) {
 			h.LastPacketAt = now
 			if h.Status != domain.StatusActive {
 				h.Status = domain.StatusActive
-				h.LastError = ""
-				h.LastErrorAt = time.Time{}
+				// Errors history is preserved across recovery; only cleared on Stop/Unregister.
 				delete(state.degradedAt, inputPriority)
 				s.m.ManagerInputHealth.WithLabelValues(string(streamID), strconv.Itoa(inputPriority)).Set(1)
 			}
@@ -335,8 +351,7 @@ func (s *Service) ReportInputError(streamID domain.StreamCode, inputPriority int
 		return
 	}
 	h.Status = domain.StatusDegraded
-	h.LastError = err.Error()
-	h.LastErrorAt = now
+	recordInputError(h, err.Error(), now)
 	state.degradedAt[inputPriority] = now
 	state.mu.Unlock()
 
@@ -429,8 +444,7 @@ func (s *Service) collectTimeoutIfNeeded(
 		return
 	}
 	h.Status = domain.StatusDegraded
-	h.LastError = fmt.Sprintf("no packet for %s (timeout %s)", now.Sub(h.LastPacketAt).Truncate(time.Second), timeout)
-	h.LastErrorAt = now
+	recordInputError(h, fmt.Sprintf("no packet for %s (timeout %s)", now.Sub(h.LastPacketAt).Truncate(time.Second), timeout), now)
 	state.degradedAt[priority] = now
 	*timedOut = priority
 }

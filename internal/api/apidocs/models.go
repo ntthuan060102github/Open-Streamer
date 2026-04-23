@@ -3,6 +3,8 @@ package apidocs
 
 import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
 )
 
@@ -14,18 +16,20 @@ type ErrorBody struct {
 	} `json:"error"`
 }
 
-// StreamRuntime holds live pipeline state overlaid on the persisted stream config.
-// Null when the pipeline is not running.
-type StreamRuntime struct {
-	ActiveInputPriority int `json:"active_input_priority"`
-}
-
-// StreamResponse is the API representation of a stream returned by GET /streams and GET /streams/{code}.
-// It adds runtime-computed fields on top of the persisted configuration.
+// StreamResponse is the API representation of a stream returned by GET /streams
+// and GET /streams/{code}. It adds runtime-computed fields on top of the
+// persisted configuration:
+//
+//   - runtime    — manager state: active input, per-input health + last 5 errors
+//   - transcoder — per-profile FFmpeg state: restart count + last 5 crash errors
+//
+// Both `runtime` and `transcoder` are null until the pipeline is running.
 type StreamResponse struct {
 	domain.Stream
-	Status  domain.StreamStatus `json:"status"`
-	Runtime *StreamRuntime      `json:"runtime"`
+	Status         domain.StreamStatus       `json:"status"`
+	PipelineActive bool                      `json:"pipeline_active"`
+	Runtime        *manager.RuntimeStatus    `json:"runtime,omitempty"`
+	Transcoder     *transcoder.RuntimeStatus `json:"transcoder,omitempty"`
 }
 
 // StreamData wraps a single stream response.

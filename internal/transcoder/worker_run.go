@@ -2,6 +2,7 @@ package transcoder
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
@@ -61,7 +62,7 @@ func (s *Service) runProfileEncoder(
 	attempt := 0
 
 	for {
-		crashed := s.runOnce(ctx, logStream, outBufferID, track, sub, args)
+		crashed, runErr := s.runOnce(ctx, logStream, outBufferID, track, sub, args)
 		if ctx.Err() != nil {
 			return // clean shutdown
 		}
@@ -71,6 +72,11 @@ func (s *Service) runProfileEncoder(
 
 		attempt++
 		fatal := maxRestarts > 0 && attempt >= maxRestarts
+		errMsg := "ffmpeg crashed"
+		if runErr != nil {
+			errMsg = runErr.Error()
+		}
+		s.recordProfileError(logStream, profileIndex, errMsg)
 		//nolint:contextcheck // ctx may be cancelled after crash; publish must outlive it
 		s.bus.Publish(context.Background(), domain.Event{
 			Type:       domain.EventTranscoderError,
@@ -80,6 +86,7 @@ func (s *Service) runProfileEncoder(
 				"attempt":        attempt,
 				"fatal":          fatal,
 				"restart_in_sec": delay.Seconds(),
+				"error":          errMsg,
 			},
 		})
 
@@ -116,7 +123,8 @@ func (s *Service) runProfileEncoder(
 }
 
 // runOnce spawns one FFmpeg process and blocks until it exits.
-// Returns true if FFmpeg exited unexpectedly (crash), false on a clean/expected exit.
+// Returns crashed=true with a descriptive error if FFmpeg exited unexpectedly;
+// crashed=false with nil err on a clean/expected exit.
 func (s *Service) runOnce(
 	ctx context.Context,
 	logStream domain.StreamCode,
@@ -124,7 +132,7 @@ func (s *Service) runOnce(
 	track string,
 	sub *buffer.Subscriber,
 	args []string,
-) (crashed bool) {
+) (crashed bool, err error) {
 	cmd := exec.CommandContext(ctx, s.cfg.FFmpegPath, args...)
 	// Copy-pasteable command for ad-hoc reproduction. Debug level so it stays
 	// out of normal logs (filter chains with pad expressions are noisy).
@@ -136,22 +144,22 @@ func (s *Service) runOnce(
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		slog.Error("transcoder: stdin pipe failed", "stream_code", logStream, "profile", track, "err", err)
-		return true
+		return true, fmt.Errorf("stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		slog.Error("transcoder: stdout pipe failed", "stream_code", logStream, "profile", track, "err", err)
-		return true
+		return true, fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		slog.Error("transcoder: stderr pipe failed", "stream_code", logStream, "profile", track, "err", err)
-		return true
+		return true, fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		slog.Error("transcoder: ffmpeg start failed", "stream_code", logStream, "profile", track, "err", err)
-		return true
+		return true, fmt.Errorf("ffmpeg start: %w", err)
 	}
 
 	slog.Info("transcoder: profile encoder started",
@@ -228,9 +236,9 @@ func (s *Service) runOnce(
 
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		slog.Error("transcoder: ffmpeg exited with error", "stream_code", logStream, "profile", track, "err", err)
-		return true // crashed
+		return true, fmt.Errorf("ffmpeg exit: %w", err)
 	}
-	return false
+	return false, nil
 }
 
 func minDuration(a, b time.Duration) time.Duration {
