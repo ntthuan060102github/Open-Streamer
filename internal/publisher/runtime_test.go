@@ -58,6 +58,42 @@ func TestSetPushStatus_StampsConnectedAtOnActive(t *testing.T) {
 	require.True(t, !rt.Pushes[0].ConnectedAt.Before(before) && !rt.Pushes[0].ConnectedAt.After(after))
 }
 
+// Successful reconnect (transition to Active) clears the rolling error
+// history so the UI doesn't simultaneously show "ACTIVE" with a stale
+// "5 errors" badge. Errors only persist while the destination is unhealthy.
+func TestSetPushStatus_ActiveClearsErrors(t *testing.T) {
+	t.Parallel()
+	s := newPushTestService()
+
+	s.recordPushError("test1", "rtmp://a/key", "handshake fail")
+	s.recordPushError("test1", "rtmp://a/key", "tls timeout")
+	s.setPushStatus("test1", "rtmp://a/key", PushStatusReconnecting)
+
+	rt, _ := s.RuntimeStatus("test1")
+	require.Len(t, rt.Pushes[0].Errors, 2, "errors visible while reconnecting")
+
+	// Reconnect succeeds → enter Active.
+	s.setPushStatus("test1", "rtmp://a/key", PushStatusActive)
+	rt, _ = s.RuntimeStatus("test1")
+	require.Empty(t, rt.Pushes[0].Errors, "Active transition must wipe stale error history")
+	require.NotNil(t, rt.Pushes[0].ConnectedAt, "connected_at still stamped")
+}
+
+// Non-Active transitions must NOT clear the error history.
+func TestSetPushStatus_NonActiveKeepsErrors(t *testing.T) {
+	t.Parallel()
+	s := newPushTestService()
+	s.recordPushError("test1", "rtmp://a/key", "fail-1")
+
+	s.setPushStatus("test1", "rtmp://a/key", PushStatusReconnecting)
+	rt, _ := s.RuntimeStatus("test1")
+	require.Len(t, rt.Pushes[0].Errors, 1, "Reconnecting must keep history")
+
+	s.setPushStatus("test1", "rtmp://a/key", PushStatusFailed)
+	rt, _ = s.RuntimeStatus("test1")
+	require.Len(t, rt.Pushes[0].Errors, 1, "Failed must keep history (final state — debug context)")
+}
+
 // removePushState clears the entry so a stopped destination disappears from
 // the API. Cleans up parent map too when last URL for stream goes away.
 func TestRemovePushState_CleansUp(t *testing.T) {

@@ -81,14 +81,22 @@ func (s *Service) getOrCreatePushState(streamID domain.StreamCode, url string) *
 	return st
 }
 
-// setPushStatus updates the status. Entering Active also stamps connectedAt
-// so the API can show how long the current session has held up.
+// setPushStatus updates the status. Entering Active also:
+//   - stamps connectedAt so the API can show session uptime
+//   - clears the error history because past failures are now resolved (server
+//     came back, network healed, etc.) and leaving them stuck on the UI
+//     would misleadingly suggest the destination is still in trouble
+//
+// This differs from the input/transcoder error history (which persists for
+// the lifetime of the registration) — for pushes the user wants a clean
+// slate per healthy session.
 func (s *Service) setPushStatus(streamID domain.StreamCode, url string, status PushStatus) {
 	st := s.getOrCreatePushState(streamID, url)
 	st.mu.Lock()
 	st.status = status
 	if status == PushStatusActive {
 		st.connectedAt = time.Now()
+		st.errors = nil
 	}
 	st.mu.Unlock()
 }
