@@ -34,6 +34,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
 	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
+	"github.com/q191201771/naza/pkg/nazalog"
 	"github.com/samber/do/v2"
 )
 
@@ -75,6 +76,14 @@ func run() error {
 	if gcfg.Log != nil {
 		slog.SetDefault(logger.New(*gcfg.Log))
 	}
+
+	// Silence lal's nazalog INFO-level chatter (every RTMP "Acknowledgement"
+	// and lifecycle line) — keep warn/error so real failures still surface.
+	// Without this the journalctl tail is dominated by per-second ack lines
+	// from each push session, drowning out our own structured slog output.
+	_ = nazalog.Init(func(o *nazalog.Option) {
+		o.Level = nazalog.LevelWarn
+	})
 
 	// 5. Wire all services.
 	wireServices(injector)

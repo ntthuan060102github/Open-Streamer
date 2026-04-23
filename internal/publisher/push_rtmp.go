@@ -59,7 +59,6 @@ import (
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/q191201771/lal/pkg/base"
-	"github.com/q191201771/lal/pkg/remux"
 	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
@@ -92,11 +91,12 @@ type rtmpPushPackager struct {
 	onPublishStart func()
 
 	session *rtmp.PushSession
-	remuxer *remux.AvPacket2RtmpRemuxer
+	codec   *pushCodecAdapter
 
-	// Base DTS for relative timestamps. TS demuxer emits 90 kHz ticks; lal
-	// expects ms. baseDTS captures the first frame's DTS so the published
-	// timeline starts at 0 regardless of source clock origin.
+	// Base DTS for relative timestamps. mpeg2.TSDemuxer already converts
+	// 90 kHz ticks to ms before calling onTSFrame; baseDTS captures the
+	// first frame's value so the published timeline starts at 0 regardless
+	// of source clock origin.
 	baseDTS    int64
 	baseDTSSet bool
 
@@ -253,16 +253,11 @@ func (p *rtmpPushPackager) connect(ctx context.Context) error {
 
 	// Wire the codec → FLV tag → RtmpMsg adapter. SPS/PPS and AAC ASC are
 	// extracted from the input stream itself and emitted as sequence headers
-	// the first time they appear.
-	p.remuxer = remux.NewAvPacket2RtmpRemuxer().WithOnRtmpMsg(func(msg base.RtmpMsg) {
-		if werr := p.session.WriteMsg(msg); werr != nil {
-			p.failConn(fmt.Errorf("write rtmp msg: %w", werr))
-		}
-	})
-	p.remuxer.WithOption(func(o *base.AvPacketStreamOption) {
-		// TS demuxer emits Annex-B for video and ADTS-prefixed AAC for audio.
-		o.VideoFormat = base.AvPacketStreamVideoFormatAnnexb
-		o.AudioFormat = base.AvPacketStreamAudioFormatAdtsAac
+	// the first time they appear. composition_time = (PTS - DTS) is preserved
+	// so B-frames render correctly at the receiver — see push_codec.go for
+	// rationale (lal's high-level remuxer drops PTS).
+	p.codec = newPushCodecAdapter(func(msg base.RtmpMsg) error {
+		return p.session.WriteMsg(msg)
 	})
 
 	return nil
@@ -304,19 +299,12 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 }
 
 // onTSFrame is the TSDemuxer callback; runs in the demuxer goroutine.
-// Converts the demuxed frame into a base.AvPacket and feeds the lal remuxer.
+// Dispatches by stream type to the codec adapter, which composes the FLV
+// tag (with proper composition_time for B-frames) and writes via lal.
+//
+//nolint:exhaustive // RTMP push only carries H.264 + AAC; H.265 needs Enhanced RTMP, MP3 unsupported by most ingest servers
 func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
 	if p.connErr.Load() != nil || len(frame) == 0 {
-		return
-	}
-
-	var pt base.AvPacketPt
-	switch cid { //nolint:exhaustive // RTMP push only carries H.264 video and AAC audio; H.265 needs Enhanced RTMP, MP3 unsupported by most ingest servers
-	case mpeg2.TS_STREAM_H264:
-		pt = base.AvPacketPtAvc
-	case mpeg2.TS_STREAM_AAC:
-		pt = base.AvPacketPtAac
-	default:
 		return
 	}
 
@@ -326,10 +314,7 @@ func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 	}
 	// mpeg2.TSDemuxer.OnFrame already converts MPEG-TS 90 kHz ticks to ms
 	// before calling us (see ts-demuxer.go: `stream.pkg.pts/90`). Do NOT
-	// divide again here — that's the bug that caused YouTube/Flussonic to
-	// receive frames with timestamps 90× too small, decoder treats them as
-	// all-at-once and only renders the seed frame.
-	// Clamp negatives to 0 to absorb any out-of-order frames near the base.
+	// divide again here.
 	relDTS := int64(dts) - p.baseDTS
 	if relDTS < 0 {
 		relDTS = 0
@@ -339,12 +324,18 @@ func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		relPTS = 0
 	}
 
-	p.remuxer.FeedAvPacket(base.AvPacket{
-		PayloadType: pt,
-		Timestamp:   relDTS,
-		Pts:         relPTS,
-		Payload:     frame,
-	})
+	var err error
+	switch cid {
+	case mpeg2.TS_STREAM_H264:
+		err = p.codec.FeedH264(frame, relDTS, relPTS)
+	case mpeg2.TS_STREAM_AAC:
+		err = p.codec.FeedAAC(frame, relDTS)
+	default:
+		return
+	}
+	if err != nil {
+		p.failConn(fmt.Errorf("write rtmp msg: %w", err))
+	}
 }
 
 // closeConn disposes the lal session exactly once. Safe from multiple
