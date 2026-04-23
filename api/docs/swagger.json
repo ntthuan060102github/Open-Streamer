@@ -2322,6 +2322,33 @@
                 }
             }
         },
+        "domain.InterlaceMode": {
+            "type": "string",
+            "enum": [
+                "auto",
+                "tff",
+                "bff",
+                "progressive"
+            ],
+            "x-enum-comments": {
+                "InterlaceAuto": "detect parity each frame",
+                "InterlaceBottomField": "bottom field first (legacy DV)",
+                "InterlaceProgressive": "assert source is progressive — skip filter",
+                "InterlaceTopField": "top field first (BBC HD, most ATSC)"
+            },
+            "x-enum-descriptions": [
+                "detect parity each frame",
+                "top field first (BBC HD, most ATSC)",
+                "bottom field first (legacy DV)",
+                "assert source is progressive — skip filter"
+            ],
+            "x-enum-varnames": [
+                "InterlaceAuto",
+                "InterlaceTopField",
+                "InterlaceBottomField",
+                "InterlaceProgressive"
+            ]
+        },
         "domain.OutputProtocols": {
             "type": "object",
             "properties": {
@@ -2438,6 +2465,33 @@
                 "RecordingStatusRecording",
                 "RecordingStatusStopped",
                 "RecordingStatusFailed"
+            ]
+        },
+        "domain.ResizeMode": {
+            "type": "string",
+            "enum": [
+                "pad",
+                "crop",
+                "stretch",
+                "fit"
+            ],
+            "x-enum-comments": {
+                "ResizeModeCrop": "fill: keep aspect, crop excess",
+                "ResizeModeFit": "keep aspect, no padding (output may be smaller than W:H)",
+                "ResizeModePad": "letterbox: keep aspect, fill remainder with black",
+                "ResizeModeStretch": "distort: scale to W:H, ignore source aspect"
+            },
+            "x-enum-descriptions": [
+                "letterbox: keep aspect, fill remainder with black",
+                "fill: keep aspect, crop excess",
+                "distort: scale to W:H, ignore source aspect",
+                "keep aspect, no padding (output may be smaller than W:H)"
+            ],
+            "x-enum-varnames": [
+                "ResizeModePad",
+                "ResizeModeCrop",
+                "ResizeModeStretch",
+                "ResizeModeFit"
             ]
         },
         "domain.StreamCodeFilter": {
@@ -2622,6 +2676,10 @@
         "domain.VideoProfile": {
             "type": "object",
             "properties": {
+                "bframes": {
+                    "description": "Bframes is the number of consecutive B-frames the encoder may emit.\nnil = encoder default; 0 = explicit none (low-latency live);\n2-3 = typical VOD; NVENC HW B-ref pyramid is auto-enabled when \u003e0.",
+                    "type": "integer"
+                },
                 "bitrate": {
                     "description": "Bitrate is the target video bitrate in kbps. 0 = encoder auto.",
                     "type": "integer"
@@ -2656,6 +2714,22 @@
                     "description": "Profile controls the H.264/H.265 encoding profile.\n\"baseline\" | \"main\" | \"high\" (H.264); \"main\" | \"main10\" (H.265)",
                     "type": "string"
                 },
+                "refs": {
+                    "description": "Refs is the number of reference frames. nil = encoder default.\nHigher = better compression at cost of CPU/latency. NVENC has its own caps.",
+                    "type": "integer"
+                },
+                "resize_mode": {
+                    "description": "ResizeMode chooses how the source is fitted to Width/Height.\n\"\" defaults to ResizeModePad.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.ResizeMode"
+                        }
+                    ]
+                },
+                "sar": {
+                    "description": "SAR is the output Sample Aspect Ratio, \"N:M\". \"\" = inherit from source.\nUse \"1:1\" for square pixels (web); \"16:11\", \"59:54\" etc. for anamorphic.",
+                    "type": "string"
+                },
                 "width": {
                     "description": "Width and Height define the output resolution.\nSet to 0 to keep the source dimensions (Width=0 \u0026 Height=0 = no scaling).",
                     "type": "integer"
@@ -2668,6 +2742,14 @@
                 "copy": {
                     "description": "Copy copies origin video without re-encoding.",
                     "type": "boolean"
+                },
+                "interlace": {
+                    "description": "Interlace selects the deinterlace pre-filter applied before scaling.\nApplies once per FFmpeg subprocess (i.e. per profile in the ABR ladder).\n\"\" disables the filter; use ResizeModeProgressive to assert progressive source.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.InterlaceMode"
+                        }
+                    ]
                 },
                 "profiles": {
                     "description": "Profiles defines ABR renditions when re-encoding.",
