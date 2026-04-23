@@ -1637,6 +1637,9 @@ const docTemplate = `{
                 "name": {
                     "type": "string"
                 },
+                "pipeline_active": {
+                    "type": "boolean"
+                },
                 "protocols": {
                     "description": "Protocols defines which delivery protocols are opened for this stream.\nThe server opens a listener/packager for each enabled protocol.\nProtocol-level config (ports, segment duration, CDN URL) lives in server config.",
                     "allOf": [
@@ -1653,7 +1656,7 @@ const docTemplate = `{
                     }
                 },
                 "runtime": {
-                    "$ref": "#/definitions/apidocs.StreamRuntime"
+                    "$ref": "#/definitions/manager.RuntimeStatus"
                 },
                 "status": {
                     "$ref": "#/definitions/domain.StreamStatus"
@@ -1677,12 +1680,7 @@ const docTemplate = `{
                     ]
                 },
                 "transcoder": {
-                    "description": "Transcoder controls encoding/decoding settings.\nnil means no transcoding for this stream.",
-                    "allOf": [
-                        {
-                            "$ref": "#/definitions/domain.TranscoderConfig"
-                        }
-                    ]
+                    "$ref": "#/definitions/transcoder.RuntimeStatus"
                 },
                 "watermark": {
                     "description": "Watermark is an optional text or image overlay applied before encoding.",
@@ -1691,14 +1689,6 @@ const docTemplate = `{
                             "$ref": "#/definitions/domain.WatermarkConfig"
                         }
                     ]
-                }
-            }
-        },
-        "apidocs.StreamRuntime": {
-            "type": "object",
-            "properties": {
-                "active_input_priority": {
-                    "type": "integer"
                 }
             }
         },
@@ -2068,6 +2058,17 @@ const docTemplate = `{
             "properties": {
                 "name": {
                     "description": "Name is the FFmpeg decoder name.\n\"\" = let FFmpeg choose automatically.\nExamples: \"h264_cuvid\", \"h264_qsv\".",
+                    "type": "string"
+                }
+            }
+        },
+        "domain.ErrorEntry": {
+            "type": "object",
+            "properties": {
+                "at": {
+                    "type": "string"
+                },
+                "message": {
                     "type": "string"
                 }
             }
@@ -2844,6 +2845,84 @@ const docTemplate = `{
                 "WatermarkTypeText",
                 "WatermarkTypeImage"
             ]
+        },
+        "manager.InputHealthSnapshot": {
+            "type": "object",
+            "properties": {
+                "bitrate_kbps": {
+                    "type": "number"
+                },
+                "errors": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.ErrorEntry"
+                    }
+                },
+                "input_priority": {
+                    "type": "integer"
+                },
+                "last_packet_at": {
+                    "type": "string"
+                },
+                "packet_loss": {
+                    "type": "number"
+                },
+                "status": {
+                    "$ref": "#/definitions/domain.StreamStatus"
+                }
+            }
+        },
+        "manager.RuntimeStatus": {
+            "type": "object",
+            "properties": {
+                "active_input_priority": {
+                    "type": "integer"
+                },
+                "exhausted": {
+                    "type": "boolean"
+                },
+                "inputs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/manager.InputHealthSnapshot"
+                    }
+                },
+                "override_input_priority": {
+                    "type": "integer"
+                }
+            }
+        },
+        "transcoder.ProfileSnapshot": {
+            "type": "object",
+            "properties": {
+                "errors": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.ErrorEntry"
+                    }
+                },
+                "index": {
+                    "description": "0-based ladder index; track label = track_\u003cindex+1\u003e",
+                    "type": "integer"
+                },
+                "restart_count": {
+                    "type": "integer"
+                },
+                "track": {
+                    "type": "string"
+                }
+            }
+        },
+        "transcoder.RuntimeStatus": {
+            "type": "object",
+            "properties": {
+                "profiles": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/transcoder.ProfileSnapshot"
+                    }
+                }
+            }
         },
         "vod.FileEntry": {
             "type": "object",

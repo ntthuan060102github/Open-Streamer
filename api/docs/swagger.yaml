@@ -197,6 +197,8 @@ definitions:
         type: array
       name:
         type: string
+      pipeline_active:
+        type: boolean
       protocols:
         allOf:
         - $ref: '#/definitions/domain.OutputProtocols'
@@ -212,7 +214,7 @@ definitions:
           $ref: '#/definitions/domain.PushDestination'
         type: array
       runtime:
-        $ref: '#/definitions/apidocs.StreamRuntime'
+        $ref: '#/definitions/manager.RuntimeStatus'
       status:
         $ref: '#/definitions/domain.StreamStatus'
       stream_key:
@@ -228,21 +230,12 @@ definitions:
         description: Thumbnail controls periodic screenshot generation for preview
           images.
       transcoder:
-        allOf:
-        - $ref: '#/definitions/domain.TranscoderConfig'
-        description: |-
-          Transcoder controls encoding/decoding settings.
-          nil means no transcoding for this stream.
+        $ref: '#/definitions/transcoder.RuntimeStatus'
       watermark:
         allOf:
         - $ref: '#/definitions/domain.WatermarkConfig'
         description: Watermark is an optional text or image overlay applied before
           encoding.
-    type: object
-  apidocs.StreamRuntime:
-    properties:
-      active_input_priority:
-        type: integer
     type: object
   apidocs.VODFileData:
     properties:
@@ -522,6 +515,13 @@ definitions:
           Name is the FFmpeg decoder name.
           "" = let FFmpeg choose automatically.
           Examples: "h264_cuvid", "h264_qsv".
+        type: string
+    type: object
+  domain.ErrorEntry:
+    properties:
+      at:
+        type: string
+      message:
         type: string
     type: object
   domain.EventType:
@@ -1181,6 +1181,57 @@ definitions:
     x-enum-varnames:
     - WatermarkTypeText
     - WatermarkTypeImage
+  manager.InputHealthSnapshot:
+    properties:
+      bitrate_kbps:
+        type: number
+      errors:
+        items:
+          $ref: '#/definitions/domain.ErrorEntry'
+        type: array
+      input_priority:
+        type: integer
+      last_packet_at:
+        type: string
+      packet_loss:
+        type: number
+      status:
+        $ref: '#/definitions/domain.StreamStatus'
+    type: object
+  manager.RuntimeStatus:
+    properties:
+      active_input_priority:
+        type: integer
+      exhausted:
+        type: boolean
+      inputs:
+        items:
+          $ref: '#/definitions/manager.InputHealthSnapshot'
+        type: array
+      override_input_priority:
+        type: integer
+    type: object
+  transcoder.ProfileSnapshot:
+    properties:
+      errors:
+        items:
+          $ref: '#/definitions/domain.ErrorEntry'
+        type: array
+      index:
+        description: 0-based ladder index; track label = track_<index+1>
+        type: integer
+      restart_count:
+        type: integer
+      track:
+        type: string
+    type: object
+  transcoder.RuntimeStatus:
+    properties:
+      profiles:
+        items:
+          $ref: '#/definitions/transcoder.ProfileSnapshot'
+        type: array
+    type: object
   vod.FileEntry:
     properties:
       ingest_url:

@@ -121,12 +121,12 @@ type RuntimeStatus struct {
 // cleared when the stream pipeline is stopped. Frontend should treat each
 // message as a diagnostic string, not a code.
 type InputHealthSnapshot struct {
-	InputPriority int                  `json:"input_priority"`
-	LastPacketAt  time.Time            `json:"last_packet_at"`
-	BitrateKbps   float64              `json:"bitrate_kbps"`
-	PacketLoss    float64              `json:"packet_loss"`
-	Status        domain.StreamStatus  `json:"status"`
-	Errors        []domain.ErrorEntry  `json:"errors,omitempty"`
+	InputPriority int                 `json:"input_priority"`
+	LastPacketAt  time.Time           `json:"last_packet_at"`
+	BitrateKbps   float64             `json:"bitrate_kbps"`
+	PacketLoss    float64             `json:"packet_loss"`
+	Status        domain.StreamStatus `json:"status"`
+	Errors        []domain.ErrorEntry `json:"errors,omitempty"`
 }
 
 // probeTask carries the arguments for a background probe goroutine.
