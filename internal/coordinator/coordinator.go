@@ -637,6 +637,10 @@ func transcoderProfilesFromDomain(video *domain.VideoTranscodeConfig) []transcod
 			MaxBitrate:       p.MaxBitrate,
 			Framerate:        p.Framerate,
 			KeyframeInterval: p.KeyframeInterval,
+			Bframes:          p.Bframes,
+			Refs:             p.Refs,
+			SAR:              p.SAR,
+			ResizeMode:       string(p.ResizeMode),
 		})
 	}
 	return out

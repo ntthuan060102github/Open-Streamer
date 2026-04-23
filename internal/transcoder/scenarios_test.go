@@ -700,3 +700,213 @@ func TestScenario_NVENC_HWAccelOrderingBeforeInput(t *testing.T) {
 	cvIdx := indexOf(args, "-c:v")
 	require.Greater(t, cvIdx, iIdx, "-c:v must come after -i")
 }
+
+// ── Mode 5: Combined v0.0.6 features (Bframes / Refs / SAR / Interlace / Resize) ──
+//
+// These scenarios pair the new fields with the existing GPU/CPU pipelines to
+// verify they compose without breaking earlier contracts (full-GPU pipeline,
+// flag/value adjacency, hwaccel-before-input ordering).
+
+func TestScenario_NVENC_FullProfile_AllNewFields(t *testing.T) {
+	t.Parallel()
+	bf := 0
+	refs := 3
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{
+			Interlace: domain.InterlaceTopField,
+		},
+		Audio:  domain.AudioTranscodeConfig{Copy: true},
+		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC, GOP: 60},
+	}
+	p := []Profile{{
+		Width: 1920, Height: 1080, Bitrate: "5000k", MaxBitrate: 6000,
+		Codec: "h264", Preset: "p4",
+		Bframes:    &bf,
+		Refs:       &refs,
+		SAR:        "1:1",
+		ResizeMode: string(domain.ResizeModeFit),
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+
+	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"))
+	require.Equal(t, "0", argAfter(args, "-bf"), "explicit bframes=0 must propagate (low-latency)")
+	require.Equal(t, "3", argAfter(args, "-refs"))
+
+	vf := argAfter(args, "-vf")
+	require.Contains(t, vf, "yadif_cuda=mode=0:parity=0:deint=0", "GPU pipeline must use yadif_cuda")
+	require.Contains(t, vf, "scale_cuda=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2",
+		"fit mode → scale_cuda with force_divisible_by, no pad_cuda")
+	require.NotContains(t, vf, "pad_cuda", "fit must skip pad")
+	require.Contains(t, vf, "setsar=1:1")
+
+	// bframes=0 → no b_ref_mode.
+	require.Equal(t, "", argAfter(args, "-b_ref_mode"))
+
+	// Hwaccel still emitted (full-GPU pipeline contract).
+	require.Equal(t, "cuda", argAfter(args, "-hwaccel"))
+	require.Equal(t, "cuda", argAfter(args, "-hwaccel_output_format"))
+}
+
+func TestScenario_NVENC_BframesPositive_EnablesBRefMode(t *testing.T) {
+	t.Parallel()
+	bf := 3
+	tc := &domain.TranscoderConfig{
+		Video:  domain.VideoTranscodeConfig{},
+		Audio:  domain.AudioTranscodeConfig{Copy: true},
+		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "3000k",
+		Codec: "h264", Preset: "p5",
+		Bframes: &bf,
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+
+	require.Equal(t, "3", argAfter(args, "-bf"))
+	require.Equal(t, "middle", argAfter(args, "-b_ref_mode"),
+		"NVENC + bframes>0 must enable HW b-ref pyramid (free quality on Turing+)")
+}
+
+func TestScenario_CPU_PadModeProducesPadFilter(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Video:  domain.VideoTranscodeConfig{},
+		Audio:  domain.AudioTranscodeConfig{Copy: true},
+		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "2000k",
+		Codec: "h264", Preset: "fast",
+		ResizeMode: string(domain.ResizeModePad),
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+	vf := argAfter(args, "-vf")
+	require.Contains(t, vf, "scale=1280:720:")
+	require.Contains(t, vf, "pad=ceil(iw/2)*2:ceil(ih/2)*2")
+}
+
+func TestScenario_CPU_CropMode_HasNoPad(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "2000k",
+		Codec: "h264", Preset: "fast",
+		ResizeMode: string(domain.ResizeModeCrop),
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+	vf := argAfter(args, "-vf")
+	require.Contains(t, vf, "scale=1280:720:force_original_aspect_ratio=increase")
+	require.Contains(t, vf, "crop=1280:720")
+	require.NotContains(t, vf, "pad=", "crop mode must not emit pad")
+}
+
+func TestScenario_NVENC_CropMode_RoundTripsThroughCPU(t *testing.T) {
+	t.Parallel()
+	// CUDA filter graph has no crop primitive — chain must round-trip via CPU
+	// (hwdownload → CPU crop → hwupload_cuda) so the encoder still gets CUDA
+	// frames. Encoder stays on GPU; only the crop step pays PCIe cost.
+	tc := &domain.TranscoderConfig{
+		Video:  domain.VideoTranscodeConfig{},
+		Audio:  domain.AudioTranscodeConfig{Copy: true},
+		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "3000k",
+		Codec: "h264", Preset: "p4",
+		ResizeMode: string(domain.ResizeModeCrop),
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+
+	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"))
+	vf := argAfter(args, "-vf")
+	require.Contains(t, vf, "hwdownload")
+	require.Contains(t, vf, "format=nv12")
+	require.Contains(t, vf, "crop=1280:720")
+	require.Contains(t, vf, "hwupload_cuda")
+	// Encoder pipeline still gets cuda frames overall.
+	require.Equal(t, "cuda", argAfter(args, "-hwaccel_output_format"))
+}
+
+func TestScenario_NVENC_StretchMode_NoPadOrAspect(t *testing.T) {
+	t.Parallel()
+	tc := &domain.TranscoderConfig{
+		Video:  domain.VideoTranscodeConfig{},
+		Audio:  domain.AudioTranscodeConfig{Copy: true},
+		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "3000k",
+		Codec: "h264", Preset: "p4",
+		ResizeMode: string(domain.ResizeModeStretch),
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+	vf := argAfter(args, "-vf")
+	require.Equal(t, "scale_cuda=1280:720", vf,
+		"stretch on GPU must be a bare scale_cuda — no aspect, no pad")
+}
+
+func TestScenario_Interlace_AppliesToEveryProfileIndependently(t *testing.T) {
+	t.Parallel()
+	// Interlace lives on VideoTranscodeConfig (source-level) — every per-profile
+	// FFmpeg subprocess emits the same yadif filter against its own decoded copy.
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{Interlace: domain.InterlaceAuto},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	for _, p := range []Profile{
+		{Width: 1920, Height: 1080, Bitrate: "5000k", Codec: "h264", Preset: "fast"},
+		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "fast"},
+		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264", Preset: "fast"},
+	} {
+		args, err := buildFFmpegArgs([]Profile{p}, tc)
+		require.NoError(t, err)
+		vf := argAfter(args, "-vf")
+		require.Contains(t, vf, "yadif=mode=0:parity=-1:deint=0")
+	}
+}
+
+func TestScenario_InterlaceProgressive_SkipsFilter(t *testing.T) {
+	t.Parallel()
+	// "progressive" is an assertion that the source has no interlace artifacts;
+	// the deinterlacer should be skipped so we don't waste GPU/CPU per frame.
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{Interlace: domain.InterlaceProgressive},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	p := []Profile{{
+		Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast",
+	}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+	vf := argAfter(args, "-vf")
+	require.NotContains(t, vf, "yadif")
+}
+
+func TestScenario_NewFields_NoneSet_NoExtraArgs(t *testing.T) {
+	t.Parallel()
+	// Backward-compat: a config with only the v0.0.5 fields must produce the
+	// same FFmpeg command as before (no -bf, no -refs, no setsar, no yadif).
+	tc := &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast"}}
+	args, err := buildFFmpegArgs(p, tc)
+	require.NoError(t, err)
+
+	require.Equal(t, "", argAfter(args, "-bf"))
+	require.Equal(t, "", argAfter(args, "-refs"))
+	require.Equal(t, "", argAfter(args, "-b_ref_mode"))
+	vf := argAfter(args, "-vf")
+	require.NotContains(t, vf, "yadif")
+	require.NotContains(t, vf, "setsar")
+}

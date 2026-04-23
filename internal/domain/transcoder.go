@@ -36,6 +36,28 @@ const (
 	AudioCodecCopy AudioCodec = "copy" // passthrough — no re-encode
 )
 
+// ResizeMode controls how the source frame is fitted into the output dimensions.
+type ResizeMode string
+
+// ResizeMode values match Flussonic's resize modes. "" defaults to ResizeModePad.
+const (
+	ResizeModePad     ResizeMode = "pad"     // letterbox: keep aspect, fill remainder with black
+	ResizeModeCrop    ResizeMode = "crop"    // fill: keep aspect, crop excess
+	ResizeModeStretch ResizeMode = "stretch" // distort: scale to W:H, ignore source aspect
+	ResizeModeFit     ResizeMode = "fit"     // keep aspect, no padding (output may be smaller than W:H)
+)
+
+// InterlaceMode selects deinterlacing behavior for the source.
+type InterlaceMode string
+
+// InterlaceMode values map to yadif/yadif_cuda parameters. "" disables the filter.
+const (
+	InterlaceAuto        InterlaceMode = "auto"        // detect parity each frame
+	InterlaceTopField    InterlaceMode = "tff"         // top field first (BBC HD, most ATSC)
+	InterlaceBottomField InterlaceMode = "bff"         // bottom field first (legacy DV)
+	InterlaceProgressive InterlaceMode = "progressive" // assert source is progressive — skip filter
+)
+
 // VideoProfile is a single rendition in the ABR (Adaptive Bitrate) ladder.
 // The Transcoder produces one FFmpeg output per profile.
 // Stable rendition ids are derived from slice order: track_1, track_2, track_3, … (1-based).
@@ -72,6 +94,23 @@ type VideoProfile struct {
 	// Level controls the H.264/H.265 encoding level.
 	// Common: "3.1", "4.0", "4.1", "4.2", "5.0", "5.1"
 	Level string `json:"level" yaml:"level"`
+
+	// Bframes is the number of consecutive B-frames the encoder may emit.
+	// nil = encoder default; 0 = explicit none (low-latency live);
+	// 2-3 = typical VOD; NVENC HW B-ref pyramid is auto-enabled when >0.
+	Bframes *int `json:"bframes,omitempty" yaml:"bframes,omitempty"`
+
+	// Refs is the number of reference frames. nil = encoder default.
+	// Higher = better compression at cost of CPU/latency. NVENC has its own caps.
+	Refs *int `json:"refs,omitempty" yaml:"refs,omitempty"`
+
+	// SAR is the output Sample Aspect Ratio, "N:M". "" = inherit from source.
+	// Use "1:1" for square pixels (web); "16:11", "59:54" etc. for anamorphic.
+	SAR string `json:"sar,omitempty" yaml:"sar,omitempty"`
+
+	// ResizeMode chooses how the source is fitted to Width/Height.
+	// "" defaults to ResizeModePad.
+	ResizeMode ResizeMode `json:"resize_mode,omitempty" yaml:"resize_mode,omitempty"`
 }
 
 // AudioConfig defines the audio encoding settings applied to all output profiles.
@@ -122,6 +161,11 @@ type TranscoderGlobalConfig struct {
 type VideoTranscodeConfig struct {
 	// Copy copies origin video without re-encoding.
 	Copy bool `json:"copy" yaml:"copy"`
+
+	// Interlace selects the deinterlace pre-filter applied before scaling.
+	// Applies once per FFmpeg subprocess (i.e. per profile in the ABR ladder).
+	// "" disables the filter; use ResizeModeProgressive to assert progressive source.
+	Interlace InterlaceMode `json:"interlace,omitempty" yaml:"interlace,omitempty"`
 
 	// Profiles defines ABR renditions when re-encoding.
 	Profiles []VideoProfile `json:"profiles,omitempty" yaml:"profiles,omitempty"`

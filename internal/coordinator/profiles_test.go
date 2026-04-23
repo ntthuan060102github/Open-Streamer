@@ -137,6 +137,44 @@ func TestTranscoderProfilesFromDomain_AllFieldsPropagated(t *testing.T) {
 	}, got[0])
 }
 
+// New-field round-trip: Bframes/Refs/SAR/ResizeMode added in v0.0.6 must
+// reach the transcoder layer unchanged so buildFFmpegArgs can emit them.
+func TestTranscoderProfilesFromDomain_NewFieldsPropagated(t *testing.T) {
+	t.Parallel()
+	bf := 0
+	refs := 3
+	video := &domain.VideoTranscodeConfig{
+		Profiles: []domain.VideoProfile{{
+			Width: 1280, Height: 720, Bitrate: 2500,
+			Bframes:    &bf,
+			Refs:       &refs,
+			SAR:        "1:1",
+			ResizeMode: domain.ResizeModeCrop,
+		}},
+	}
+	got := transcoderProfilesFromDomain(video)
+	require.Len(t, got, 1)
+	require.NotNil(t, got[0].Bframes)
+	require.Equal(t, 0, *got[0].Bframes)
+	require.NotNil(t, got[0].Refs)
+	require.Equal(t, 3, *got[0].Refs)
+	require.Equal(t, "1:1", got[0].SAR)
+	require.Equal(t, "crop", got[0].ResizeMode)
+}
+
+// Pointer fields must propagate as nil (encoder default) when domain leaves them unset.
+func TestTranscoderProfilesFromDomain_NilPointersStayNil(t *testing.T) {
+	t.Parallel()
+	video := &domain.VideoTranscodeConfig{
+		Profiles: []domain.VideoProfile{{Width: 1280, Height: 720, Bitrate: 2500}},
+	}
+	got := transcoderProfilesFromDomain(video)
+	require.Nil(t, got[0].Bframes, "unset Bframes must stay nil — encoder picks its own default")
+	require.Nil(t, got[0].Refs, "unset Refs must stay nil")
+	require.Empty(t, got[0].SAR)
+	require.Empty(t, got[0].ResizeMode)
+}
+
 func TestTranscoderProfilesFromDomain_MultipleProfilesPreserveOrder(t *testing.T) {
 	t.Parallel()
 	video := &domain.VideoTranscodeConfig{

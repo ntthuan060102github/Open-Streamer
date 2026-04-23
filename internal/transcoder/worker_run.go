@@ -126,6 +126,13 @@ func (s *Service) runOnce(
 	args []string,
 ) (crashed bool) {
 	cmd := exec.CommandContext(ctx, s.cfg.FFmpegPath, args...)
+	// Copy-pasteable command for ad-hoc reproduction. Debug level so it stays
+	// out of normal logs (filter chains with pad expressions are noisy).
+	slog.Debug("transcoder: ffmpeg cmdline",
+		"stream_code", logStream,
+		"profile", track,
+		"cmd", formatFFmpegCmd(s.cfg.FFmpegPath, args),
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		slog.Error("transcoder: stdin pipe failed", "stream_code", logStream, "profile", track, "err", err)

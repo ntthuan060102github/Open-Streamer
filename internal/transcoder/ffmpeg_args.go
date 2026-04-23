@@ -51,7 +51,7 @@ func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string,
 	if tc.Video.Copy {
 		args = append(args, "-c:v", "copy")
 	} else {
-		vf := buildScaleFilter(p.Width, p.Height, tc.Global.HW, videoEnc)
+		vf := buildVideoFilter(p, tc, videoEnc)
 		if vf != "" {
 			args = append(args, "-vf", vf)
 		}
@@ -79,6 +79,10 @@ func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string,
 			args = append(args, "-r", formatFloat(p.Framerate))
 		} else if tc.Global.FPS > 0 {
 			args = append(args, "-r", strconv.Itoa(tc.Global.FPS))
+		}
+		args = append(args, bframesArgs(p.Bframes, videoEnc)...)
+		if p.Refs != nil && *p.Refs > 0 {
+			args = append(args, "-refs", strconv.Itoa(*p.Refs))
 		}
 	}
 
@@ -130,14 +134,59 @@ func hwInputArgs(hw domain.HWAccel, encoder string) []string {
 	return nil
 }
 
+// buildVideoFilter composes the full -vf chain in pipeline order:
+// deinterlace → resize/pad/crop → setsar. Skipped if all parts are no-ops.
+// Each filter is GPU- or CPU-flavored to match the active hwaccel; mixing
+// them in one chain forces hwdownload/hwupload, which we want to avoid.
+func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) string {
+	hw := tc.Global.HW
+	_, onGPU := gpuScaleFilterName(hw, encoder)
+
+	chain := make([]string, 0, 3)
+	if df := deinterlaceFilter(tc.Video.Interlace, onGPU); df != "" {
+		chain = append(chain, df)
+	}
+	if rs := resizeFilter(p.Width, p.Height, p.ResizeMode, hw, encoder); rs != "" {
+		chain = append(chain, rs)
+	}
+	if p.SAR != "" {
+		chain = append(chain, "setsar="+p.SAR)
+	}
+	return strings.Join(chain, ",")
+}
+
+// buildScaleFilter remains the simple resize entry point. Defaults to ResizeModePad.
 func buildScaleFilter(w, h int, hw domain.HWAccel, encoder string) string {
+	return resizeFilter(w, h, "", hw, encoder)
+}
+
+// resizeFilter dispatches to GPU/CPU scaler chains based on the active hwaccel.
+// mode "" defaults to ResizeModePad. crop on GPU round-trips through CPU
+// (hwdownload→crop→hwupload) — the cuda filter graph has no crop primitive.
+func resizeFilter(w, h int, mode string, hw domain.HWAccel, encoder string) string {
 	if w <= 0 && h <= 0 {
 		return ""
 	}
-	if name, ok := gpuScaleFilterName(hw, encoder); ok {
-		return gpuScaleFilter(name, w, h)
+	m := normalizeResizeMode(mode)
+	if name, onGPU := gpuScaleFilterName(hw, encoder); onGPU {
+		return gpuResizeFilter(name, w, h, m)
 	}
-	return cpuScaleFilter(w, h)
+	return cpuResizeFilter(w, h, m)
+}
+
+func normalizeResizeMode(m string) domain.ResizeMode {
+	switch domain.ResizeMode(strings.ToLower(strings.TrimSpace(m))) {
+	case domain.ResizeModeCrop:
+		return domain.ResizeModeCrop
+	case domain.ResizeModeStretch:
+		return domain.ResizeModeStretch
+	case domain.ResizeModeFit:
+		return domain.ResizeModeFit
+	case domain.ResizeModePad:
+		return domain.ResizeModePad
+	default:
+		return domain.ResizeModePad
+	}
 }
 
 // gpuScaleFilterName picks the in-VRAM scaler that pairs with the active
@@ -168,27 +217,102 @@ func gpuScaleFilterName(hw domain.HWAccel, encoder string) (string, bool) {
 	return "", false
 }
 
-func gpuScaleFilter(name string, w, h int) string {
-	// `force_divisible_by=2` is the GPU-friendly equivalent of the CPU `pad`
-	// chain — NVENC/VAAPI/QSV all reject odd dimensions.
-	if w > 0 && h > 0 {
+// gpuResizeFilter builds an in-VRAM scaler chain for the active hwaccel.
+// pad mode uses pad_cuda (FFmpeg ≥5.1). crop mode round-trips through CPU
+// (hwdownload→cpu crop→hwupload_cuda) since no cuda crop filter exists.
+func gpuResizeFilter(name string, w, h int, mode domain.ResizeMode) string {
+	// Single-axis specifications collapse to a fit/stretch behavior — there's
+	// no aspect to enforce when one dimension is auto.
+	if w <= 0 || h <= 0 {
+		if w > 0 {
+			return fmt.Sprintf("%s=%d:-2", name, w)
+		}
+		return fmt.Sprintf("%s=-2:%d", name, h)
+	}
+	switch mode {
+	case domain.ResizeModeStretch:
+		return fmt.Sprintf("%s=%d:%d", name, w, h)
+	case domain.ResizeModeFit:
 		return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", name, w, h)
+	case domain.ResizeModeCrop:
+		// CUDA filter graph has no crop primitive; round-trip via CPU.
+		// hwupload_cuda promotes the cropped frame back to VRAM for the encoder.
+		return fmt.Sprintf("hwdownload,format=nv12,%s,hwupload_cuda", cpuResizeFilter(w, h, domain.ResizeModeCrop))
+	case domain.ResizeModePad:
+		fallthrough
+	default:
+		return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2,pad_cuda=%d:%d:(%d-iw)/2:(%d-ih)/2",
+			name, w, h, w, h, w, h)
 	}
-	if w > 0 {
-		return fmt.Sprintf("%s=%d:-2", name, w)
-	}
-	return fmt.Sprintf("%s=-2:%d", name, h)
 }
 
-func cpuScaleFilter(w, h int) string {
-	const chain = "force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2:(ow-iw)/2:(oh-ih)/2"
-	if w > 0 && h > 0 {
-		return fmt.Sprintf("scale=%d:%d:%s", w, h, chain)
+func cpuResizeFilter(w, h int, mode domain.ResizeMode) string {
+	if w <= 0 || h <= 0 {
+		if w > 0 {
+			return fmt.Sprintf("scale=%d:-2", w)
+		}
+		return fmt.Sprintf("scale=-2:%d", h)
 	}
-	if w > 0 {
-		return fmt.Sprintf("scale=%d:-2:%s", w, chain)
+	switch mode {
+	case domain.ResizeModeStretch:
+		return fmt.Sprintf("scale=%d:%d", w, h)
+	case domain.ResizeModeFit:
+		// Round to even — H.264/HEVC require even dimensions.
+		return fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", w, h)
+	case domain.ResizeModeCrop:
+		return fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d", w, h, w, h)
+	case domain.ResizeModePad:
+		fallthrough
+	default:
+		const padChain = "force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2:(ow-iw)/2:(oh-ih)/2"
+		return fmt.Sprintf("scale=%d:%d:%s", w, h, padChain)
 	}
-	return fmt.Sprintf("scale=-2:%d:%s", h, chain)
+}
+
+// deinterlaceFilter returns a yadif/yadif_cuda fragment, or "" when disabled
+// or when the source is asserted progressive. mode=0 keeps source FPS;
+// parity is auto unless caller specifies tff/bff.
+func deinterlaceFilter(im domain.InterlaceMode, onGPU bool) string {
+	parity := -1
+	switch im {
+	case "":
+		return ""
+	case domain.InterlaceProgressive:
+		// Source asserted progressive; FFmpeg's deinterlacer would still run
+		// per-frame detection, costing GPU/CPU for no reason. Skip entirely.
+		return ""
+	case domain.InterlaceTopField:
+		parity = 0
+	case domain.InterlaceBottomField:
+		parity = 1
+	case domain.InterlaceAuto:
+		// auto-detect parity per frame.
+	default:
+		return ""
+	}
+	name := "yadif"
+	if onGPU {
+		name = "yadif_cuda"
+	}
+	return fmt.Sprintf("%s=mode=0:parity=%d:deint=0", name, parity)
+}
+
+// bframesArgs emits -bf and (for NVENC) -b_ref_mode. nil pointer = encoder default.
+func bframesArgs(bf *int, encoder string) []string {
+	if bf == nil {
+		return nil
+	}
+	n := *bf
+	if n < 0 {
+		n = 0
+	}
+	out := []string{"-bf", strconv.Itoa(n)}
+	if n > 0 && strings.Contains(strings.ToLower(encoder), "nvenc") {
+		// b_ref_mode=middle enables HW B-frame as reference (Turing+);
+		// improves quality at no extra GPU cost when B-frames are on.
+		out = append(out, "-b_ref_mode", "middle")
+	}
+	return out
 }
 
 func normalizeVideoEncoder(codec string, hw domain.HWAccel) string {
@@ -271,4 +395,28 @@ func audioEncodeArgs(tc *domain.TranscoderConfig) []string {
 
 func formatFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', 3, 64)
+}
+
+// formatFFmpegCmd renders the binary + args as a single shell-pasteable string.
+// Args containing whitespace or shell metacharacters (parentheses, $, etc. —
+// common in FFmpeg pad expressions like `(ow-iw)/2`) are wrapped in single
+// quotes; embedded single quotes are escaped using the standard `'\”` form.
+func formatFFmpegCmd(bin string, args []string) string {
+	var sb strings.Builder
+	sb.WriteString(shellQuote(bin))
+	for _, a := range args {
+		sb.WriteByte(' ')
+		sb.WriteString(shellQuote(a))
+	}
+	return sb.String()
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n\"'`$\\&|;<>()*?#~![]{}") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

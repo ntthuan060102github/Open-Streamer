@@ -33,7 +33,11 @@ type Profile struct {
 	CodecLevel       string // e.g. 4.1
 	MaxBitrate       int    // kbps peak (0 = omit -maxrate)
 	Framerate        float64
-	KeyframeInterval int // GOP target in seconds (0 = encoder default)
+	KeyframeInterval int    // GOP target in seconds (0 = encoder default)
+	Bframes          *int   // nil = encoder default; 0 = explicit none
+	Refs             *int   // nil = encoder default
+	SAR              string // "" = inherit; "N:M" sets output sample aspect ratio
+	ResizeMode       string // "" = pad; "pad"|"crop"|"stretch"|"fit"
 }
 
 // profileWorker tracks a single FFmpeg encoder process (one ABR ladder rung).
