@@ -728,6 +728,14 @@ definitions:
           readers that use net/http (e.g. HLS playlist and segment GETs). Zero uses
           the reader's default (30s for HLS).
         type: integer
+      insecure_tls:
+        description: |-
+          InsecureTLS disables TLS certificate verification for HTTPS pulls
+          (HLS playlist + segment GETs). Default false — leave secure-by-default
+          for production. Use only when the source uses a self-signed,
+          expired, or otherwise-invalid certificate that you trust at the
+          network level (private VLAN, fixed IP allowlist).
+        type: boolean
       max_reconnects:
         description: MaxReconnects is the total number of reconnect attempts (0 =
           unlimited).

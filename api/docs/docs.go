@@ -2308,6 +2308,10 @@ const docTemplate = `{
                     "description": "ConnectTimeoutSec caps each HTTP round-trip (headers + full body) for pull\nreaders that use net/http (e.g. HLS playlist and segment GETs). Zero uses\nthe reader's default (30s for HLS).",
                     "type": "integer"
                 },
+                "insecure_tls": {
+                    "description": "InsecureTLS disables TLS certificate verification for HTTPS pulls\n(HLS playlist + segment GETs). Default false — leave secure-by-default\nfor production. Use only when the source uses a self-signed,\nexpired, or otherwise-invalid certificate that you trust at the\nnetwork level (private VLAN, fixed IP allowlist).",
+                    "type": "boolean"
+                },
                 "max_reconnects": {
                     "description": "MaxReconnects is the total number of reconnect attempts (0 = unlimited).",
                     "type": "integer"
