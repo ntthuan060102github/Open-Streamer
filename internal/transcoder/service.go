@@ -142,13 +142,17 @@ type streamWorker struct {
 	profiles   map[int]*profileWorker // key = profile index (0-based)
 }
 
-// Service manages the FFmpeg worker pool.
+// Service manages the FFmpeg worker pool. There is no upper bound on the
+// number of concurrent encoders — every rendition gets its own FFmpeg
+// process and the OS (rlimit / GPU NVENC slots / RAM) is the natural
+// limit. The previous app-level semaphore was removed because it caused
+// silent profile starvation when set too low (e.g. 4-slot cap with 20
+// streams × 2 profile = 40 needed → 36 stuck waiting forever).
 type Service struct {
 	cfg     config.TranscoderConfig
 	buf     *buffer.Service
 	bus     events.Bus
 	m       *metrics.Metrics
-	sem     chan struct{} // bounded semaphore to cap concurrent FFmpeg processes
 	mu      sync.Mutex
 	workers map[domain.StreamCode]*streamWorker
 }
@@ -165,7 +169,6 @@ func New(i do.Injector) (*Service, error) {
 		buf:     buf,
 		bus:     bus,
 		m:       m,
-		sem:     make(chan struct{}, cfg.MaxWorkers),
 		workers: make(map[domain.StreamCode]*streamWorker),
 	}, nil
 }

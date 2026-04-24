@@ -76,10 +76,12 @@ type BufferConfig struct {
 	Capacity int `mapstructure:"capacity" json:"capacity" yaml:"capacity"`
 }
 
-// TranscoderConfig controls FFmpeg worker pool behaviour.
+// TranscoderConfig controls FFmpeg invocation. There is intentionally no
+// concurrency cap on the worker pool — every rendition spawns its own
+// FFmpeg process and the OS (rlimit / GPU encoder slots) is the natural
+// upper bound. Operators who need a soft cap should provision the host
+// accordingly rather than relying on application-level throttling.
 type TranscoderConfig struct {
-	// MaxWorkers caps the number of concurrent FFmpeg processes.
-	MaxWorkers int    `mapstructure:"max_workers" json:"max_workers" yaml:"max_workers"`
 	FFmpegPath string `mapstructure:"ffmpeg_path" json:"ffmpeg_path" yaml:"ffmpeg_path"`
 }
 

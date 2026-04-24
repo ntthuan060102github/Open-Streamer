@@ -39,7 +39,6 @@
       "capacity": 1024
     },
     "transcoder": {
-      "max_workers": 4,
       "ffmpeg_path": "ffmpeg",
       "max_restarts": 5
     },

@@ -32,14 +32,6 @@ func (s *Service) runProfileEncoder(
 ) {
 	track := buffer.VideoTrackSlug(profileIndex)
 
-	// Hold the semaphore slot for the full lifetime of this profile (including retries).
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-ctx.Done():
-		return
-	}
-
 	args, err := buildFFmpegArgs([]Profile{prof}, tc)
 	if err != nil {
 		slog.Error("transcoder: build ffmpeg args", "stream_code", logStream, "profile", track, "err", err)

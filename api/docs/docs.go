@@ -1987,10 +1987,6 @@ const docTemplate = `{
             "properties": {
                 "ffmpeg_path": {
                     "type": "string"
-                },
-                "max_workers": {
-                    "description": "MaxWorkers caps the number of concurrent FFmpeg processes.",
-                    "type": "integer"
                 }
             }
         },

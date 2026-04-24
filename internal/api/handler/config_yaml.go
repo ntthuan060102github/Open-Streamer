@@ -415,11 +415,6 @@ func validateGlobalConfig(c *domain.GlobalConfig) []fieldError {
 			errs = append(errs, fieldError{Path: "global_config.buffer.capacity", Message: "must be > 0"})
 		}
 	}
-	if c.Transcoder != nil {
-		if c.Transcoder.MaxWorkers < 0 {
-			errs = append(errs, fieldError{Path: "global_config.transcoder.max_workers", Message: msgMustBeGEZero})
-		}
-	}
 	if c.Publisher != nil {
 		errs = append(errs, validatePublisher(c.Publisher)...)
 	}
