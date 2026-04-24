@@ -68,6 +68,19 @@ type Service struct {
 	sessions map[domain.StreamCode]*recordingSession
 }
 
+// NewForTesting builds a Service from pre-constructed deps. Used by unit
+// tests that wire fakes / minimal real implementations and skip the DI
+// plumbing.
+func NewForTesting(buf *buffer.Service, bus events.Bus, m *metrics.Metrics, recRepo store.RecordingRepository) *Service {
+	return &Service{
+		buf:      buf,
+		bus:      bus,
+		m:        m,
+		recRepo:  recRepo,
+		sessions: make(map[domain.StreamCode]*recordingSession),
+	}
+}
+
 // New creates a Service and registers it with the DI injector.
 func New(i do.Injector) (*Service, error) {
 	buf := do.MustInvoke[*buffer.Service](i)

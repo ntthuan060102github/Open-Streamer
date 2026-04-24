@@ -154,10 +154,22 @@ type probeTask struct {
 	input    domain.Input // value copy of the input (URL, headers, etc.)
 }
 
+// ingestorDep is the slice of ingestor.Service that manager actually uses.
+// Defined as an interface so unit tests can substitute a stub without
+// constructing a full pull/push ingest stack — same pattern coordinator uses
+// for its mgrDep / tcDep / pubDep deps.
+type ingestorDep interface {
+	Start(ctx context.Context, streamID domain.StreamCode, input domain.Input, bufferWriteID domain.StreamCode) error
+	Probe(ctx context.Context, input domain.Input) error
+	SetPacketObserver(fn func(streamID domain.StreamCode, inputPriority int))
+	SetInputErrorObserver(fn func(streamID domain.StreamCode, inputPriority int, err error))
+	Stop(streamID domain.StreamCode)
+}
+
 // Service monitors all streams and orchestrates source failover.
 type Service struct {
 	bus           events.Bus
-	ingestor      *ingestor.Service
+	ingestor      ingestorDep
 	m             *metrics.Metrics
 	packetTimeout time.Duration
 
@@ -182,6 +194,26 @@ func (s *Service) SetRestoredCallback(fn func(domain.StreamCode)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onRestored = fn
+}
+
+// NewForTesting builds a Service from pre-constructed deps. Used by unit
+// tests that stub the ingestor (no real pull workers needed) and skip the
+// DI plumbing. packetTimeoutSec mirrors ManagerConfig.InputPacketTimeoutSec
+// (defaults to 30s when ≤ 0).
+func NewForTesting(bus events.Bus, ing ingestorDep, m *metrics.Metrics, packetTimeoutSec int) *Service {
+	if packetTimeoutSec <= 0 {
+		packetTimeoutSec = 30
+	}
+	svc := &Service{
+		bus:           bus,
+		ingestor:      ing,
+		m:             m,
+		packetTimeout: time.Duration(packetTimeoutSec) * time.Second,
+		streams:       make(map[domain.StreamCode]*streamState),
+	}
+	ing.SetPacketObserver(svc.RecordPacket)
+	ing.SetInputErrorObserver(svc.ReportInputError)
+	return svc
 }
 
 // New creates a Service and registers it with the DI injector.
