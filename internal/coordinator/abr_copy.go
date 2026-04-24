@@ -1,0 +1,264 @@
+// abr_copy.go — coordinator branch for `copy://` inputs whose upstream has an
+// ABR ladder. Unlike single-stream copy (handled by ingestor.pull.CopyReader),
+// ABR copy bypasses the ingest worker AND the transcoder entirely:
+//
+//	Upstream rendition_track_1  ──tap1──▶  Downstream rendition_track_1
+//	Upstream rendition_track_2  ──tap2──▶  Downstream rendition_track_2
+//	... (one tap goroutine per rung)
+//
+// The publisher then serves the downstream's rendition buffers as a normal
+// ABR HLS/DASH master playlist — clients can't tell the rungs are copies.
+//
+// v1 limitations (documented):
+//   - upstream profile changes after Start are NOT picked up; operator must
+//     restart the downstream stream to re-snapshot the ladder.
+//   - chained ABR copy (B = copy://A where A itself is ABR-copy) is not
+//     supported because the in-memory ladder mirror is local to coordinator
+//     and not visible through the StreamRepository. Configure C → A directly.
+//   - failover not applicable: ABR-copy requires `copy://X` as the SOLE
+//     input (enforced by domain.ValidateCopyShape).
+
+package coordinator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+)
+
+// abrCopyEntry holds the runtime handles needed to tear down an ABR-copy stream.
+type abrCopyEntry struct {
+	cancel context.CancelFunc
+	wg     *sync.WaitGroup
+	slugs  []string // rendition slugs; used to delete downstream buffers on stop
+}
+
+// detectABRCopy reports whether `s` is an ABR-copy candidate. Returns the
+// upstream stream when:
+//   - the first input is `copy://X` and parses cleanly
+//   - X exists in the lookup
+//   - X has an ABR ladder (≥1 video profile, video.copy=false)
+//
+// Otherwise returns nil — the caller falls back to the normal pipeline.
+//
+// The first input is sufficient to detect because ValidateCopyShape rejects
+// ABR-copy + fallback inputs at write time.
+func (c *Coordinator) detectABRCopy(s *domain.Stream) *domain.Stream {
+	if c.upstreamLookup == nil || s == nil || len(s.Inputs) == 0 {
+		return nil
+	}
+	first := s.Inputs[0]
+	if !domain.IsCopyInput(first) {
+		return nil
+	}
+	target, err := domain.CopyInputTarget(first)
+	if err != nil {
+		return nil
+	}
+	upstream, ok := c.upstreamLookup(target)
+	if !ok {
+		return nil
+	}
+	if !upstreamHasABRLadder(upstream) {
+		return nil
+	}
+	return upstream
+}
+
+// upstreamHasABRLadder mirrors domain.streamHasRenditions — kept inline to
+// avoid widening the domain export surface for one call site.
+func upstreamHasABRLadder(s *domain.Stream) bool {
+	if s == nil || s.Transcoder == nil {
+		return false
+	}
+	if s.Transcoder.Video.Copy {
+		return false
+	}
+	return len(s.Transcoder.Video.Profiles) > 0
+}
+
+// mirrorTranscoderForCopy clones the upstream's video profiles into a fresh
+// TranscoderConfig used purely as a buffer-topology hint. The clone is never
+// persisted and never feeds the transcoder service — its only role is to make
+// `buffer.RenditionsForTranscoder(downstream)` return the correct N rungs so
+// the publisher serves an ABR master playlist with matching slugs.
+func mirrorTranscoderForCopy(src *domain.TranscoderConfig) *domain.TranscoderConfig {
+	if src == nil {
+		return nil
+	}
+	profiles := make([]domain.VideoProfile, len(src.Video.Profiles))
+	copy(profiles, src.Video.Profiles)
+	return &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{Profiles: profiles},
+	}
+}
+
+// startABRCopy wires the ABR-copy pipeline:
+//  1. shallow-clone downstream and inject the mirrored transcoder so publisher
+//     and buffer helpers see N rungs;
+//  2. create one downstream rendition buffer per rung;
+//  3. start the publisher (it'll subscribe to the rendition buffers);
+//  4. spawn N tap goroutines, each forwarding one upstream rendition into
+//     its matching downstream rendition.
+//
+// On any setup failure rolls back partial state in reverse order.
+func (c *Coordinator) startABRCopy(ctx context.Context, downstream, upstream *domain.Stream) error {
+	upRends := buffer.RenditionsForTranscoder(upstream.Code, upstream.Transcoder)
+	if len(upRends) == 0 {
+		return fmt.Errorf("coordinator: abr copy: upstream %q has no rendition ladder", upstream.Code)
+	}
+
+	mirrored := *downstream // shallow copy — we only mutate Transcoder pointer
+	mirrored.Transcoder = mirrorTranscoderForCopy(upstream.Transcoder)
+	downRends := buffer.RenditionsForTranscoder(mirrored.Code, mirrored.Transcoder)
+	if len(downRends) != len(upRends) {
+		return fmt.Errorf("coordinator: abr copy: rung count mismatch (upstream=%d downstream=%d)",
+			len(upRends), len(downRends))
+	}
+
+	slugs := make([]string, 0, len(downRends))
+	for _, r := range downRends {
+		c.buf.Create(r.BufferID)
+		slugs = append(slugs, r.Slug)
+	}
+
+	if err := c.pub.Start(ctx, &mirrored); err != nil {
+		for _, r := range downRends {
+			c.buf.Delete(r.BufferID)
+		}
+		return fmt.Errorf("coordinator: abr copy publisher: %w", err)
+	}
+
+	// Tap context is detached from the request ctx — the request is for
+	// "start the pipeline", not "run forever". Stop() cancels this ctx.
+	tapCtx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
+	for i := range downRends {
+		wg.Add(1)
+		//nolint:contextcheck // tapCtx is intentionally detached from request ctx; cancelled by Stop()
+		go c.runABRCopyTap(tapCtx, wg, downstream.Code, upRends[i].BufferID, downRends[i].BufferID, downRends[i].Slug)
+	}
+
+	c.abrMu.Lock()
+	c.abrCopies[downstream.Code] = &abrCopyEntry{cancel: cancel, wg: wg, slugs: slugs}
+	c.abrMu.Unlock()
+
+	if c.m != nil {
+		c.m.StreamStartTimeSeconds.WithLabelValues(string(downstream.Code)).Set(float64(time.Now().Unix()))
+	}
+	c.setStatus(downstream.Code, domain.StatusActive)
+	c.bus.Publish(ctx, domain.Event{
+		Type:       domain.EventStreamStarted,
+		StreamCode: downstream.Code,
+	})
+
+	slog.Info("coordinator: abr copy pipeline started",
+		"stream_code", downstream.Code,
+		"upstream", upstream.Code,
+		"renditions", len(downRends),
+	)
+	return nil
+}
+
+// stopABRCopy tears down an ABR-copy pipeline. Caller is responsible for
+// removing the entry from c.abrCopies BEFORE calling so concurrent IsRunning
+// returns false promptly.
+func (c *Coordinator) stopABRCopy(ctx context.Context, code domain.StreamCode, abr *abrCopyEntry) {
+	abr.cancel()
+	c.pub.Stop(code)
+	abr.wg.Wait() // taps must exit before deleting their target buffers
+
+	for _, slug := range abr.slugs {
+		c.buf.Delete(buffer.RenditionBufferID(code, slug))
+	}
+
+	if c.m != nil {
+		c.m.StreamStartTimeSeconds.DeleteLabelValues(string(code))
+	}
+	c.setStatus(code, domain.StatusActive) // clears the per-stream status entry
+
+	c.bus.Publish(ctx, domain.Event{
+		Type:       domain.EventStreamStopped,
+		StreamCode: code,
+	})
+
+	slog.Info("coordinator: abr copy pipeline stopped",
+		"stream_code", code,
+		"renditions", len(abr.slugs),
+	)
+}
+
+// runABRCopyTap subscribes to one upstream rendition buffer and forwards every
+// packet into the matching downstream rendition buffer until ctx is cancelled.
+// On upstream tear-down (subscriber chan closed) it retries with capped
+// exponential backoff so an upstream restart resumes copy automatically.
+func (c *Coordinator) runABRCopyTap(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	downstreamCode, upBufID, downBufID domain.StreamCode,
+	slug string,
+) {
+	defer wg.Done()
+
+	const initialBackoff = time.Second
+	const maxBackoff = 10 * time.Second
+	backoff := initialBackoff
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if c.abrCopyTapForward(ctx, upBufID, downBufID) {
+			return // ctx cancelled
+		}
+		// Subscribe failed or upstream chan closed — wait + retry.
+		slog.Info("coordinator: abr copy tap reconnecting",
+			"stream_code", downstreamCode,
+			"slug", slug,
+			"upstream_buffer", upBufID,
+			"retry_in", backoff,
+		)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+// abrCopyTapForward runs one subscribe-and-forward cycle. Returns true when
+// ctx cancellation caused the exit (caller should not retry).
+func (c *Coordinator) abrCopyTapForward(ctx context.Context, upBufID, downBufID domain.StreamCode) bool {
+	sub, err := c.buf.Subscribe(upBufID)
+	if err != nil {
+		return false
+	}
+	defer c.buf.Unsubscribe(upBufID, sub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case pkt, ok := <-sub.Recv():
+			if !ok {
+				return false // upstream torn down — tell caller to retry
+			}
+			// Write may fail with "stream not found" if the downstream
+			// buffer was already torn down between Stop() invalidating
+			// our cancel and our defer firing. Silently drop in that
+			// race; the next ctx.Done check breaks us out.
+			_ = c.buf.Write(downBufID, pkt)
+		}
+	}
+}

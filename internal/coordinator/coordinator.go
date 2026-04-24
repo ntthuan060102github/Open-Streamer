@@ -33,8 +33,17 @@ type Coordinator struct {
 	m          *metrics.Metrics
 	streamRepo store.StreamRepository
 
+	// upstreamLookup resolves another stream by code; used by detectABRCopy
+	// to inspect the upstream's transcoder ladder shape before deciding
+	// which pipeline branch to wire. Nil in unit tests that don't exercise
+	// ABR copy — detectABRCopy short-circuits to the normal path.
+	upstreamLookup func(domain.StreamCode) (*domain.Stream, bool)
+
 	rendMu     sync.Mutex
 	renditions map[domain.StreamCode][]string // ABR rendition slugs per stream (for buffer teardown)
+
+	abrMu     sync.RWMutex
+	abrCopies map[domain.StreamCode]*abrCopyEntry // streams currently running as ABR copy
 
 	statusMu sync.RWMutex
 	status   map[domain.StreamCode]domain.StreamStatus // runtime status per running stream
@@ -42,6 +51,7 @@ type Coordinator struct {
 
 // New registers a Coordinator with the DI injector.
 func New(i do.Injector) (*Coordinator, error) {
+	repo := do.MustInvoke[store.StreamRepository](i)
 	c := &Coordinator{
 		buf:        do.MustInvoke[*buffer.Service](i),
 		mgr:        do.MustInvoke[*manager.Service](i),
@@ -50,8 +60,16 @@ func New(i do.Injector) (*Coordinator, error) {
 		dvr:        do.MustInvoke[*dvr.Service](i),
 		bus:        do.MustInvoke[events.Bus](i),
 		m:          do.MustInvoke[*metrics.Metrics](i),
-		streamRepo: do.MustInvoke[store.StreamRepository](i),
+		streamRepo: repo,
+		upstreamLookup: func(code domain.StreamCode) (*domain.Stream, bool) {
+			s, err := repo.FindByCode(context.Background(), code)
+			if err != nil {
+				return nil, false
+			}
+			return s, true
+		},
 		renditions: make(map[domain.StreamCode][]string),
+		abrCopies:  make(map[domain.StreamCode]*abrCopyEntry),
 		status:     make(map[domain.StreamCode]domain.StreamStatus),
 	}
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
@@ -78,11 +96,18 @@ func newForTesting(
 		bus:        bus,
 		m:          m,
 		renditions: make(map[domain.StreamCode][]string),
+		abrCopies:  make(map[domain.StreamCode]*abrCopyEntry),
 		status:     make(map[domain.StreamCode]domain.StreamStatus),
 	}
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
 	c.mgr.SetRestoredCallback(c.handleInputRestored)
 	return c
+}
+
+// SetUpstreamLookupForTesting injects an upstream stream resolver — used by
+// tests that exercise the ABR-copy branch without spinning up a store backend.
+func (c *Coordinator) SetUpstreamLookupForTesting(fn func(domain.StreamCode) (*domain.Stream, bool)) {
+	c.upstreamLookup = fn
 }
 
 // StreamStatus returns the runtime status of a stream pipeline.
@@ -116,11 +141,15 @@ func (c *Coordinator) setStatus(code domain.StreamCode, st domain.StreamStatus) 
 
 // Start creates the buffer, registers the stream with the manager (ingest + failover),
 // starts publisher outputs, and optionally a transcoder worker.
+//
+// When the stream's first input is `copy://X` and X has an ABR ladder the
+// pipeline is wired through startABRCopy instead — no ingest worker, no
+// transcoder, just N tap goroutines re-publishing upstream rendition packets.
 func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 	if stream == nil {
 		return fmt.Errorf("coordinator: nil stream")
 	}
-	if c.mgr.IsRegistered(stream.Code) {
+	if c.IsRunning(stream.Code) {
 		return nil
 	}
 	if stream.Disabled {
@@ -128,6 +157,10 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 	}
 	if len(stream.Inputs) == 0 {
 		return fmt.Errorf("coordinator: stream %q has no inputs", stream.Code)
+	}
+
+	if upstream := c.detectABRCopy(stream); upstream != nil {
+		return c.startABRCopy(ctx, stream, upstream)
 	}
 
 	c.buf.Create(stream.Code)
@@ -234,14 +267,34 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 }
 
 // IsRunning reports whether the stream pipeline is active in memory.
+// Covers both the normal pipeline (manager-registered) and the ABR-copy
+// pipeline (no manager registration; tracked in c.abrCopies instead).
 func (c *Coordinator) IsRunning(streamID domain.StreamCode) bool {
-	return c.mgr.IsRegistered(streamID)
+	if c.mgr.IsRegistered(streamID) {
+		return true
+	}
+	c.abrMu.RLock()
+	_, ok := c.abrCopies[streamID]
+	c.abrMu.RUnlock()
+	return ok
 }
 
 // Stop tears down publisher, transcoder, manager (ingest), and the buffer.
 // ctx is used for the DVR stop and the EventStreamStopped publish; cleanup
 // of in-memory state always proceeds even if ctx is cancelled.
 func (c *Coordinator) Stop(ctx context.Context, streamID domain.StreamCode) {
+	c.abrMu.Lock()
+	abr, isABR := c.abrCopies[streamID]
+	if isABR {
+		delete(c.abrCopies, streamID)
+	}
+	c.abrMu.Unlock()
+	if isABR {
+		slog.Info("coordinator: stopping abr copy pipeline", "stream_code", streamID)
+		c.stopABRCopy(ctx, streamID, abr)
+		return
+	}
+
 	slog.Info("coordinator: stopping stream pipeline", "stream_code", streamID)
 	if c.dvr.IsRecording(streamID) {
 		if err := c.dvr.StopRecording(ctx, streamID); err != nil {
@@ -281,6 +334,21 @@ func (c *Coordinator) Stop(ctx context.Context, streamID domain.StreamCode) {
 func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error {
 	if old == nil || new == nil {
 		return fmt.Errorf("coordinator: Update requires both old and new stream")
+	}
+
+	// ABR copy uses a custom pipeline (no ingestor / transcoder), so the
+	// per-component diff routing doesn't apply. Whenever either side is an
+	// ABR copy we full-cycle: stop whatever is running, then start fresh.
+	c.abrMu.RLock()
+	wasABRCopy := c.abrCopies[old.Code] != nil
+	c.abrMu.RUnlock()
+	willBeABRCopy := !new.Disabled && c.detectABRCopy(new) != nil
+	if wasABRCopy || willBeABRCopy {
+		c.Stop(ctx, old.Code)
+		if new.Disabled || len(new.Inputs) == 0 {
+			return nil
+		}
+		return c.Start(ctx, new)
 	}
 
 	diff := ComputeDiff(old, new)
