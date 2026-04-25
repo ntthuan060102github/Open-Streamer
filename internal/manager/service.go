@@ -85,6 +85,11 @@ type SwitchReason string
 // trigger path so the UI legend and frontend filter dropdowns can stay
 // in sync (currently maintained manually).
 const (
+	// SwitchReasonInitial — the very first activation of a stream when
+	// Register picks the best-priority input. From=-1 (no previous active);
+	// recorded so the UI history shows a baseline event for streams that
+	// haven't switched yet.
+	SwitchReasonInitial SwitchReason = "initial"
 	// SwitchReasonError — ingestor reported a non-recoverable error on
 	// the active input (RTMP disconnect, HLS playlist 404, SRT broken …).
 	SwitchReasonError SwitchReason = "error"
@@ -110,9 +115,8 @@ const (
 )
 
 // SwitchEvent records one active-input switch for the rolling history.
-// From = -1 is reserved for "no previous active" (only the very first
-// activation in Register would qualify, but Register intentionally does
-// not record one — history shows real switches only).
+// From = -1 means "no previous active" — used for the initial activation
+// recorded by Register so the UI has a baseline event for fresh streams.
 type SwitchEvent struct {
 	At     time.Time    `json:"at"`
 	From   int          `json:"from"`
@@ -124,7 +128,7 @@ type SwitchEvent struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-const maxSwitchHistory = 5
+const maxSwitchHistory = 20
 
 // recordSwitch prepends an entry, capped at maxSwitchHistory.
 // Caller must hold the parent streamState.mu.
@@ -352,6 +356,18 @@ func (s *Service) Register(ctx context.Context, stream *domain.Stream, bufferWri
 				"input_priority", best.Input.Priority,
 				"err", err,
 			)
+		} else {
+			// Record the baseline event so the UI's switch history shows
+			// "stream came up on input N at T" before any failover happens.
+			// From=-1 distinguishes this from a real input-to-input switch.
+			state.mu.Lock()
+			recordSwitch(state, SwitchEvent{
+				At:     time.Now(),
+				From:   -1,
+				To:     best.Input.Priority,
+				Reason: SwitchReasonInitial,
+			})
+			state.mu.Unlock()
 		}
 	}
 	return nil

@@ -20,28 +20,48 @@ func TestRecordSwitch_OrderingAndCap(t *testing.T) {
 	state := &streamState{}
 	base := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
 
-	for i := 0; i < 7; i++ {
+	// Push more than the cap so the oldest entries roll off.
+	const overflow = 5
+	total := maxSwitchHistory + overflow
+	for i := 0; i < total; i++ {
 		recordSwitch(state, SwitchEvent{
 			At:     base.Add(time.Duration(i) * time.Second),
 			From:   i,
 			To:     i + 1,
 			Reason: SwitchReasonError,
-			Detail: switchDetail(i),
 		})
 	}
 
 	require.Len(t, state.switchHistory, maxSwitchHistory,
 		"ring buffer must cap at %d", maxSwitchHistory)
-	assert.Equal(t, 6, state.switchHistory[0].From, "newest entry at index 0")
-	assert.Equal(t, "switch-6", state.switchHistory[0].Detail)
-	assert.Equal(t, 2, state.switchHistory[maxSwitchHistory-1].From,
+	assert.Equal(t, total-1, state.switchHistory[0].From, "newest entry at index 0")
+	assert.Equal(t, base.Add(time.Duration(total-1)*time.Second), state.switchHistory[0].At)
+	// Oldest survivor: index (total-1 - (cap-1)) = total - cap.
+	assert.Equal(t, total-maxSwitchHistory, state.switchHistory[maxSwitchHistory-1].From,
 		"oldest survivor at end")
-	assert.Equal(t, base.Add(6*time.Second), state.switchHistory[0].At)
+}
+
+// Initial activation in Register must produce a SwitchReasonInitial entry
+// with From=-1, so the UI history shows a baseline event for fresh streams
+// before any failover happens.
+func TestSwitchHistory_RecordsInitialActivation(t *testing.T) {
+	t.Parallel()
+	svc, _ := newSvc(t)
+	require.NoError(t, svc.Register(context.Background(),
+		streamWithInputs("s_init", "rtmp://primary"), ""))
+
+	rt, _ := svc.RuntimeStatus("s_init")
+	require.Len(t, rt.Switches, 1, "Register must record the initial activation")
+	assert.Equal(t, SwitchReasonInitial, rt.Switches[0].Reason)
+	assert.Equal(t, -1, rt.Switches[0].From, "no previous active for initial activation")
+	assert.Equal(t, 0, rt.Switches[0].To, "best-priority input must be the active one")
+	assert.Empty(t, rt.Switches[0].Detail, "initial activation has no extra context")
 }
 
 // ──────────────────────────────────────────────────────────────────────────
 // End-to-end coverage — every callsite of tryFailover must produce a switch
-// entry with the right reason. The cases below pin one path each.
+// entry with the right reason. Switches[0] is the most recent (the failover
+// under test); Switches[1] is the initial activation from Register.
 // ──────────────────────────────────────────────────────────────────────────
 
 // Error path: ingestor reports a failure on the active input → degrade →
@@ -59,11 +79,12 @@ func TestSwitchHistory_RecordsErrorReason(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 
 	rt, _ := svc.RuntimeStatus("s_err")
-	require.Len(t, rt.Switches, 1)
+	require.Len(t, rt.Switches, 2, "initial + error failover")
 	assert.Equal(t, 0, rt.Switches[0].From)
 	assert.Equal(t, 1, rt.Switches[0].To)
 	assert.Equal(t, SwitchReasonError, rt.Switches[0].Reason)
 	assert.Equal(t, "rtmp connection reset", rt.Switches[0].Detail)
+	assert.Equal(t, SwitchReasonInitial, rt.Switches[1].Reason)
 }
 
 // Manual path: SwitchInput API call → failover with reason=manual and no
@@ -80,10 +101,11 @@ func TestSwitchHistory_RecordsManualReason(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 
 	rt, _ := svc.RuntimeStatus("s_man")
-	require.Len(t, rt.Switches, 1)
+	require.Len(t, rt.Switches, 2, "initial + manual switch")
 	assert.Equal(t, SwitchReasonManual, rt.Switches[0].Reason)
 	assert.Empty(t, rt.Switches[0].Detail)
 	assert.Equal(t, 1, rt.Switches[0].To)
+	assert.Equal(t, SwitchReasonInitial, rt.Switches[1].Reason)
 }
 
 // input_removed path: UpdateInputs deletes the active input → failover
@@ -103,9 +125,10 @@ func TestSwitchHistory_RecordsInputRemovedReason(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 
 	rt, _ := svc.RuntimeStatus("s_rm")
-	require.Len(t, rt.Switches, 1)
+	require.Len(t, rt.Switches, 2)
 	assert.Equal(t, SwitchReasonInputRemoved, rt.Switches[0].Reason)
 	assert.Equal(t, 1, rt.Switches[0].To)
+	assert.Equal(t, SwitchReasonInitial, rt.Switches[1].Reason)
 }
 
 // input_added path: UpdateInputs adds a higher-priority input while a
@@ -128,10 +151,14 @@ func TestSwitchHistory_RecordsInputAddedReason(t *testing.T) {
 	}, 2*time.Second, 20*time.Millisecond)
 
 	rt, _ := svc.RuntimeStatus("s_add")
-	require.Len(t, rt.Switches, 1)
+	require.Len(t, rt.Switches, 2)
 	assert.Equal(t, SwitchReasonInputAdded, rt.Switches[0].Reason)
 	assert.Equal(t, 5, rt.Switches[0].From)
 	assert.Equal(t, 1, rt.Switches[0].To)
+	// Initial: From=-1, To=5 (only one input was registered initially).
+	assert.Equal(t, SwitchReasonInitial, rt.Switches[1].Reason)
+	assert.Equal(t, -1, rt.Switches[1].From)
+	assert.Equal(t, 5, rt.Switches[1].To)
 }
 
 // Switches snapshot must be a defensive copy — caller mutating the slice
@@ -145,31 +172,15 @@ func TestSwitchHistory_DefensiveCopy(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		rt, _ := svc.RuntimeStatus("s_def")
-		return len(rt.Switches) > 0
+		return len(rt.Switches) >= 2
 	}, 2*time.Second, 20*time.Millisecond)
 
 	first, _ := svc.RuntimeStatus("s_def")
-	require.Len(t, first.Switches, 1)
+	require.Len(t, first.Switches, 2)
 	first.Switches[0].Reason = "tampered"
 
 	second, _ := svc.RuntimeStatus("s_def")
-	require.Len(t, second.Switches, 1)
+	require.Len(t, second.Switches, 2)
 	assert.Equal(t, SwitchReasonError, second.Switches[0].Reason,
 		"caller mutation of the returned slice must not leak back into state")
-}
-
-// Switches must not be emitted for a freshly-registered stream that
-// hasn't switched yet — Switches[0] otherwise would be the initial
-// activation, which the user explicitly excluded from the history.
-func TestSwitchHistory_NoEntryForInitialActivation(t *testing.T) {
-	t.Parallel()
-	svc, _ := newSvc(t)
-	require.NoError(t, svc.Register(context.Background(),
-		streamWithInputs("s_init", "rtmp://primary"), ""))
-	rt, _ := svc.RuntimeStatus("s_init")
-	assert.Empty(t, rt.Switches, "first activation must not appear in switch history")
-}
-
-func switchDetail(i int) string {
-	return "switch-" + string(rune('0'+i))
 }
