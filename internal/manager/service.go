@@ -316,6 +316,18 @@ func (s *Service) IsRegistered(streamID domain.StreamCode) bool {
 	return ok
 }
 
+// RegisteredStreams returns the codes of every stream currently under
+// manager supervision (snapshot — caller is free to mutate the slice).
+func (s *Service) RegisteredStreams() []domain.StreamCode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]domain.StreamCode, 0, len(s.streams))
+	for code := range s.streams {
+		out = append(out, code)
+	}
+	return out
+}
+
 // RuntimeStatus returns a snapshot of runtime input health, or ok=false if not registered.
 func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool) {
 	s.mu.RLock()

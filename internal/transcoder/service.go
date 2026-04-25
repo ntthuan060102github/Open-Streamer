@@ -173,6 +173,28 @@ func New(i do.Injector) (*Service, error) {
 	}, nil
 }
 
+// SetConfig hot-swaps the cached transcoder config. Used by runtime.Manager
+// when the operator updates GlobalConfig.Transcoder via POST /config so the
+// next Start uses the new value.
+//
+// Already-running streams are NOT restarted from here — caller must
+// stop+start them separately to materialize behaviour-changing fields like
+// MultiOutput. Holding s.mu prevents a Start in flight from observing a
+// torn (half-old, half-new) config.
+func (s *Service) SetConfig(cfg config.TranscoderConfig) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
+
+// Config returns a snapshot of the currently active transcoder config.
+// Used by runtime.diff to compare old vs new without racing SetConfig.
+func (s *Service) Config() config.TranscoderConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
+}
+
 // Start launches the transcoder pipeline for a stream. By default it spawns
 // one FFmpeg per RenditionTarget (legacy mode). When config.MultiOutput is
 // true, spawns ONE FFmpeg per stream that emits all renditions via separate

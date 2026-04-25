@@ -93,6 +93,7 @@ func run() error {
 		Ingestor:         do.MustInvoke[*ingestor.Service](injector),
 		Publisher:        do.MustInvoke[*publisher.Service](injector),
 		Coordinator:      do.MustInvoke[*coordinator.Coordinator](injector),
+		Transcoder:       do.MustInvoke[*transcoder.Service](injector),
 		HooksSvc:         do.MustInvoke[*hooks.Service](injector),
 		APISrv:           do.MustInvoke[*api.Server](injector),
 		Bus:              do.MustInvoke[events.Bus](injector),

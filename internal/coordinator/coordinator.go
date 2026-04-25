@@ -286,6 +286,35 @@ func (c *Coordinator) IsRunning(streamID domain.StreamCode) bool {
 	return copyOK || mixerOK
 }
 
+// RunningStreams returns the codes of every stream whose pipeline is
+// currently active. Used by runtime.diff to enumerate streams that need
+// to be restarted when global config (e.g. transcoder.multi_output) changes.
+//
+// Snapshot semantics: the returned slice is decoupled from the live maps,
+// so a stream torn down between this call and the caller acting on it
+// will safely no-op via Stop's existing "not running" branch.
+func (c *Coordinator) RunningStreams() []domain.StreamCode {
+	seen := make(map[domain.StreamCode]struct{})
+
+	for _, code := range c.mgr.RegisteredStreams() {
+		seen[code] = struct{}{}
+	}
+	c.abrMu.RLock()
+	for code := range c.abrCopies {
+		seen[code] = struct{}{}
+	}
+	for code := range c.abrMixers {
+		seen[code] = struct{}{}
+	}
+	c.abrMu.RUnlock()
+
+	out := make([]domain.StreamCode, 0, len(seen))
+	for code := range seen {
+		out = append(out, code)
+	}
+	return out
+}
+
 // Stop tears down publisher, transcoder, manager (ingest), and the buffer.
 // ctx is used for the DVR stop and the EventStreamStopped publish; cleanup
 // of in-memory state always proceeds even if ctx is cancelled.

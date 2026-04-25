@@ -44,6 +44,18 @@ func (m *spyMgr) IsRegistered(c domain.StreamCode) bool {
 	return m.registered[c]
 }
 
+func (m *spyMgr) RegisteredStreams() []domain.StreamCode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]domain.StreamCode, 0, len(m.registered))
+	for c, ok := range m.registered {
+		if ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func (m *spyMgr) Register(_ context.Context, s *domain.Stream, _ domain.StreamCode) error {
 	m.mu.Lock()
 	m.registered[s.Code] = true

@@ -20,6 +20,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
@@ -35,6 +36,7 @@ type Deps struct {
 	Ingestor         *ingestor.Service
 	Publisher        *publisher.Service
 	Coordinator      *coordinator.Coordinator
+	Transcoder       *transcoder.Service
 	HooksSvc         *hooks.Service
 	APISrv           *api.Server
 	Bus              events.Bus
@@ -241,6 +243,87 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 			slog.SetDefault(logger.New(*new.Log))
 			slog.Info("runtime: log config applied", "level", new.Log.Level, "format", new.Log.Format)
 		}
+	}
+
+	// Transcoder — not a service of its own, but the cached cfg field on
+	// transcoder.Service decides FFmpeg dispatch shape (per-profile vs
+	// multi-output). Hot-swap the cache so future Start() calls use the
+	// new value, then bounce every running stream pipeline so the change
+	// takes effect immediately on already-encoding streams.
+	if configChanged(old.Transcoder, new.Transcoder) && m.deps.Transcoder != nil {
+		m.applyTranscoderChange(old.Transcoder, new.Transcoder)
+	}
+}
+
+// applyTranscoderChange refreshes the cached transcoder config and, when the
+// change requires it, restarts every running stream pipeline so the new
+// settings are materialized in FFmpeg right away.
+func (m *Manager) applyTranscoderChange(oldCfg, newCfg *config.TranscoderConfig) {
+	cfg := config.TranscoderConfig{}
+	if newCfg != nil {
+		cfg = *newCfg
+	}
+	m.deps.Transcoder.SetConfig(cfg)
+
+	// Only restart for fields that actually change in-flight FFmpeg
+	// behaviour. FFmpegPath could in principle be hot-swapped, but we
+	// never run a stale binary mid-stream — restart for that too.
+	if !transcoderRequiresRestart(oldCfg, newCfg) {
+		slog.Info("runtime: transcoder config updated (no restart required)")
+		return
+	}
+
+	codes := m.deps.Coordinator.RunningStreams()
+	if len(codes) == 0 {
+		slog.Info("runtime: transcoder config updated (no running streams)")
+		return
+	}
+
+	slog.Info("runtime: restarting streams to apply transcoder config",
+		"streams", len(codes))
+	// Detach from any request context — restarts run in the background and
+	// must outlive the HTTP call that triggered Apply.
+	ctx := context.WithoutCancel(m.rootCtx)
+	for _, code := range codes {
+		m.restartStream(ctx, code)
+	}
+}
+
+// transcoderRequiresRestart reports whether the change in transcoder config
+// affects already-running FFmpeg processes. Fields that only feed the next
+// Start() (and have no in-flight effect) can be hot-swapped without bouncing
+// streams.
+func transcoderRequiresRestart(oldCfg, newCfg *config.TranscoderConfig) bool {
+	oldMO, oldFP := false, ""
+	if oldCfg != nil {
+		oldMO, oldFP = oldCfg.MultiOutput, oldCfg.FFmpegPath
+	}
+	newMO, newFP := false, ""
+	if newCfg != nil {
+		newMO, newFP = newCfg.MultiOutput, newCfg.FFmpegPath
+	}
+	return oldMO != newMO || oldFP != newFP
+}
+
+// restartStream stops the pipeline, reloads the persisted stream from
+// the repo (so any concurrent edit lands), and starts it back up. Skips
+// streams whose pipeline died between the snapshot and the restart, and
+// streams that have been disabled since.
+func (m *Manager) restartStream(ctx context.Context, code domain.StreamCode) {
+	stream, err := m.deps.StreamRepo.FindByCode(ctx, code)
+	if err != nil {
+		slog.Warn("runtime: skip restart, stream lookup failed",
+			"stream_code", code, "err", err)
+		return
+	}
+	if stream.Disabled {
+		slog.Info("runtime: skip restart, stream disabled", "stream_code", code)
+		return
+	}
+	m.deps.Coordinator.Stop(ctx, code)
+	if err := m.deps.Coordinator.Start(ctx, stream); err != nil {
+		slog.Warn("runtime: stream restart failed",
+			"stream_code", code, "err", err)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 // mgrDep is the subset of manager.Service the coordinator needs.
 type mgrDep interface {
 	IsRegistered(domain.StreamCode) bool
+	RegisteredStreams() []domain.StreamCode
 	Register(context.Context, *domain.Stream, domain.StreamCode) error
 	Unregister(domain.StreamCode)
 	UpdateInputs(domain.StreamCode, []domain.Input, []domain.Input, []domain.Input)
