@@ -143,7 +143,7 @@ func TestBuildScaleFilter(t *testing.T) {
 		{"CPU both dims (default pad)", 1280, 720, domain.HWAccelNone, "libx264", "scale=1280:720:", false},
 		{"CPU width only", 1280, 0, domain.HWAccelNone, "libx264", "scale=1280:-2", false},
 		{"CPU height only", 0, 720, domain.HWAccelNone, "libx264", "scale=-2:720", false},
-		{"NVENC both dims (default pad → CPU round-trip)", 1280, 720, domain.HWAccelNVENC, "h264_nvenc", "hwdownload", false},
+		{"NVENC both dims (pure GPU scale_cuda)", 1280, 720, domain.HWAccelNVENC, "h264_nvenc", "scale_cuda=1280:720:", false},
 		{"NVENC + CPU encoder mismatch → CPU scale", 1280, 720, domain.HWAccelNVENC, "libx264", "scale=1280:720:", false},
 		{"VAAPI both dims → scale_vaapi", 1920, 1080, domain.HWAccelVAAPI, "h264_vaapi", "scale_vaapi=1920:1080:", false},
 		{"QSV both dims → scale_qsv", 1280, 720, domain.HWAccelQSV, "h264_qsv", "scale_qsv=1280:720:", false},
@@ -201,30 +201,35 @@ func TestResizeFilter_Modes(t *testing.T) {
 			wantNot:  []string{"pad="},
 		},
 		{
-			name: "GPU NVENC pad → CPU round-trip (no pad_cuda)",
+			// pad on GPU degrades to fit (aspect-preserving scale, no
+			// server-side letterbox). Letterbox is rendered client-side by
+			// every modern HLS/DASH player. Trade-off accepted in exchange
+			// for ~10-15% CPU/process saved (no hwdownload→CPU→hwupload).
+			name: "GPU NVENC pad → pure GPU scale (degrades to fit)",
 			w:    1920, h: 1080, mode: "pad", hw: domain.HWAccelNVENC, enc: "h264_nvenc",
-			// pad_cuda was dropped: round-trip through CPU is universal across
-			// ffmpeg builds and the cost is paid only when source/target aspects
-			// differ. No-op for typical 16:9 ABR ladders.
-			wantSubs: []string{"hwdownload", "format=nv12", "pad=", "hwupload_cuda"},
-			wantNot:  []string{"pad_cuda", "scale_cuda"},
+			wantSubs: []string{"scale_cuda=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2"},
+			wantNot:  []string{"hwdownload", "hwupload", "pad="},
 		},
 		{
 			name: "GPU NVENC stretch",
 			w:    1280, h: 720, mode: "stretch", hw: domain.HWAccelNVENC, enc: "h264_nvenc",
 			wantSubs: []string{"scale_cuda=1280:720"},
-			wantNot:  []string{"force_original_aspect_ratio", "pad_cuda"},
+			wantNot:  []string{"force_original_aspect_ratio", "pad_cuda", "hwdownload"},
 		},
 		{
 			name: "GPU NVENC fit",
 			w:    1280, h: 720, mode: "fit", hw: domain.HWAccelNVENC, enc: "h264_nvenc",
 			wantSubs: []string{"scale_cuda=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2"},
-			wantNot:  []string{"pad_cuda"},
+			wantNot:  []string{"pad_cuda", "hwdownload"},
 		},
 		{
-			name: "GPU NVENC crop → CPU round-trip",
+			// crop on GPU also degrades to fit — CUDA filter graph has no
+			// crop primitive without CPU round-trip. Operators who need
+			// strict cropping must use HW=none (CPU encode).
+			name: "GPU NVENC crop → pure GPU scale (degrades to fit)",
 			w:    1280, h: 720, mode: "crop", hw: domain.HWAccelNVENC, enc: "h264_nvenc",
-			wantSubs: []string{"hwdownload", "format=nv12", "crop=1280:720", "hwupload_cuda"},
+			wantSubs: []string{"scale_cuda=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2"},
+			wantNot:  []string{"hwdownload", "hwupload", "crop="},
 		},
 		{
 			name: "Unknown mode falls back to pad",
@@ -245,19 +250,36 @@ func TestResizeFilter_Modes(t *testing.T) {
 	}
 }
 
-// pad_cuda was deliberately dropped — the GPU pad mode always round-trips
-// through CPU pad (hwdownload → cpu pad → hwupload_cuda). Rationale: pad_cuda
-// requires --enable-cuda-nvcc (Ubuntu apt skips it), has had option-syntax
-// bugs in the wild, and the CPU round-trip is only paid when source/target
-// aspects differ — typical 16:9 ABR ladders never trigger pad in practice.
-func TestGpuResizeFilter_PadAlwaysRoundTripsCPU(t *testing.T) {
+// All resize modes on GPU degrade to aspect-preserving scale (= fit).
+// Server-side pad / crop would require a CPU round-trip
+// (hwdownload→CPU filter→hwupload_cuda) costing ~10-15% CPU/process —
+// unacceptable at scale. Players render letterbox client-side.
+func TestGpuResizeFilter_PadAndCropStayPureGPU(t *testing.T) {
 	t.Parallel()
-	got := gpuResizeFilter("scale_cuda", 1280, 720, domain.ResizeModePad)
-	require.Contains(t, got, "hwdownload", "must hwdownload before CPU pad")
-	require.Contains(t, got, "format=nv12")
-	require.Contains(t, got, "pad=", "must use CPU pad filter")
-	require.Contains(t, got, "hwupload_cuda", "must re-upload to VRAM for the encoder")
-	require.NotContains(t, got, "pad_cuda", "pad_cuda is intentionally never emitted")
+	for _, mode := range []domain.ResizeMode{
+		domain.ResizeModePad,
+		domain.ResizeModeCrop,
+		domain.ResizeModeFit,
+		"",
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			got := gpuResizeFilter("scale_cuda", 1280, 720, mode)
+			require.Contains(t, got, "scale_cuda=1280:720", "must use pure GPU scaler")
+			require.Contains(t, got, "force_original_aspect_ratio=decrease", "must preserve aspect")
+			require.NotContains(t, got, "hwdownload", "no CPU round-trip allowed")
+			require.NotContains(t, got, "hwupload", "no CPU round-trip allowed")
+			require.NotContains(t, got, "pad=", "no server-side pad — clients handle letterbox")
+			require.NotContains(t, got, "crop=", "no server-side crop on GPU pipeline")
+		})
+	}
+}
+
+// Stretch on GPU is exact W×H (no aspect preservation) — the only mode that
+// intentionally distorts. Operators must opt in explicitly.
+func TestGpuResizeFilter_StretchExactDimensions(t *testing.T) {
+	t.Parallel()
+	got := gpuResizeFilter("scale_cuda", 1280, 720, domain.ResizeModeStretch)
+	require.Equal(t, "scale_cuda=1280:720", got, "stretch must be exact, no aspect flag")
 }
 
 func TestDeinterlaceFilter(t *testing.T) {

@@ -220,12 +220,24 @@ func gpuScaleFilterName(hw domain.HWAccel, encoder string) (string, bool) {
 }
 
 // gpuResizeFilter builds an in-VRAM scaler chain for the active hwaccel.
-// stretch and fit stay fully in VRAM. pad and crop both round-trip through
-// CPU (hwdownload→cpu filter→hwupload_cuda) — pad_cuda was deliberately
-// dropped: the round-trip overhead is only paid when source/target aspects
-// differ (no-op for typical 16:9 ABR ladders), and the CPU pad filter is
-// rock-solid across every ffmpeg build, while pad_cuda needs a CUDA-enabled
-// build (Ubuntu apt skips it) and has had option-syntax bugs in the wild.
+// All four modes stay fully on the GPU — pad and crop degrade to fit
+// (aspect-preserving scale, no server-side letterbox bars or cropping).
+//
+// Rationale: the previous CPU round-trip for pad/crop
+// (hwdownload→CPU filter→hwupload_cuda) cost ~10-15% of one CPU core per
+// FFmpeg process. With 21 streams × 2 profile = 42 processes that was
+// ~5 cores burned just shuttling frames between VRAM and RAM, even when
+// the source and target had the same aspect ratio (the typical ABR case).
+//
+// Trade-off accepted by this change:
+//   - pad: server no longer renders black letterbox bars when source aspect
+//     differs from target. Players (HLS.js, native Safari, VLC) all render
+//     letterbox client-side automatically — server-side bars are redundant
+//     in 99% of viewing scenarios.
+//   - crop: similarly, no server-side cropping. Source aspect is preserved
+//     within the target box. Operators who genuinely need crop must use
+//     CPU encode (HW=none) — the GPU CUDA filter graph has no crop
+//     primitive without round-trip.
 func gpuResizeFilter(name string, w, h int, mode domain.ResizeMode) string {
 	// Single-axis specifications collapse to a fit/stretch behavior — there's
 	// no aspect to enforce when one dimension is auto.
@@ -235,27 +247,11 @@ func gpuResizeFilter(name string, w, h int, mode domain.ResizeMode) string {
 		}
 		return fmt.Sprintf("%s=-2:%d", name, h)
 	}
-	switch mode {
-	case domain.ResizeModeStretch:
+	if mode == domain.ResizeModeStretch {
 		return fmt.Sprintf("%s=%d:%d", name, w, h)
-	case domain.ResizeModeFit:
-		return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", name, w, h)
-	case domain.ResizeModeCrop:
-		// CUDA filter graph has no crop primitive; round-trip via CPU.
-		// hwupload_cuda promotes the cropped frame back to VRAM for the encoder.
-		return fmt.Sprintf("hwdownload,format=nv12,%s,hwupload_cuda", cpuResizeFilter(w, h, domain.ResizeModeCrop))
-	case domain.ResizeModePad:
-		fallthrough
-	default:
-		if name == "scale_cuda" {
-			// CPU pad round-trip — see function doc for rationale.
-			return fmt.Sprintf("hwdownload,format=nv12,%s,hwupload_cuda", cpuResizeFilter(w, h, domain.ResizeModePad))
-		}
-		// Non-CUDA GPU backends (VAAPI/QSV): no universal pad_<backend> filter
-		// and the hwupload variant is backend-specific. Degrade pad → fit
-		// (aspect-preserving scale, no letterbox bars).
-		return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", name, w, h)
 	}
+	// fit / pad / crop / default: aspect-preserving GPU scale.
+	return fmt.Sprintf("%s=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2", name, w, h)
 }
 
 func cpuResizeFilter(w, h int, mode domain.ResizeMode) string {

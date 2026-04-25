@@ -809,11 +809,13 @@ func TestScenario_CPU_CropMode_HasNoPad(t *testing.T) {
 	require.NotContains(t, vf, "pad=", "crop mode must not emit pad")
 }
 
-func TestScenario_NVENC_CropMode_RoundTripsThroughCPU(t *testing.T) {
+func TestScenario_NVENC_CropMode_DegradesToFitOnGPU(t *testing.T) {
 	t.Parallel()
-	// CUDA filter graph has no crop primitive — chain must round-trip via CPU
-	// (hwdownload → CPU crop → hwupload_cuda) so the encoder still gets CUDA
-	// frames. Encoder stays on GPU; only the crop step pays PCIe cost.
+	// CUDA filter graph has no crop primitive. The previous behaviour did a
+	// CPU round-trip (hwdownload → CPU crop → hwupload_cuda) for ~10-15%
+	// CPU/process — unacceptable at scale. Crop now degrades to
+	// aspect-preserving GPU scale (= fit). Operators who genuinely need
+	// strict cropping must use HW=none (CPU encode) explicitly.
 	tc := &domain.TranscoderConfig{
 		Video:  domain.VideoTranscodeConfig{},
 		Audio:  domain.AudioTranscodeConfig{Copy: true},
@@ -829,11 +831,10 @@ func TestScenario_NVENC_CropMode_RoundTripsThroughCPU(t *testing.T) {
 
 	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"))
 	vf := argAfter(args, "-vf")
-	require.Contains(t, vf, "hwdownload")
-	require.Contains(t, vf, "format=nv12")
-	require.Contains(t, vf, "crop=1280:720")
-	require.Contains(t, vf, "hwupload_cuda")
-	// Encoder pipeline still gets cuda frames overall.
+	require.Contains(t, vf, "scale_cuda=1280:720")
+	require.Contains(t, vf, "force_original_aspect_ratio=decrease")
+	require.NotContains(t, vf, "hwdownload", "no CPU round-trip — must stay pure GPU")
+	require.NotContains(t, vf, "crop=", "crop primitive not emitted on GPU pipeline")
 	require.Equal(t, "cuda", argAfter(args, "-hwaccel_output_format"))
 }
 
