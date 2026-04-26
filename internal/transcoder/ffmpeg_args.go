@@ -56,8 +56,8 @@ func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string,
 			args = append(args, "-vf", vf)
 		}
 		args = append(args, "-c:v", videoEnc)
-		if p.Preset != "" {
-			args = append(args, "-preset", p.Preset)
+		if preset := normalizePreset(p.Preset, videoEnc); preset != "" {
+			args = append(args, "-preset", preset)
 		}
 		if p.CodecProfile != "" {
 			args = append(args, "-profile:v", p.CodecProfile)
@@ -160,8 +160,8 @@ func buildMultiOutputArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]st
 			args = append(args, "-vf:v:0", vf)
 		}
 		args = append(args, "-c:v:0", videoEnc)
-		if p.Preset != "" {
-			args = append(args, "-preset:v:0", p.Preset)
+		if preset := normalizePreset(p.Preset, videoEnc); preset != "" {
+			args = append(args, "-preset:v:0", preset)
 		}
 		if p.CodecProfile != "" {
 			args = append(args, "-profile:v:0", p.CodecProfile)
@@ -449,6 +449,115 @@ func bframesArgs(bf *int, encoder string) []string {
 
 func normalizeVideoEncoder(codec string, hw domain.HWAccel) string {
 	return domain.ResolveVideoEncoder(domain.VideoCodec(codec), hw)
+}
+
+// libx264-style presets — accepted verbatim by libx264, libx265, and
+// h264_qsv/hevc_qsv. The list is fixed by upstream FFmpeg so it's
+// safe to hardcode; any new value would be silently rejected by the
+// encoder and we'd want to skip-and-fall-back-to-default anyway.
+var libx264Presets = map[string]bool{
+	"ultrafast": true, "superfast": true, "veryfast": true,
+	"faster": true, "fast": true, "medium": true,
+	"slow": true, "slower": true, "veryslow": true, "placebo": true,
+}
+
+// NVENC accepts the modern p1–p7 series + a legacy alias set. Some
+// legacy aliases (slow/medium/fast) overlap with libx264 names — they
+// stay valid here so a value typed as "fast" works on either family.
+var nvencPresets = map[string]bool{
+	"p1": true, "p2": true, "p3": true, "p4": true,
+	"p5": true, "p6": true, "p7": true,
+	"default": true, "hp": true, "hq": true, "bd": true,
+	"ll": true, "llhq": true, "llhp": true,
+	"lossless": true, "losslesshp": true,
+	"slow": true, "medium": true, "fast": true,
+}
+
+// libx264 → NVENC translation table. Maps the speed/quality intent of
+// each libx264 preset to its closest NVENC p-series equivalent. Used
+// when the operator picks a libx264-style value but the resolved
+// encoder is NVENC (common when codec="" + HW=nvenc routes to
+// h264_nvenc — the user typed "veryfast" expecting libx264 semantics).
+//
+// Mapping is rough but consistent with NVENC SDK guidance: p1=fastest,
+// p7=highest quality. Documented at:
+//
+//	https://docs.nvidia.com/video-technologies/video-codec-sdk/12.0/nvenc-application-note/
+var x264ToNvencPreset = map[string]string{
+	"ultrafast": "p1",
+	"superfast": "p1",
+	"veryfast":  "p2",
+	"faster":    "p3",
+	"fast":      "p3",
+	"medium":    "p4",
+	"slow":      "p5",
+	"slower":    "p6",
+	"veryslow":  "p7",
+	"placebo":   "p7",
+}
+
+// NVENC → libx264 translation table (symmetric with x264ToNvencPreset).
+// Used when the operator explicitly types "p4" but the resolved
+// encoder is libx264 (HW configured to none, codec stays empty).
+var nvencToX264Preset = map[string]string{
+	"p1": "ultrafast", "p2": "veryfast",
+	"p3": "fast", "p4": "medium",
+	"p5": "slow", "p6": "slower", "p7": "veryslow",
+}
+
+// normalizePreset translates the user-supplied preset string to a value
+// the resolved encoder will accept. Stream config is encoder-agnostic
+// at the API level — operator picks "fast" / "medium" / "p4" / etc.
+// without knowing which FFmpeg encoder name HW routing produces — so
+// this helper bridges to the encoder-specific syntax. Without it,
+// preset="veryfast" + encoder="h264_nvenc" makes FFmpeg reject the
+// invocation ("Undefined constant 'veryfast'") and the stream goes
+// down with 0 packets out.
+//
+// Returns "" when the preset cannot be translated. Caller skips the
+// `-preset` flag entirely so the encoder picks its own internal
+// default — encoders that lack a preset concept (VAAPI uses
+// `-compression_level`, VideoToolbox has no analog) always return "".
+func normalizePreset(preset, encoder string) string {
+	p := strings.TrimSpace(strings.ToLower(preset))
+	if p == "" {
+		return ""
+	}
+	enc := strings.ToLower(encoder)
+
+	switch {
+	case strings.Contains(enc, "nvenc"):
+		if nvencPresets[p] {
+			return p
+		}
+		if mapped, ok := x264ToNvencPreset[p]; ok {
+			return mapped
+		}
+		return ""
+
+	case strings.HasPrefix(enc, "libx264"),
+		strings.HasPrefix(enc, "libx265"),
+		strings.Contains(enc, "qsv"):
+		if libx264Presets[p] {
+			return p
+		}
+		if mapped, ok := nvencToX264Preset[p]; ok {
+			return mapped
+		}
+		return ""
+
+	case strings.Contains(enc, "vaapi"),
+		strings.Contains(enc, "videotoolbox"):
+		// No `-preset` mechanism on these backends; let the encoder
+		// pick its built-in defaults / use its own knobs (vaapi uses
+		// `-compression_level`, vt has no analog).
+		return ""
+	}
+
+	// Unknown encoder family (custom build, future codec). Pass the
+	// preset through unchanged — encoder will reject if invalid; we
+	// don't want to silently drop a value the operator typed.
+	return preset
 }
 
 func gopFrames(tc *domain.TranscoderConfig, p Profile) int {
