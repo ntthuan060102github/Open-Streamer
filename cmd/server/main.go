@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,6 +72,32 @@ func run() error {
 
 	// 4. Provide individual sub-configs to DI so services can read them at construction time.
 	provideSubConfigs(injector, gcfg)
+
+	// 4b. Probe FFmpeg before any service starts. A missing required encoder
+	// (libx264 / aac / mpegts) means transcoding will crash on every stream
+	// — fail fast with a clear error instead of accepting traffic and
+	// erroring per-stream later. Path defaults to "ffmpeg" via $PATH when
+	// gcfg.Transcoder.FFmpegPath is empty (matches publisher.NewService).
+	ffmpegPath := ""
+	if gcfg.Transcoder != nil {
+		ffmpegPath = gcfg.Transcoder.FFmpegPath
+	}
+	probeRes, probeErr := transcoder.Probe(ctx, ffmpegPath)
+	if probeErr != nil {
+		return fmt.Errorf("ffmpeg probe: %w", probeErr)
+	}
+	if !probeRes.OK {
+		return fmt.Errorf("ffmpeg %q at %s is incompatible: %s",
+			probeRes.Version, probeRes.Path, strings.Join(probeRes.Errors, "; "))
+	}
+	slog.Info("ffmpeg probe ok",
+		"path", probeRes.Path,
+		"version", probeRes.Version,
+		"warnings", len(probeRes.Warnings),
+	)
+	for _, w := range probeRes.Warnings {
+		slog.Warn("ffmpeg capability missing", "msg", w)
+	}
 
 	// Init logger from store config.
 	if gcfg.Log != nil {

@@ -99,6 +99,52 @@ const docTemplate = `{
                 }
             }
         },
+        "/config/transcoder/probe": {
+            "post": {
+                "description": "Inspects the binary at ffmpeg_path (empty = $PATH) and reports which required / optional encoders + muxers are available. Pure check — does not modify config.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Probe an FFmpeg binary for app compatibility.",
+                "parameters": [
+                    {
+                        "description": "Path to probe (empty = use $PATH)",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.probeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/transcoder.ProbeResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "502": {
+                        "description": "Bad Gateway",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
         "/config/yaml": {
             "get": {
                 "description": "Returns global_config, streams, and hooks bundled in a single YAML document. Pair with PUT /config/yaml to round-trip an editor.",
@@ -3061,6 +3107,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handler.probeRequest": {
+            "type": "object",
+            "properties": {
+                "ffmpeg_path": {
+                    "type": "string"
+                }
+            }
+        },
         "handler.rtspListenerDefaults": {
             "type": "object",
             "properties": {
@@ -3243,6 +3297,47 @@ const docTemplate = `{
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/publisher.PushSnapshot"
+                    }
+                }
+            }
+        },
+        "transcoder.ProbeResult": {
+            "type": "object",
+            "properties": {
+                "encoders": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "boolean"
+                        }
+                    }
+                },
+                "errors": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "muxers": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "boolean"
+                    }
+                },
+                "ok": {
+                    "type": "boolean"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "string"
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
                     }
                 }
             }

@@ -192,6 +192,18 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate FFmpeg path before Apply when transcoder.ffmpeg_path is
+	// changing — Apply persists immediately and would happily save a
+	// broken path that crashes every transcoder restart afterwards. Only
+	// re-probe when the path actually changed (probe is ~50ms × 3 sub-
+	// invocations; not worth running on unrelated config edits).
+	if h.transcoderPathChanged(current, &merged) {
+		if vErr := h.validateTranscoderPath(r.Context(), &merged); vErr != nil {
+			writeError(w, http.StatusBadRequest, vErr.code, vErr.message)
+			return
+		}
+	}
+
 	if err := h.rtm.Apply(r.Context(), &merged); err != nil {
 		serverError(w, r, "APPLY_FAILED", "apply config", err)
 		return

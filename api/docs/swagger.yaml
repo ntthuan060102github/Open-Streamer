@@ -1330,6 +1330,11 @@ definitions:
       live_window:
         type: integer
     type: object
+  handler.probeRequest:
+    properties:
+      ffmpeg_path:
+        type: string
+    type: object
   handler.rtspListenerDefaults:
     properties:
       listen_host:
@@ -1465,6 +1470,33 @@ definitions:
           $ref: '#/definitions/publisher.PushSnapshot'
         type: array
     type: object
+  transcoder.ProbeResult:
+    properties:
+      encoders:
+        additionalProperties:
+          additionalProperties:
+            type: boolean
+          type: object
+        type: object
+      errors:
+        items:
+          type: string
+        type: array
+      muxers:
+        additionalProperties:
+          type: boolean
+        type: object
+      ok:
+        type: boolean
+      path:
+        type: string
+      version:
+        type: string
+      warnings:
+        items:
+          type: string
+        type: array
+    type: object
   transcoder.ProfileSnapshot:
     properties:
       errors:
@@ -1576,6 +1608,38 @@ paths:
           schema:
             $ref: '#/definitions/handler.configDefaultsResponse'
       summary: Get system configuration defaults.
+      tags:
+      - system
+  /config/transcoder/probe:
+    post:
+      consumes:
+      - application/json
+      description: Inspects the binary at ffmpeg_path (empty = $PATH) and reports
+        which required / optional encoders + muxers are available. Pure check — does
+        not modify config.
+      parameters:
+      - description: Path to probe (empty = use $PATH)
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handler.probeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/transcoder.ProbeResult'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "502":
+          description: Bad Gateway
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Probe an FFmpeg binary for app compatibility.
       tags:
       - system
   /config/yaml:

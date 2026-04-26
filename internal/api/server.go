@@ -78,6 +78,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	r.Get("/config", s.configH.GetConfig)
 	r.Post("/config", s.configH.UpdateConfig)
 	r.Get("/config/defaults", s.configH.GetConfigDefaults)
+	r.Post("/config/transcoder/probe", s.configH.ProbeTranscoder)
 	r.Get("/config/yaml", s.configH.GetConfigYAML)
 	r.Put("/config/yaml", s.configH.ReplaceConfigYAML)
 
