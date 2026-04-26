@@ -82,7 +82,9 @@ func run() error {
 	if gcfg.Transcoder != nil {
 		ffmpegPath = gcfg.Transcoder.FFmpegPath
 	}
-	probeRes, probeErr := transcoder.Probe(ctx, ffmpegPath)
+	// Empty hw → probe covers every backend's encoders so warnings
+	// surface for whatever HW any persisted stream might select.
+	probeRes, probeErr := transcoder.Probe(ctx, ffmpegPath, "")
 	if probeErr != nil {
 		return fmt.Errorf("ffmpeg probe: %w", probeErr)
 	}

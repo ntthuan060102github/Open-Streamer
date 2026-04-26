@@ -12,10 +12,17 @@ import (
 )
 
 // probeRequest is the body shape for POST /config/transcoder/probe.
+//
 // FFmpegPath empty → server probes "ffmpeg" via $PATH (matches the
 // runtime default at publisher.NewService and transcoder.Service).
+//
+// HW filters the OPTIONAL encoder set so the response only carries
+// encoders relevant to the operator's hardware selection — UI just
+// renders that list with no client-side filtering. Empty HW returns
+// every backend's encoders (used by "show all" views).
 type probeRequest struct {
-	FFmpegPath string `json:"ffmpeg_path"`
+	FFmpegPath string         `json:"ffmpeg_path"`
+	HW         domain.HWAccel `json:"hw,omitempty"`
 }
 
 // probeRequestTimeout caps the entire probe call (ffmpeg sub-invocations
@@ -53,7 +60,7 @@ func (h *ConfigHandler) ProbeTranscoder(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), probeRequestTimeout)
 	defer cancel()
 
-	res, err := transcoder.Probe(ctx, body.FFmpegPath)
+	res, err := transcoder.Probe(ctx, body.FFmpegPath, body.HW)
 	if err != nil {
 		// Binary unusable (not found / not executable / not FFmpeg).
 		// 502 — the path the caller supplied points to something the
@@ -92,7 +99,10 @@ func (h *ConfigHandler) validateTranscoderPath(ctx context.Context, proposed *do
 	if proposed != nil && proposed.Transcoder != nil {
 		path = proposed.Transcoder.FFmpegPath
 	}
-	res, err := transcoder.Probe(probeCtx, path)
+	// Empty hw → probe covers every backend's encoders. Server-wide
+	// path swap could affect streams using any HW, so we validate
+	// against the union (REQUIRED set is the same regardless).
+	res, err := transcoder.Probe(probeCtx, path, "")
 	if err != nil {
 		return &putValidationError{
 			code:    "FFMPEG_UNUSABLE",

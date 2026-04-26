@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // ProbeResult is the structured outcome of inspecting an FFmpeg binary
@@ -43,18 +45,81 @@ var (
 // Optional capability sets — missing means specific configs will fail
 // but the server still boots. UI surfaces these as warnings + can
 // disable the corresponding selections in dropdowns.
-var (
-	optionalEncoders = []string{
-		"h264_nvenc", "hevc_nvenc", // NVENC HW
+var optionalMuxers = []string{"hls", "dash"}
+
+// hwOptionalEncoders maps a hardware backend to the video encoders that
+// are relevant FOR THAT BACKEND. Used to filter probe output so the UI
+// shows only encoders applicable to the operator's current HW selection.
+//
+// HWAccelNone covers the CPU pipeline — the alternative video codecs
+// (h265, vp9, av1) are reachable only without HW acceleration.
+//
+// Each HW backend that supports an explicit encoder name (e.g. h264_qsv)
+// lists it here so operators picking that backend get a flat "this is
+// available / missing" view of what they care about.
+var hwOptionalEncoders = map[domain.HWAccel][]string{
+	domain.HWAccelNone: {
 		"libx265",    // h265 CPU
 		"libvpx-vp9", // vp9
 		"libsvtav1",  // av1
-		"libopus",    // opus audio
-		"libmp3lame", // mp3 audio
-		"ac3",        // ac3 audio
+	},
+	domain.HWAccelNVENC: {
+		"h264_nvenc",
+		"hevc_nvenc",
+	},
+	domain.HWAccelVAAPI: {
+		"h264_vaapi",
+		"hevc_vaapi",
+	},
+	domain.HWAccelQSV: {
+		"h264_qsv",
+		"hevc_qsv",
+	},
+	domain.HWAccelVideoToolbox: {
+		"h264_videotoolbox",
+		"hevc_videotoolbox",
+	},
+}
+
+// audioOptionalEncoders are HW-independent — included regardless of the
+// caller's hw filter (audio doesn't have HW variants in this app).
+var audioOptionalEncoders = []string{
+	"libopus",
+	"libmp3lame",
+	"ac3",
+}
+
+// optionalEncodersFor returns the optional encoder set the probe should
+// inspect for a given HW backend. Empty hw → union of every backend's
+// set + audio (used by the boot check so warnings cover everything).
+func optionalEncodersFor(hw domain.HWAccel) []string {
+	if hw == "" {
+		// Union: every HW-specific encoder + audio. Order is fixed so
+		// the response is deterministic and JSON output is stable.
+		var all []string
+		for _, key := range []domain.HWAccel{
+			domain.HWAccelNone,
+			domain.HWAccelNVENC,
+			domain.HWAccelVAAPI,
+			domain.HWAccelQSV,
+			domain.HWAccelVideoToolbox,
+		} {
+			all = append(all, hwOptionalEncoders[key]...)
+		}
+		return append(all, audioOptionalEncoders...)
 	}
-	optionalMuxers = []string{"hls", "dash"}
-)
+	hwSet, known := hwOptionalEncoders[hw]
+	if !known {
+		// Unknown HW backend — fall back to CPU set + audio rather than
+		// returning empty (operator picked a typo'd value; still report
+		// something useful instead of "no optionals at all").
+		hwSet = hwOptionalEncoders[domain.HWAccelNone]
+	}
+	out := make([]string, 0, len(hwSet)+len(audioOptionalEncoders))
+	out = append(out, hwSet...)
+	out = append(out, audioOptionalEncoders...)
+	return out
+}
 
 // probeTimeout caps each ffmpeg sub-invocation so a hung binary doesn't
 // block boot or an HTTP request indefinitely.
@@ -74,10 +139,20 @@ var versionRE = regexp.MustCompile(`(?i)^ffmpeg version\s+(\S+)`)
 //
 // Empty path is normalised to "ffmpeg" (PATH lookup) — matches the
 // runtime default at publisher.NewService and transcoder.Service.
-func Probe(ctx context.Context, path string) (*ProbeResult, error) {
+//
+// hw filters the OPTIONAL encoder set to only those relevant to the
+// caller's chosen backend (e.g. hw=nvenc → h264_nvenc/hevc_nvenc + audio
+// codecs; hw=none → libx265/libvpx-vp9/libsvtav1 + audio). Empty hw
+// includes every backend's encoders — used by the boot check so
+// warnings cover whatever any future stream might select.
+//
+// REQUIRED set (libx264, aac, mpegts) is constant — independent of hw.
+func Probe(ctx context.Context, path string, hw domain.HWAccel) (*ProbeResult, error) {
 	if strings.TrimSpace(path) == "" {
 		path = "ffmpeg"
 	}
+
+	optionalEncoders := optionalEncodersFor(hw)
 
 	res := &ProbeResult{
 		Path:     path,
