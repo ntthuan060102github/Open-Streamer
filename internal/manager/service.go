@@ -465,6 +465,14 @@ func (s *Service) RecordPacket(streamID domain.StreamCode, inputPriority int) {
 	}
 
 	now := time.Now()
+	// recoveredFromExhaustion captures the post-recovery transition under the
+	// lock so we can fire the onRestored callback after unlocking. The
+	// callback re-enters the coordinator (StatusDegraded → StatusActive
+	// transition) and we must not hold state.mu across that — risk of lock
+	// inversion with handlers that call back into the manager.
+	recoveredFromExhaustion := false
+	var recoveryCtx context.Context
+
 	state.mu.Lock()
 	if !state.dead {
 		if h, found := state.inputs[inputPriority]; found {
@@ -482,10 +490,49 @@ func (s *Service) RecordPacket(streamID domain.StreamCode, inputPriority int) {
 				h.Errors = nil
 				delete(state.degradedAt, inputPriority)
 				s.m.ManagerInputHealth.WithLabelValues(string(streamID), strconv.Itoa(inputPriority)).Set(1)
+
+				// Bypass-probe recovery: ingestor reader (HLS pull, RTMP
+				// reconnect, …) repaired itself before the manager's probe
+				// cycle (~8s cooldown) had a chance to run. Without this
+				// the exhausted flag stays true forever — UI shows "all
+				// inputs exhausted" alert despite packets flowing — and no
+				// switch event is recorded for the recovery moment.
+				//
+				// Only the active input clears exhausted: a non-active
+				// input recovering doesn't bring the pipeline back online
+				// (we'd still need to switch to it via tryFailover).
+				if state.exhausted && inputPriority == state.active {
+					state.exhausted = false
+					state.lastSwitchAt = now
+					recordSwitch(state, SwitchEvent{
+						At:     now,
+						From:   inputPriority,
+						To:     inputPriority,
+						Reason: SwitchReasonRecovery,
+						Detail: "ingestor auto-reconnect",
+					})
+					recoveredFromExhaustion = true
+					recoveryCtx = state.monCtx
+				}
 			}
 		}
 	}
 	state.mu.Unlock()
+
+	if recoveredFromExhaustion {
+		s.m.ManagerFailoversTotal.WithLabelValues(string(streamID)).Inc()
+		//nolint:contextcheck // event publish must outlive any single-packet ctx
+		s.bus.Publish(recoveryCtx, domain.Event{
+			Type:       domain.EventInputFailover,
+			StreamCode: streamID,
+			Payload: map[string]any{
+				"from":   inputPriority,
+				"to":     inputPriority,
+				"reason": string(SwitchReasonRecovery),
+			},
+		})
+		s.notifyRestored(true, streamID)
+	}
 }
 
 // ReportInputError marks an input degraded immediately and triggers failover.
