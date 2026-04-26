@@ -23,7 +23,7 @@ Loaded by `viper` in this order: defaults → `config.yaml` → env (`OPEN_STREA
 ```yaml
 # config.yaml
 storage:
-  driver:   json          # json | yaml | sql | mongo
+  driver:   json          # json | yaml
   json_dir: ./test_data   # for driver=json
   yaml_dir: ./test_data   # for driver=yaml
 ```
@@ -37,12 +37,8 @@ export OPEN_STREAMER_STORAGE_YAML_DIR=/var/lib/open-streamer
 
 | Driver | Backend | Notes |
 |---|---|---|
-| `json` (default) | Flat JSON files under `json_dir/` | Single-node; fastest setup |
-| `yaml` | Single `open_streamer.yaml` | Human-editable; good for ops-as-code |
-| `sql` | Postgres / MySQL via JSONB | HA; auto-migrate on startup |
-| `mongo` | MongoDB BSON+JSON | Index init on startup |
-
-SQL/Mongo connection details: `OPEN_STREAMER_STORAGE_SQL_DSN`, `OPEN_STREAMER_STORAGE_MONGO_URI` etc. — see `cmd/server/main.go` for the full list.
+| `json` (default) | Flat JSON files under `json_dir/` | Fastest setup; one file per resource |
+| `yaml` | Single `open_streamer.yaml` under `yaml_dir/` | Human-editable; good for ops-as-code workflows |
 
 ---
 

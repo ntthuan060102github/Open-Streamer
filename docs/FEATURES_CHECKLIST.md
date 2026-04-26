@@ -37,9 +37,7 @@ Legend:
 |---|---|---|
 | Stream repository — JSON | Complete | Default; flat-file under `storage.json_dir` |
 | Stream repository — YAML | Complete | Single `open_streamer.yaml` per data dir |
-| Stream repository — SQL (Postgres/MySQL) | Complete | JSONB; auto-migrate |
-| Stream repository — MongoDB | Complete | BSON+JSON; index init |
-| Recording / Hook / VOD repositories | Complete | All 3 backends |
+| Recording / Hook / VOD repositories | Complete | Both backends |
 | REST API — streams CRUD + start/stop/restart | Complete | `chi/v5` router under `/streams` |
 | REST API — `PUT /streams/{code}` hot-reload | Complete | Diff-based; only changed components restart |
 | REST API — input switch | Complete | `POST /streams/{code}/inputs/switch` forces active priority |

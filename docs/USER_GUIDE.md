@@ -464,7 +464,7 @@ in the runtime snapshot means.
 - [ ] FFmpeg installed with required encoders (boot probe will catch this)
 - [ ] HLS + DASH dirs are different (when both enabled)
 - [ ] HTTP server bind address chosen — reverse proxy in front for TLS
-- [ ] Storage backend chosen (`json` for single-node, `sql` / `mongo` for HA)
+- [ ] Storage backend chosen (`json` flat-file or `yaml` single-doc)
 - [ ] Hooks configured for at least `stream.stopped` + `transcoder.error` so ops gets paged on crashes
 - [ ] DVR retention sized against disk capacity
 - [ ] `manager.input_packet_timeout_sec` tuned per-protocol (HLS pull bursts may need ≥ segment duration × 2)

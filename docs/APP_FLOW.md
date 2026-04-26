@@ -20,7 +20,7 @@ sequenceDiagram
     participant Coord as Coordinator
 
     Main->>Store: Load StorageConfig (viper: file → env)
-    Main->>Store: Open repository (json/yaml/sql/mongo)
+    Main->>Store: Open repository (json or yaml)
     Main->>Store: Load GlobalConfig
     Note over Main,Store: Empty? Start unconfigured.
     Main->>DI: Provide sub-configs
@@ -47,7 +47,7 @@ sequenceDiagram
                         ├── from config.yaml
                         └── from OPEN_STREAMER_* env (overrides file)
 
-2.  Open storage backend (json / yaml / sql / mongo)
+2.  Open storage backend (json or yaml)
     └── register repositories in DI: stream, hook, recording, vod, global_config
 
 3.  Load GlobalConfig from store
@@ -291,18 +291,18 @@ sequenceDiagram
     Mgr->>Mgr: selectBest() → next-priority Idle/Active
     alt no candidate
         Mgr->>Coord: handleAllInputsExhausted
-        Coord->>Coord: status = Degraded
+        Coord->>Coord: status to Degraded
     else
-        Mgr->>New: ingestor.Start(ctx, bestInput, bufferID)
-        New->>Hub: write packets (same buffer)
-        Mgr->>Old: implicit cancel (context)
+        Mgr->>New: ingestor.Start with bestInput
+        New->>Hub: write packets to same buffer
+        Mgr->>Old: implicit cancel via context
         Old-->>Hub: stops writing
-        Mgr->>Mgr: commitSwitch (lock state)
-        Note over Mgr: state.active = new<br/>recordSwitch(reason, from, to)
-        Mgr->>Bus: input.failover {from, to, reason}
+        Mgr->>Mgr: commitSwitch under lock
+        Note over Mgr: state.active becomes new<br/>recordSwitch with reason and from/to
+        Mgr->>Bus: publish input.failover with from / to / reason
         opt was exhausted
             Mgr->>Coord: handleInputRestored
-            Coord->>Coord: status = Active
+            Coord->>Coord: status to Active
         end
     end
 ```
@@ -385,25 +385,25 @@ sequenceDiagram
     participant Bus as EventBus
 
     loop until ctx cancelled
-        Loop->>FFmpeg: spawn (runOnce)
-        FFmpeg-->>Loop: exit (crashed=true, runDur)
+        Loop->>FFmpeg: spawn via runOnce
+        FFmpeg-->>Loop: exit — crashed plus runDur
 
-        alt runDur ≥ 30s
+        alt runDur >= 30s
             Loop->>Tx: fireHealthyIfTransitioned
-            Tx->>Coord: onHealthy (if transitioned)
-            Coord->>Coord: status → Active
+            Tx->>Coord: onHealthy if transitioned
+            Coord->>Coord: status to Active
         end
 
         Loop->>Tx: recordProfileError
-        Loop->>Bus: transcoder.error (visible attempts only)
+        Loop->>Bus: transcoder.error — visible attempts only
 
-        alt fast crash count ≥ 3
+        alt fast crash count >= 3
             Loop->>Tx: fireUnhealthyIfTransitioned
             Tx->>Coord: onUnhealthy
-            Coord->>Coord: status → Degraded
+            Coord->>Coord: status to Degraded
         end
 
-        Note over Loop: sleep delay (2s → 30s exponential)
+        Note over Loop: sleep delay 2s to 30s exponential
     end
 ```
 
@@ -493,11 +493,11 @@ sequenceDiagram
     RTM->>RTM: persist + diff(old, new)
     RTM->>Tx: SetConfig(new) (hot-swap cache)
 
-    alt requires restart (multi_output / ffmpeg_path)
-        RTM->>Coord: RunningStreams() → [code1, code2, …]
+    alt requires restart — multi_output or ffmpeg_path changed
+        RTM->>Coord: RunningStreams returns codes
         loop each running stream
-            RTM->>Coord: Stop(code)
-            RTM->>Coord: Start(code, stream)
+            RTM->>Coord: Stop code
+            RTM->>Coord: Start code with stream
         end
     end
 

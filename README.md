@@ -22,8 +22,8 @@ flowchart LR
 
     subgraph Pipeline
         Hub(("Buffer Hub")):::data
-        Tx[Transcoder<br/>FFmpeg pool]
-        DVR[DVR + events]
+        Tx["Transcoder<br/>FFmpeg pool"]
+        DVR["DVR + events"]
         Hub --> Tx
         Tx --> Hub
         Hub --> DVR
@@ -32,8 +32,8 @@ flowchart LR
     subgraph Deliver
         D1["HLS / DASH"]
         D2["RTMP / RTSP / SRT"]
-        D3["Push out (RTMP/RTMPS)"]
-        D4["Webhooks / Kafka<br/>(HMAC signed)"]
+        D3["Push out — RTMP / RTMPS"]
+        D4["Webhooks / Kafka<br/>HMAC signed"]
     end
 
     S1 --> Hub
@@ -44,10 +44,10 @@ flowchart LR
     Hub --> D1
     Hub --> D2
     Hub --> D3
-    DVR -.events.-> D4
+    DVR -.->|"events"| D4
 
-    Mgr[Stream Manager<br/>failover, no FFmpeg restart]
-    Mgr -.health.-> Ingest
+    Mgr["Stream Manager<br/>failover — no FFmpeg restart"]
+    Mgr -.->|"health"| Ingest
 
     classDef data fill:#5a3a1f,stroke:#e0a060,color:#fff
 ```
@@ -152,7 +152,7 @@ regenerate from annotations).
 - **FFmpeg compatibility probe** — boot + on-demand check for
   required/optional encoders/muxers; UI sees a checklist before
   saving the path.
-- **Pluggable storage** — JSON / YAML / Postgres / MySQL / MongoDB.
+- **Pluggable storage** — JSON flat-file (default) or YAML single-document.
 - **Prometheus metrics** + structured slog logging.
 
 Full feature matrix in [FEATURES_CHECKLIST.md](./docs/FEATURES_CHECKLIST.md).
@@ -192,7 +192,7 @@ internal/
   events/             # in-process event bus
   hooks/              # webhook + Kafka delivery
   domain/             # types + defaults + resolvers (single source of truth)
-  store/              # repository pattern (json / yaml / sql / mongo)
+  store/              # repository pattern (json / yaml backends)
   runtime/            # service lifecycle wrapper
   api/handler/        # HTTP handlers
 config/               # bootstrap config (storage backend selection)

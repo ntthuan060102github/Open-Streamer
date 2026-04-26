@@ -91,14 +91,14 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Source[Source URL] --> Ing
-    Ing[Ingestor] -->|writes| Raw[("$raw$<code>")]:::data
-    Raw -->|reads| Tx[Transcoder]
-    Raw -->|reads| DVR[DVR]
-    Tx -->|writes| R1[("$r$<code>$track_1")]:::data
-    Tx -->|writes| R2[("$r$<code>$track_2")]:::data
-    R1 --> P1[HLS / DASH variant 1]
-    R2 --> P2[HLS / DASH variant 2]
+    Source["Source URL"] --> Ing
+    Ing["Ingestor"] -->|"writes"| Raw[("raw ingest buffer<br/>$raw$ {code}")]:::data
+    Raw -->|"reads"| Tx["Transcoder"]
+    Raw -->|"reads"| DVR["DVR"]
+    Tx -->|"writes"| R1[("rendition 1<br/>$r$ {code} track_1")]:::data
+    Tx -->|"writes"| R2[("rendition 2<br/>$r$ {code} track_2")]:::data
+    R1 --> P1["HLS / DASH<br/>variant 1"]
+    R2 --> P2["HLS / DASH<br/>variant 2"]
 
     classDef data fill:#5a3a1f,stroke:#e0a060,color:#fff
 ```
@@ -153,12 +153,12 @@ independent `*Subscriber` with its own bounded channel.
 
 ```mermaid
 flowchart LR
-    W[Ingestor<br/>writer] -->|TS packet| RB(("ring buffer<br/>(per stream)"))
-    RB -->|sub.ch <br/>(non-blocking)| S1[Subscriber 1<br/>HLS publisher]
-    RB -->|sub.ch <br/>(non-blocking)| S2[Subscriber 2<br/>DASH publisher]
-    RB -->|sub.ch <br/>(non-blocking)| S3[Subscriber 3<br/>Transcoder]
-    RB -->|sub.ch <br/>(non-blocking)| S4[Subscriber 4<br/>DVR]
-    RB -.full channel<br/>= drop packet.-> X((dropped))
+    W["Ingestor<br/>writer"] -->|"TS packet"| RB(("ring buffer<br/>per stream"))
+    RB -->|"sub.ch — non-blocking"| S1["Subscriber 1<br/>HLS publisher"]
+    RB -->|"sub.ch — non-blocking"| S2["Subscriber 2<br/>DASH publisher"]
+    RB -->|"sub.ch — non-blocking"| S3["Subscriber 3<br/>Transcoder"]
+    RB -->|"sub.ch — non-blocking"| S4["Subscriber 4<br/>DVR"]
+    RB -.->|"full channel — drop packet"| X(("dropped"))
 
     classDef warn fill:#5a3a3a,stroke:#e06060,color:#fff,stroke-dasharray: 3 3
     class X warn
@@ -283,20 +283,20 @@ one FFmpeg with N output pipes (multi-output mode).
 
 ```mermaid
 flowchart LR
-    subgraph Legacy["Legacy mode (default) — N processes"]
-        Raw1[("$raw$<code>")] --> F1[FFmpeg #1<br/>1080p]
-        Raw1 --> F2[FFmpeg #2<br/>720p]
-        Raw1 --> F3[FFmpeg #3<br/>480p]
-        F1 --> R1a[("$r$<code>$track_1")]
-        F2 --> R2a[("$r$<code>$track_2")]
-        F3 --> R3a[("$r$<code>$track_3")]
+    subgraph Legacy["Legacy mode — N processes"]
+        Raw1[("raw ingest<br/>buffer")] --> F1["FFmpeg 1<br/>1080p"]
+        Raw1 --> F2["FFmpeg 2<br/>720p"]
+        Raw1 --> F3["FFmpeg 3<br/>480p"]
+        F1 --> R1a[("rendition<br/>track 1")]
+        F2 --> R2a[("rendition<br/>track 2")]
+        F3 --> R3a[("rendition<br/>track 3")]
     end
 
-    subgraph Multi["Multi-output mode — 1 process, N pipes"]
-        Raw2[("$raw$<code>")] --> FM[FFmpeg<br/>decode 1× + encode N×]
-        FM -->|pipe:3| R1b[("$r$<code>$track_1")]
-        FM -->|pipe:4| R2b[("$r$<code>$track_2")]
-        FM -->|pipe:5| R3b[("$r$<code>$track_3")]
+    subgraph Multi["Multi-output mode — 1 process / N pipes"]
+        Raw2[("raw ingest<br/>buffer")] --> FM["FFmpeg<br/>1 decode + N encode"]
+        FM -->|"pipe 3"| R1b[("rendition<br/>track 1")]
+        FM -->|"pipe 4"| R2b[("rendition<br/>track 2")]
+        FM -->|"pipe 5"| R3b[("rendition<br/>track 3")]
     end
 ```
 
@@ -445,8 +445,8 @@ signing for HTTP). Kafka delivery uses lazy per-topic writers.
 
 ### Storage Layer (`internal/store/`)
 
-Repository pattern. Drivers: JSON, YAML, Postgres/MySQL (JSONB),
-MongoDB. Selected via `storage.driver`.
+Repository pattern. Drivers: JSON (flat-file, default) and YAML
+(single document per data dir). Selected via `storage.driver`.
 
 ```go
 type StreamRepository interface {
