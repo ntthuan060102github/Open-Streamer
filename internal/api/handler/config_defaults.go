@@ -68,12 +68,12 @@ type configDefaultsResponse struct {
 		Video       struct {
 			BitrateK   int               `json:"bitrate_k"`
 			ResizeMode domain.ResizeMode `json:"resize_mode"`
-			// DefaultCodec is the codec family used when the user leaves
+			// Codec is the codec family used when the user leaves
 			// VideoProfile.Codec empty. EncoderByCodecHW resolves it (or
 			// any explicit codec) to the actual FFmpeg encoder name based
 			// on the stream's Global.HW selection — frontend looks up
 			// `EncoderByCodecHW[codec][hw]` to render the placeholder.
-			DefaultCodec     string                       `json:"default_codec"`
+			Codec            string                       `json:"codec"`
 			EncoderByCodecHW map[string]map[string]string `json:"encoder_by_codec_hw"`
 		} `json:"video"`
 		Audio struct {
@@ -213,7 +213,7 @@ func buildConfigDefaults() configDefaultsResponse {
 	resp.Transcoder.MultiOutput = false
 	resp.Transcoder.Video.BitrateK = domain.DefaultVideoBitrateK
 	resp.Transcoder.Video.ResizeMode = domain.ResizeModePad
-	resp.Transcoder.Video.DefaultCodec = string(domain.VideoCodecH264)
+	resp.Transcoder.Video.Codec = string(domain.VideoCodecH264)
 	resp.Transcoder.Video.EncoderByCodecHW = buildEncoderByCodecHW()
 	resp.Transcoder.Audio.Codec = domain.AudioCodecAAC
 	resp.Transcoder.Audio.BitrateK = domain.DefaultAudioBitrateK

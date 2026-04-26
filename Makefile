@@ -64,6 +64,14 @@ generate: ## Run go generate (e.g. Swagger from swag annotations)
 swagger: ## Regenerate api/docs (OpenAPI 2) via swag; run from repo root
 	cd cmd/server && $(GO) run github.com/swaggo/swag/cmd/swag@latest init -g doc_swagger.go -o ../../api/docs --parseGoList=false -d .,../../internal/api,../../internal/api/handler,../../internal/api/apidocs,../../internal/domain,../../internal/manager,../../internal/publisher,../../internal/transcoder,../../internal/vod,../../config,../../pkg/version
 
+.PHONY: hooks-install
+hooks-install: ## Install repo git hooks (pre-commit auto-regenerates swagger)
+	@hook_dst="$$(git rev-parse --git-path hooks)/pre-commit"; \
+	hook_src="$$(git rev-parse --show-toplevel)/scripts/git-hooks/pre-commit"; \
+	rm -f "$$hook_dst"; \
+	ln -s "$$hook_src" "$$hook_dst"; \
+	echo "linked $$hook_dst → $$hook_src"
+
 .PHONY: tidy
 tidy: ## go mod tidy
 	$(GO) mod tidy

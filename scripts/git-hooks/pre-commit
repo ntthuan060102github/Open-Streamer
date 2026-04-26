@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Open Streamer — pre-commit hook.
+#
+# Regenerates Swagger docs (api/docs/) when any *.go file is staged so the
+# committed OpenAPI spec stays in sync with the Go source annotations.
+#
+# Behaviour:
+#   1. Skip silently if no Go files are staged (docs / yaml / config-only
+#      commits don't pay the swag cost).
+#   2. Run `make swagger`. Abort the commit if it fails.
+#   3. If the regeneration produced changes under api/docs/, auto-stage
+#      them so the commit captures the in-sync output. The hook prints a
+#      single line so the developer notices the implicit add.
+#
+# Skip the hook for an emergency commit:    git commit --no-verify
+# Re-install (e.g. after pulling updates):  make hooks-install
+set -euo pipefail
+
+# 1. Bail out fast when no Go file is staged.
+if ! git diff --cached --name-only --diff-filter=ACMR -- '*.go' | grep -q .; then
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "pre-commit: regenerating swagger docs (Go files staged)…"
+if ! make swagger >/dev/null 2>&1; then
+    echo "pre-commit: make swagger FAILED — fix the swag annotations and retry." >&2
+    echo "            run 'make swagger' manually to see the full error." >&2
+    exit 1
+fi
+
+# 2. Auto-stage any drift in api/docs/ so the commit captures it. We only
+#    add the directory when it actually changed — otherwise the commit
+#    notification stays quiet on noop generations.
+if ! git diff --quiet -- api/docs/; then
+    git add api/docs/
+    echo "pre-commit: api/docs/ regenerated and auto-staged."
+fi

@@ -3011,8 +3011,8 @@ const docTemplate = `{
                                 "bitrate_k": {
                                     "type": "integer"
                                 },
-                                "default_codec": {
-                                    "description": "DefaultCodec is the codec family used when the user leaves\nVideoProfile.Codec empty. EncoderByCodecHW resolves it (or\nany explicit codec) to the actual FFmpeg encoder name based\non the stream's Global.HW selection — frontend looks up\n` + "`" + `EncoderByCodecHW[codec][hw]` + "`" + ` to render the placeholder.",
+                                "codec": {
+                                    "description": "Codec is the codec family used when the user leaves\nVideoProfile.Codec empty. EncoderByCodecHW resolves it (or\nany explicit codec) to the actual FFmpeg encoder name based\non the stream's Global.HW selection — frontend looks up\n` + "`" + `EncoderByCodecHW[codec][hw]` + "`" + ` to render the placeholder.",
                                     "type": "string"
                                 },
                                 "encoder_by_codec_hw": {

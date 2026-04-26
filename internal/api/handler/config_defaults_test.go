@@ -83,7 +83,7 @@ func TestGetConfigDefaults_CodecRoutingTable(t *testing.T) {
 	var got configDefaultsResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 
-	assert.Equal(t, "h264", got.Transcoder.Video.DefaultCodec,
+	assert.Equal(t, "h264", got.Transcoder.Video.Codec,
 		"default codec family must be h264 — most-compatible across players")
 
 	table := got.Transcoder.Video.EncoderByCodecHW

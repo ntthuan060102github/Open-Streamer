@@ -1293,9 +1293,9 @@ definitions:
             properties:
               bitrate_k:
                 type: integer
-              default_codec:
+              codec:
                 description: |-
-                  DefaultCodec is the codec family used when the user leaves
+                  Codec is the codec family used when the user leaves
                   VideoProfile.Codec empty. EncoderByCodecHW resolves it (or
                   any explicit codec) to the actual FFmpeg encoder name based
                   on the stream's Global.HW selection — frontend looks up
