@@ -19,7 +19,8 @@ bench/
 │   ├── summarize.sh      ← read results/<id>/* → emit summary.md
 │   ├── run-all.sh        ← execute A+B+C+D plan, summarise + aggregate
 │   ├── aggregate.sh      ← combine every summary.md into one master report.md
-│   └── notify.sh         ← optional Telegram notifier (start / done / fail)
+│   ├── notify.sh         ← optional Telegram notifier (start / done / fail)
+│   └── push-report.sh    ← push reports/<sweep>/ to a dedicated GitHub branch
 ├── payloads/             ← stream JSON templates ({{CODE}} placeholder)
 │   ├── passthrough.json
 │   ├── abr3-legacy.json
@@ -148,6 +149,25 @@ After the sweep finishes:
 git add bench/reports/<sweep>/
 git commit -m "bench: <sweep> results"
 ```
+
+Or push directly from the benchmarking host (no SSH key needed, uses a
+GitHub Personal Access Token for one push):
+
+```bash
+bench/scripts/push-report.sh                       # prompts token, latest sweep
+bench/scripts/push-report.sh v0.0.41-...           # specific sweep
+bench/scripts/push-report.sh v0.0.41-... my-branch # override branch name
+```
+
+Default branch is `bench/<sweep>` — one branch per sweep so each is easy
+to review and PR independently. Examples:
+`bench/v0.0.41-2026-04-27-baseline`, `bench/v0.0.42-2026-05-01-after-fix`.
+
+Token resolution order: `$GH_TOKEN` env var (if set) → silent interactive
+prompt (`read -rsp`, characters not echoed). The script uses a temporary
+git worktree, never writes the token to `.git/config`, and is idempotent
+(re-runs with no new files emit "no changes" and exit 0). PAT needs `repo`
+scope (or `public_repo` for public repos).
 
 The master report has every metric table auto-filled. You only fill the
 `<TODO>` sections: highlights, recommendations, sign-off.
