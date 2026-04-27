@@ -90,17 +90,23 @@ NOW=$(date -Iseconds 2>/dev/null || date)
 # Phase from run-id prefix (A/B/C/D/E)
 PHASE=$(echo "$RUN" | sed -E 's/^([A-Z]).*/\1/')
 
-# Stream count + statuses from runtime-end.json (best-effort, no jq dependency).
-# All grep pipes are wrapped with || true so the script doesn't exit when a
-# pattern doesn't match — pipefail + set -e would otherwise abort here.
+# Stream count + statuses from runtime-end.json (a snapshot of GET /streams).
+# Response shape: {"data": [{"code":"...", "runtime":{"status":"...","switches":[...]}}, ...]}.
+# Prefer jq; fall back to tolerant grep when jq is missing.
 STREAM_LIST=""
 DEGRADED_COUNT=0
 SWITCHES_TOTAL=0
 if [[ -f "$DIR/runtime-end.json" ]]; then
-  STREAM_LIST=$( { grep -oE '"code"[[:space:]]*:[[:space:]]*"[^"]+"' "$DIR/runtime-end.json" 2>/dev/null \
-                    | sed 's/.*"\([^"]*\)"$/\1/' | sort -u | tr '\n' ' '; } || true)
-  DEGRADED_COUNT=$(grep -cE '"status"[[:space:]]*:[[:space:]]*"degraded"' "$DIR/runtime-end.json" 2>/dev/null || echo 0)
-  SWITCHES_TOTAL=$(grep -cE '"switches"[[:space:]]*:[[:space:]]*\[' "$DIR/runtime-end.json" 2>/dev/null || echo 0)
+  if command -v jq >/dev/null; then
+    STREAM_LIST=$(jq -r '(.data // [])[] | .code' "$DIR/runtime-end.json" 2>/dev/null | sort -u | tr '\n' ' ' || true)
+    DEGRADED_COUNT=$(jq -r '[(.data // [])[] | select(.runtime.status == "degraded")] | length' "$DIR/runtime-end.json" 2>/dev/null || echo 0)
+    SWITCHES_TOTAL=$(jq -r '[(.data // [])[] | (.runtime.switches // []) | length] | add // 0' "$DIR/runtime-end.json" 2>/dev/null || echo 0)
+  else
+    STREAM_LIST=$( { grep -oE '"code"[[:space:]]*:[[:space:]]*"[^"]+"' "$DIR/runtime-end.json" 2>/dev/null \
+                      | sed 's/.*"\([^"]*\)"$/\1/' | sort -u | tr '\n' ' '; } || true)
+    DEGRADED_COUNT=$(grep -cE '"status"[[:space:]]*:[[:space:]]*"degraded"' "$DIR/runtime-end.json" 2>/dev/null || echo 0)
+    SWITCHES_TOTAL=$(grep -cE '"switches"[[:space:]]*:[[:space:]]*\[' "$DIR/runtime-end.json" 2>/dev/null || echo 0)
+  fi
 fi
 STREAM_COUNT=$(echo "$STREAM_LIST" | wc -w | tr -d ' ')
 

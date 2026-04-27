@@ -14,7 +14,7 @@
 set -euo pipefail
 
 BENCH_ROOT=$(cd "$(dirname "$0")"/.. && pwd)
-API=${API:-http://127.0.0.1:8080/api/v1}
+API=${API:-http://127.0.0.1:8080}
 PREFIX=${PREFIX:-bench}
 
 usage() {

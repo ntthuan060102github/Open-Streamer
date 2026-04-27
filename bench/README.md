@@ -135,7 +135,7 @@ bench/scripts/run-bench.sh A2 10 passthrough
 bench/scripts/run-bench.sh B3 4 abr3-legacy
 
 # Phase C3 — same load, multi-output mode (toggle global config first!)
-curl -X PUT http://127.0.0.1:8080/api/v1/config \
+curl -X POST http://127.0.0.1:8080/config \
   -H 'Content-Type: application/json' \
   -d '{"transcoder":{"multi_output":true}}'
 bench/scripts/run-bench.sh C3 4 abr3-multi
@@ -179,7 +179,7 @@ All scripts accept these env vars:
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `API` | `http://127.0.0.1:8080/api/v1` | open-streamer REST base |
+| `API` | `http://127.0.0.1:8080` | open-streamer REST base (no `/api/v1` prefix — endpoints sit at root) |
 | `PREFIX` | `bench` | stream code prefix; final code = `<PREFIX><i>` |
 | `SERVER` | `rtmp://127.0.0.1:1935/live` | source.sh push target |
 | `INPUT` | `assets/sample-1080p.ts` | source.sh input file |

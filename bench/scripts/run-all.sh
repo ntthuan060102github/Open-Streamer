@@ -46,7 +46,7 @@ if [[ -z "${SWEEP:-}" ]]; then
 fi
 
 COOLDOWN=${COOLDOWN:-30}
-API=${API:-http://127.0.0.1:8080/api/v1}
+API=${API:-http://127.0.0.1:8080}
 SKIP_FAILOVER=${SKIP_FAILOVER:-0}
 LOGDIR=$BENCH_ROOT/results/$SWEEP
 LOG=$LOGDIR/run-all.log
@@ -64,7 +64,7 @@ api_check() {
 set_multi_output() {
   local val=$1
   log "config → multi_output=$val"
-  curl -fs -X PUT "$API/config" -H 'Content-Type: application/json' \
+  curl -fs -X POST "$API/config" -H 'Content-Type: application/json' \
     -d "{\"transcoder\":{\"multi_output\":$val}}" >/dev/null \
     || log "WARN: failed to toggle multi_output (continuing)"
 }

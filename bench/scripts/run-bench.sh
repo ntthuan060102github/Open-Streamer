@@ -30,7 +30,7 @@ WARMUP=${5:-60}
 BENCH_ROOT=$(cd "$(dirname "$0")"/.. && pwd)
 SCRIPTS=$BENCH_ROOT/scripts
 OUTDIR=$BENCH_ROOT/results/$RUN_ID
-API=${API:-http://127.0.0.1:8080/api/v1}
+API=${API:-http://127.0.0.1:8080}
 
 mkdir -p "$OUTDIR"
 echo "[run-bench] === $RUN_ID  N=$N  profile=$PROFILE  warmup=${WARMUP}s  steady=${STEADY}s ==="
@@ -38,9 +38,10 @@ echo "[run-bench] output → $OUTDIR"
 
 trap '"$SCRIPTS"/source.sh stop >/dev/null 2>&1 || true; "$SCRIPTS"/create-streams.sh delete "$N" >/dev/null 2>&1 || true' EXIT
 
-# Snapshot config + state at t0
-curl -fs "$API/config"  > "$OUTDIR/config.json"  || echo "[run-bench] WARN: cannot fetch /config"
-curl -fs "$API/runtime" > "$OUTDIR/runtime-t0.json" || true
+# Snapshot config + state at t0. /streams response embeds per-stream runtime in
+# the .runtime field — there is no separate /runtime endpoint.
+curl -fs "$API/config"  > "$OUTDIR/config.json"   || echo "[run-bench] WARN: cannot fetch /config"
+curl -fs "$API/streams" > "$OUTDIR/runtime-t0.json" || true
 
 "$SCRIPTS"/create-streams.sh "$N" "$PROFILE" | tee "$OUTDIR/create.log"
 "$SCRIPTS"/source.sh "$N" | tee -a "$OUTDIR/create.log"
@@ -48,7 +49,7 @@ curl -fs "$API/runtime" > "$OUTDIR/runtime-t0.json" || true
 echo "[run-bench] warm-up ${WARMUP}s..."
 sleep "$WARMUP"
 
-curl -fs "$API/runtime" > "$OUTDIR/runtime-warmup.json" || true
+curl -fs "$API/streams" > "$OUTDIR/runtime-warmup.json" || true
 
 echo "[run-bench] sampling for ${STEADY}s..."
 "$SCRIPTS"/sample.sh "$STEADY" "$OUTDIR/sample.csv" &
@@ -56,16 +57,14 @@ SAMPLE_PID=$!
 
 # Mid-window snapshot
 sleep $((STEADY / 2))
-curl -fs "$API/runtime" > "$OUTDIR/runtime-mid.json" || true
+curl -fs "$API/streams" > "$OUTDIR/runtime-mid.json" || true
 curl -fs "$API/streams" > "$OUTDIR/streams-mid.json" || true
 
 wait "$SAMPLE_PID"
 
-curl -fs "$API/runtime" > "$OUTDIR/runtime-end.json" || true
+curl -fs "$API/streams" > "$OUTDIR/runtime-end.json" || true
 curl -fs "$API/streams" > "$OUTDIR/streams-end.json" || true
-curl -fs "${API%/v1}/metrics" > "$OUTDIR/metrics-end.txt" 2>/dev/null \
-  || curl -fs http://127.0.0.1:8080/metrics > "$OUTDIR/metrics-end.txt" 2>/dev/null \
-  || true
+curl -fs "$API/metrics" > "$OUTDIR/metrics-end.txt" 2>/dev/null || true
 
 echo "[run-bench] === done. files in $OUTDIR ==="
 ls -la "$OUTDIR"

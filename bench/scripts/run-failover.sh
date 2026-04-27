@@ -22,7 +22,7 @@ set -euo pipefail
 
 BENCH_ROOT=$(cd "$(dirname "$0")"/.. && pwd)
 SCRIPTS=$BENCH_ROOT/scripts
-API=${API:-http://127.0.0.1:8080/api/v1}
+API=${API:-http://127.0.0.1:8080}
 RTMP_LISTEN=${RTMP_LISTEN:-rtmp://0.0.0.0:1935/live}
 RTMP_LOCAL=${RTMP_LOCAL:-rtmp://127.0.0.1:1935/live}
 HLS_BASE=${HLS_BASE:-http://127.0.0.1:8080}
@@ -74,11 +74,13 @@ jget() {
   fi
 }
 
-# Count switches[] entries for stream $1 from runtime JSON $2
+# Count switches[] entries for stream $1 from /streams JSON response $2.
+# /streams returns {"data": [{...stream..., "runtime": {"switches": [...]}}, ...]}
 switches_count() {
   local code=$1 file=$2
   if command -v jq >/dev/null; then
-    jq -r --arg c "$code" '(.streams[$c].switches // []) | length' "$file" 2>/dev/null || echo 0
+    jq -r --arg c "$code" '(.data[]? | select(.code == $c) | .runtime.switches // []) | length' "$file" 2>/dev/null \
+      || echo 0
   else
     grep -oE '"switches"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$file" \
       | head -1 | grep -oE '"at"' | wc -l | tr -d ' '
@@ -174,7 +176,7 @@ case_d1() {
   note "warm-up ${WARMUP}s"
   sleep "$WARMUP"
 
-  curl -fs "$API/runtime" >"$DIR/runtime-pre.json"
+  curl -fs "$API/streams" >"$DIR/runtime-pre.json"
   local before
   before=$(switches_count "$code" "$DIR/runtime-pre.json")
   note "switches_count before kill = $before"
@@ -187,7 +189,7 @@ case_d1() {
   local switch_ts="" latency_ms=-1
   for i in $(seq 1 200); do
     sleep 0.1
-    curl -fs "$API/runtime" >"$DIR/runtime-poll.json" || continue
+    curl -fs "$API/streams" >"$DIR/runtime-poll.json" || continue
     local now
     now=$(switches_count "$code" "$DIR/runtime-poll.json")
     if [[ "$now" -gt "$before" ]]; then
@@ -199,7 +201,7 @@ case_d1() {
   done
 
   cp "$DIR/runtime-poll.json" "$DIR/runtime-post.json" 2>/dev/null \
-    || curl -fs "$API/runtime" >"$DIR/runtime-post.json"
+    || curl -fs "$API/streams" >"$DIR/runtime-post.json"
 
   local verdict="PASS"
   [[ "$latency_ms" -lt 0 ]] && verdict="FAIL"
@@ -235,9 +237,8 @@ case_d2() {
   note "warm-up ${WARMUP}s"
   sleep "$WARMUP"
 
-  curl -fs "$API/runtime" >"$DIR/runtime-pre.json"
-  curl -fs "${API%/v1}/metrics" >"$DIR/metrics-pre.txt" 2>/dev/null \
-    || curl -fs http://127.0.0.1:8080/metrics >"$DIR/metrics-pre.txt"
+  curl -fs "$API/streams" >"$DIR/runtime-pre.json"
+  curl -fs "$API/metrics" >"$DIR/metrics-pre.txt" 2>/dev/null || true
 
   local pids
   pids=$(pgrep -f "ffmpeg.*$code" | tr '\n' ' ')
@@ -266,9 +267,8 @@ case_d2() {
     done
   done
 
-  curl -fs "$API/runtime" >"$DIR/runtime-post.json"
-  curl -fs "${API%/v1}/metrics" >"$DIR/metrics-post.txt" 2>/dev/null \
-    || curl -fs http://127.0.0.1:8080/metrics >"$DIR/metrics-post.txt"
+  curl -fs "$API/streams" >"$DIR/runtime-post.json"
+  curl -fs "$API/metrics" >"$DIR/metrics-post.txt" 2>/dev/null || true
 
   local restarts
   restarts=$(metric_delta "transcoder_restarts_total" "$DIR/metrics-pre.txt" "$DIR/metrics-post.txt")
@@ -346,7 +346,7 @@ case_d3() {
   local verdict="PASS"
   [[ "$added" -gt 0 ]] && verdict="FAIL"
 
-  curl -fs "$API/runtime" >"$DIR/runtime-post.json"
+  curl -fs "$API/streams" >"$DIR/runtime-post.json"
 
   kill "$SRC_PID" 2>/dev/null || true
   delete_stream "$code"
@@ -386,11 +386,11 @@ case_d4() {
   local seen_starting=0 seen_reconnecting=0 max_attempts=0 final_state=""
   for i in $(seq 1 30); do
     sleep 1
-    curl -fs "$API/runtime" >"$DIR/runtime-poll.json" || continue
+    curl -fs "$API/streams" >"$DIR/runtime-poll.json" || continue
     local state attempts
     if command -v jq >/dev/null; then
-      state=$(jq -r --arg c "$code" '.streams[$c].publisher.pushes[0].status // ""' "$DIR/runtime-poll.json")
-      attempts=$(jq -r --arg c "$code" '.streams[$c].publisher.pushes[0].attempt // 0' "$DIR/runtime-poll.json")
+      state=$(jq -r --arg c "$code" '.data[]? | select(.code == $c) | .runtime.publisher.pushes[0].status // ""' "$DIR/runtime-poll.json")
+      attempts=$(jq -r --arg c "$code" '.data[]? | select(.code == $c) | .runtime.publisher.pushes[0].attempt // 0' "$DIR/runtime-poll.json")
     else
       state=$(grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' "$DIR/runtime-poll.json" | tail -1 | sed 's/.*"\([^"]*\)"$/\1/')
       attempts=$(grep -oE '"attempt"[[:space:]]*:[[:space:]]*[0-9]+' "$DIR/runtime-poll.json" | tail -1 | grep -oE '[0-9]+$' || echo 0)
