@@ -51,10 +51,12 @@ mkdir -p "$LOGDIR"
 
 echo "[source] spawning $N RTMP publishers → $SERVER/$PREFIX{1..$N}"
 for i in $(seq 1 "$N"); do
-  ffmpeg -hide_banner -loglevel error \
+  # -nostdin avoids ffmpeg getting SIGTTIN/SIGTTOU from terminal job control
+  # when this script runs in an interactive shell or tmux pane.
+  ffmpeg -hide_banner -loglevel error -nostdin \
     -re -stream_loop -1 -i "$INPUT" \
     -c copy -f flv "$SERVER/${PREFIX}${i}" \
-    >"$LOGDIR/src${i}.log" 2>&1 &
+    </dev/null >"$LOGDIR/src${i}.log" 2>&1 &
   echo $! >>"$PIDFILE"
 done
 

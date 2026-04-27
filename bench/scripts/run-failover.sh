@@ -55,10 +55,10 @@ push_source() {
   # spawn one RTMP publisher; echo PID
   local key=$1
   local logfile=$2
-  ffmpeg -hide_banner -loglevel error \
+  ffmpeg -hide_banner -loglevel error -nostdin \
     -re -stream_loop -1 -i "$INPUT" \
     -c copy -f flv "$RTMP_LOCAL/$key" \
-    >"$logfile" 2>&1 &
+    </dev/null >"$logfile" 2>&1 &
   echo $!
 }
 
