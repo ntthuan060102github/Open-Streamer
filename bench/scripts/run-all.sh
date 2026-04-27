@@ -6,16 +6,16 @@
 # and are intentionally skipped here — run them manually after this completes.
 #
 # Usage:
-#   bench/scripts/run-all.sh                # SWEEP = <date>-<gpu>-<git-sha>
-#   bench/scripts/run-all.sh stress-v2      # SWEEP = <date>-<gpu>-stress-v2
-#   NOTE=baseline bench/scripts/run-all.sh  # same as positional arg
+#   bench/scripts/run-all.sh                # SWEEP = <tag>-<date>
+#   bench/scripts/run-all.sh baseline       # SWEEP = <tag>-<date>-baseline
+#   NOTE=stress bench/scripts/run-all.sh    # same as positional arg
 #   SWEEP=manual-name bench/scripts/run-all.sh   # full override
 #
 # Auto-composed name examples:
-#   2026-04-27-T4-2013a9a       (git tracked, no note arg)
-#   2026-04-27-T4-baseline      (note arg = "baseline")
-#   2026-04-27-RTX-4090-stress  (RTX 4090 host)
-#   2026-04-27-nogpu-2013a9a    (no nvidia-smi)
+#   v0.0.31-2026-04-27                  (HEAD exactly on tag v0.0.31)
+#   v0.0.31-2026-04-27-baseline         (note = "baseline")
+#   v0.0.31-3-g869cb6c-2026-04-27       (3 commits past v0.0.31)
+#   dev-2026-04-27-baseline             (no tag in repo)
 #
 # Resume / partial:
 #   PLAN="A2 B3 C3" bench/scripts/run-all.sh
@@ -25,27 +25,24 @@ set -euo pipefail
 BENCH_ROOT=$(cd "$(dirname "$0")"/.. && pwd)
 SCRIPTS=$BENCH_ROOT/scripts
 
-detect_gpu_tag() {
-  command -v nvidia-smi >/dev/null || { echo "nogpu"; return; }
-  local name
-  name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) || true
-  [[ -z "$name" ]] && { echo "nogpu"; return; }
-  echo "$name" \
-    | sed -E 's/^Tesla[[:space:]]+//; s/^NVIDIA[[:space:]]+//; s/^GeForce[[:space:]]+//' \
-    | tr -s '[:space:]' '-' \
-    | sed -E 's/-+/-/g; s/^-//; s/-$//'
-}
-
-auto_note() {
-  (cd "$BENCH_ROOT/.." && git rev-parse --short HEAD 2>/dev/null) || echo "manual"
+detect_tag() {
+  local repo=$BENCH_ROOT/..
+  local tag
+  tag=$(cd "$repo" && git describe --tags --exact-match HEAD 2>/dev/null) && { echo "$tag"; return; }
+  tag=$(cd "$repo" && git describe --tags 2>/dev/null) && { echo "$tag"; return; }
+  echo "dev"
 }
 
 # Compose SWEEP if user did not pin it explicitly
 if [[ -z "${SWEEP:-}" ]]; then
+  TAG=$(detect_tag)
   DATE=$(date +%Y-%m-%d)
-  GPU=$(detect_gpu_tag)
-  NOTE=${NOTE:-${1:-$(auto_note)}}
-  SWEEP="$DATE-$GPU-$NOTE"
+  NOTE=${NOTE:-${1:-}}
+  if [[ -n "$NOTE" ]]; then
+    SWEEP="$TAG-$DATE-$NOTE"
+  else
+    SWEEP="$TAG-$DATE"
+  fi
 fi
 
 COOLDOWN=${COOLDOWN:-30}

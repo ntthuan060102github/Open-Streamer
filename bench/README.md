@@ -63,8 +63,8 @@ Recommended: `nvidia-smi`, `pidstat` (sysstat), `ifstat`, `iostat`, `dmidecode`,
 ## Fully-automated sweep (one command, ~90 min)
 
 ```bash
-bench/scripts/run-all.sh                # SWEEP = <date>-<gpu>-<git-sha>
-bench/scripts/run-all.sh stress-v2      # SWEEP = <date>-<gpu>-stress-v2
+bench/scripts/run-all.sh                # SWEEP = <tag>-<date>
+bench/scripts/run-all.sh baseline       # SWEEP = <tag>-<date>-baseline
 SWEEP=manual-name bench/scripts/run-all.sh   # full override
 ```
 
@@ -72,12 +72,13 @@ The sweep name is auto-composed:
 
 | Part | Source | Example |
 | --- | --- | --- |
+| tag | `git describe --tags --exact-match HEAD` → `git describe --tags` → `dev` | `v0.0.31`, `v0.0.31-3-g869cb6c`, `dev` |
 | date | `date +%Y-%m-%d` | `2026-04-27` |
-| gpu | `nvidia-smi` (Tesla/NVIDIA/GeForce prefix stripped) | `T4`, `RTX-4090`, `A100-SXM4-40GB`, `nogpu` |
-| note | first positional arg, or `$NOTE`, or git short SHA | `baseline`, `stress`, `2013a9a` |
+| note | first positional arg, or `$NOTE` (skipped if empty) | `baseline`, `stress` |
 
 Examples of fully-resolved names:
-`2026-04-27-T4-2013a9a`, `2026-04-27-T4-baseline`, `2026-04-27-RTX-4090-stress`.
+`v0.0.31-2026-04-27`, `v0.0.31-2026-04-27-baseline`, `v0.0.31-3-g869cb6c-2026-04-27-fix-X`,
+`dev-2026-04-27-baseline`.
 
 What it does:
 
