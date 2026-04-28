@@ -16,7 +16,7 @@ require (
 	github.com/q191201771/lal v0.37.4
 	github.com/q191201771/naza v0.30.48
 	github.com/samber/do/v2 v2.0.0
-	github.com/segmentio/kafka-go v0.4.50
+	github.com/segmentio/kafka-go v0.4.51
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/swag v1.16.6
