@@ -14,29 +14,39 @@ import (
 // (HLS/DASH) sessions rely on the reaper as their primary close trigger
 // because there's no TCP "the viewer left" signal.
 //
-// Tick cadence is min(5 s, idleDur/3) — small enough that recent dead
-// sessions don't linger long, large enough to keep the lock churn low
-// when there are 10 k+ active sessions.
+// Tick cadence is min(5 s, idleDur/3), recomputed each iteration so a
+// hot-reloaded idle_timeout takes effect on the next loop without
+// restarting the goroutine. When the tracker is disabled the loop still
+// ticks but reapOnce is a no-op (no sessions to scan).
 func (s *service) runReaper(ctx context.Context) {
-	tick := s.idleDur / 3
-	if tick > 5*time.Second {
-		tick = 5 * time.Second
-	}
-	if tick < time.Second {
-		tick = time.Second
-	}
-	t := time.NewTicker(tick)
-	defer t.Stop()
-
 	for {
+		cfg := s.loadCfg()
+		tick := reaperTick(cfg.idleDur)
 		select {
 		case <-ctx.Done():
 			s.shutdownActiveSessions(ctx)
 			return
-		case <-t.C:
-			s.reapOnce(ctx)
+		case <-time.After(tick):
+			if cfg.enabled {
+				s.reapOnce(ctx)
+			}
 		}
 	}
+}
+
+// reaperTick clamps the reaper cadence to a sane range regardless of the
+// idle window. min 1 s avoids burning CPU when idleDur is very small, max
+// 5 s keeps recently-disconnected sessions from lingering long when the
+// operator picks a large idleDur.
+func reaperTick(idle time.Duration) time.Duration {
+	t := idle / 3
+	if t > 5*time.Second {
+		t = 5 * time.Second
+	}
+	if t < time.Second {
+		t = time.Second
+	}
+	return t
 }
 
 // reapOnce closes every session whose UpdatedAt is older than idleDur or
@@ -44,11 +54,12 @@ func (s *service) runReaper(ctx context.Context) {
 // forwarded to the close path so the EventSessionClosed publication carries
 // the same trace as the reaper goroutine.
 func (s *service) reapOnce(ctx context.Context) {
+	cfg := s.loadCfg()
 	now := s.now()
-	idleCutoff := now.Add(-s.idleDur)
+	idleCutoff := now.Add(-cfg.idleDur)
 	var maxLifeCutoff time.Time
-	if s.maxAlive > 0 {
-		maxLifeCutoff = now.Add(-s.maxAlive)
+	if cfg.maxAlive > 0 {
+		maxLifeCutoff = now.Add(-cfg.maxAlive)
 	}
 
 	// Two-phase: snapshot ids under RLock, close them under per-id lock.

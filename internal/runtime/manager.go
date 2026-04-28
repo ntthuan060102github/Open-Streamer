@@ -250,6 +250,31 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 			return m.deps.HooksSvc.Start(ctx)
 		})
 
+	// Sessions: hot-reload via UpdateConfig instead of bouncing the reaper —
+	// the in-memory session map survives idle/timeout / enable changes so we
+	// don't lose viewer attribution mid-edit. The reaper goroutine itself is
+	// started once in applyAll; here we only need to push the new config and
+	// (on first enable after boot) spawn the goroutine if it wasn't.
+	if configChanged(old.Sessions, new.Sessions) && m.deps.SessionsSvc != nil {
+		cfg := config.SessionsConfig{}
+		if new.Sessions != nil {
+			cfg = *new.Sessions
+		}
+		m.deps.SessionsSvc.UpdateConfig(cfg)
+		slog.Info("runtime: sessions config applied",
+			"enabled", cfg.Enabled,
+			"idle_timeout_sec", cfg.IdleTimeoutSec,
+			"max_lifetime_sec", cfg.MaxLifetimeSec,
+		)
+	}
+	// First boot may not have started the reaper if cfg.Sessions was nil at
+	// the time. If it's set now, ensure the goroutine is up.
+	m.diffService("sessions", old.Sessions != nil, new.Sessions != nil, false,
+		func(ctx context.Context) error {
+			m.deps.SessionsSvc.Run(ctx)
+			return nil
+		})
+
 	// Log — not a long-running service, just swap the global logger.
 	if configChanged(old.Log, new.Log) {
 		if new.Log != nil {

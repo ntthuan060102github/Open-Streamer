@@ -187,13 +187,15 @@ func TokenFromQuery(rawQuery string) string {
 // service is the in-memory Tracker. State is a single map guarded by a
 // RWMutex; that's adequate up to ~50 k concurrent sessions, after which the
 // hot path becomes the lock. We can shard later without breaking Tracker.
+//
+// runtimeCfg is held behind an atomic pointer so the runtime config-diff
+// path can hot-swap timeouts / enabled state without restarting the
+// reaper goroutine or losing the in-memory session map.
 type service struct {
-	cfg      config.SessionsConfig
-	bus      events.Bus
-	geo      GeoIPResolver
-	now      func() time.Time // hookable for tests
-	idleDur  time.Duration
-	maxAlive time.Duration
+	runtimeCfg atomic.Pointer[runtimeConfig]
+	bus        events.Bus
+	geo        GeoIPResolver
+	now        func() time.Time // hookable for tests
 
 	mu       sync.RWMutex
 	sessions map[string]*domain.PlaySession // id → live record
@@ -204,12 +206,35 @@ type service struct {
 	kickedTotal     atomic.Int64
 }
 
+// runtimeConfig is the resolved subset of config.SessionsConfig the hot
+// paths actually read. Stored behind an atomic pointer so updates publish
+// atomically without a mutex.
+type runtimeConfig struct {
+	enabled  bool
+	idleDur  time.Duration
+	maxAlive time.Duration
+}
+
 // New constructs the Tracker. Reads config.SessionsConfig and the GeoIPResolver
 // from the injector. Caller is expected to call Run(ctx) to start the reaper.
 func newService(cfg config.SessionsConfig, bus events.Bus, geo GeoIPResolver) *service {
 	if geo == nil {
 		geo = NullGeoIP{}
 	}
+	s := &service{
+		bus:      bus,
+		geo:      geo,
+		now:      time.Now,
+		sessions: make(map[string]*domain.PlaySession, 256),
+	}
+	s.applyConfig(cfg)
+	return s
+}
+
+// applyConfig resolves the user-facing SessionsConfig into the runtime form
+// and atomically swaps it into place. Safe to call concurrently with
+// TrackHTTP / OpenConn / reapOnce — they read the pointer fresh each time.
+func (s *service) applyConfig(cfg config.SessionsConfig) {
 	idle := time.Duration(cfg.IdleTimeoutSec) * time.Second
 	if idle <= 0 {
 		idle = 30 * time.Second
@@ -218,20 +243,19 @@ func newService(cfg config.SessionsConfig, bus events.Bus, geo GeoIPResolver) *s
 	if maxAlive < 0 {
 		maxAlive = 0
 	}
-	return &service{
-		cfg:      cfg,
-		bus:      bus,
-		geo:      geo,
-		now:      time.Now,
+	s.runtimeCfg.Store(&runtimeConfig{
+		enabled:  cfg.Enabled,
 		idleDur:  idle,
 		maxAlive: maxAlive,
-		sessions: make(map[string]*domain.PlaySession, 256),
-	}
+	})
 }
+
+// loadCfg returns the current runtime config. Always non-nil after construction.
+func (s *service) loadCfg() *runtimeConfig { return s.runtimeCfg.Load() }
 
 // TrackHTTP implements Tracker.
 func (s *service) TrackHTTP(ctx context.Context, h HTTPHit) *domain.PlaySession {
-	if !s.cfg.Enabled {
+	if !s.loadCfg().enabled {
 		return nil
 	}
 	id := fingerprintID(h.StreamCode, h.IP, h.UserAgent, h.Token)
@@ -297,7 +321,7 @@ func (s *service) openHTTP(id string, h HTTPHit, now time.Time) *domain.PlaySess
 
 // OpenConn implements Tracker.
 func (s *service) OpenConn(ctx context.Context, h ConnHit) (*domain.PlaySession, Closer) {
-	if !s.cfg.Enabled {
+	if !s.loadCfg().enabled {
 		return nil, noopCloser{}
 	}
 	id := uuid.NewString()

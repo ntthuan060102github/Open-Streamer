@@ -40,14 +40,22 @@ func New(i do.Injector) (*Service, error) {
 	return &Service{service: newService(cfg, bus, geo)}, nil
 }
 
-// Run starts the idle reaper. Returns immediately if sessions tracking is
-// disabled in config. Blocks until ctx is cancelled, then closes every
-// still-active session with reason=shutdown so subscribers get a final event.
+// Run starts the idle reaper. Always runs — the reaper itself checks the
+// hot-reloadable enabled flag each tick and skips reaping when disabled.
+// This way an operator toggling Enabled at runtime via /config takes effect
+// without restarting the goroutine. Blocks until ctx is cancelled, then
+// closes every still-active session with reason=shutdown so subscribers
+// get a final event.
 func (s *Service) Run(ctx context.Context) {
-	if !s.cfg.Enabled {
-		return
-	}
 	s.runReaper(ctx)
+}
+
+// UpdateConfig hot-swaps the runtime config. Called by runtime.Manager.diff
+// when the persisted SessionsConfig section changes — no restart needed.
+// In-flight sessions keep their state; new idle/max-lifetime windows take
+// effect on the next reaper tick.
+func (s *Service) UpdateConfig(cfg config.SessionsConfig) {
+	s.applyConfig(cfg)
 }
 
 // NewServiceForTesting builds a Service without going through DI — for unit
