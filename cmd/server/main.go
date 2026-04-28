@@ -30,6 +30,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/runtime"
+	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	jsonstore "github.com/ntt0601zcoder/open-streamer/internal/store/json"
 	yamlstore "github.com/ntt0601zcoder/open-streamer/internal/store/yaml"
@@ -125,6 +126,7 @@ func run() error {
 		Coordinator:      do.MustInvoke[*coordinator.Coordinator](injector),
 		Transcoder:       do.MustInvoke[*transcoder.Service](injector),
 		HooksSvc:         do.MustInvoke[*hooks.Service](injector),
+		SessionsSvc:      do.MustInvoke[*sessions.Service](injector),
 		APISrv:           do.MustInvoke[*api.Server](injector),
 		Bus:              do.MustInvoke[events.Bus](injector),
 		StreamRepo:       do.MustInvoke[store.StreamRepository](injector),
@@ -207,6 +209,7 @@ func provideSubConfigs(i *do.RootScope, gcfg *domain.GlobalConfig) {
 	do.ProvideValue(i, deref(gcfg.Publisher))
 	do.ProvideValue(i, deref(gcfg.Manager))
 	do.ProvideValue(i, deref(gcfg.Hooks))
+	do.ProvideValue(i, deref(gcfg.Sessions))
 	do.ProvideValue(i, deref(gcfg.Log))
 }
 
@@ -236,6 +239,7 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, publisher.New)
 	do.Provide(i, dvr.New)
 	do.Provide(i, hooks.New)
+	do.Provide(i, sessions.New)
 	do.Provide(i, metrics.New)
 	do.Provide(i, coordinator.New)
 
@@ -245,6 +249,7 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, handler.NewHookHandler)
 	do.Provide(i, handler.NewConfigHandler)
 	do.Provide(i, handler.NewVODHandler)
+	do.Provide(i, handler.NewSessionHandler)
 	do.Provide(i, api.New)
 }
 

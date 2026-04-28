@@ -137,6 +137,25 @@ type HookList struct {
 	Total int            `json:"total"`
 }
 
+// SessionList wraps the play-sessions list response.
+// Mirrors the JSON shape emitted by handler.SessionHandler.List /
+// ListByStream so swag can resolve {object} apidocs.SessionList.
+type SessionList struct {
+	Sessions   []*domain.PlaySession `json:"sessions"`
+	TotalCount int                   `json:"total_count"`
+	Stats      SessionStats          `json:"stats"`
+}
+
+// SessionStats mirrors sessions.Stats — duplicated here so apidocs stays
+// dependency-free of the sessions package (avoids any future cycle).
+type SessionStats struct {
+	Active          int   `json:"active"`
+	OpenedTotal     int64 `json:"opened_total"`
+	ClosedTotal     int64 `json:"closed_total"`
+	IdleClosedTotal int64 `json:"idle_closed_total"`
+	KickedTotal     int64 `json:"kicked_total"`
+}
+
 // HookTestInner is the payload for hook test success.
 type HookTestInner struct {
 	Status string `json:"status"`

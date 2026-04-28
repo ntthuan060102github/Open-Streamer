@@ -178,6 +178,32 @@ type SRTListenerConfig struct {
 	LatencyMS int `mapstructure:"latency_ms" json:"latency_ms" yaml:"latency_ms"`
 }
 
+// SessionsConfig controls the play-sessions tracker.
+//
+// Sessions are kept in memory only; restart loses every active record.
+// Idle timeout governs when an HLS/DASH viewer (no TCP-level "left" signal)
+// is considered gone. MaxLifetime caps the longest a single session can
+// stay open — useful as a safety valve against a viewer behind a misbehaving
+// proxy that keeps replaying segments forever.
+type SessionsConfig struct {
+	// Enabled toggles the entire feature. When false, the tracker no-ops and
+	// the API endpoints return empty.
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+
+	// IdleTimeoutSec is how long a session may go without activity before the
+	// reaper closes it. Default 30 s when <= 0.
+	IdleTimeoutSec int `mapstructure:"idle_timeout_sec" json:"idle_timeout_sec" yaml:"idle_timeout_sec"`
+
+	// MaxLifetimeSec, when > 0, hard-closes any session older than this even
+	// if it's still seeing activity. 0 disables the cap.
+	MaxLifetimeSec int `mapstructure:"max_lifetime_sec" json:"max_lifetime_sec" yaml:"max_lifetime_sec"`
+
+	// GeoIPDBPath is reserved for future MaxMind/IP2Location integration.
+	// Currently unused — the default GeoIP resolver is a no-op (Country="").
+	// Operators wanting GeoIP can wire their own resolver via DI.
+	GeoIPDBPath string `mapstructure:"geoip_db_path" json:"geoip_db_path,omitempty" yaml:"geoip_db_path,omitempty"`
+}
+
 // HooksConfig controls the hook dispatcher worker pool.
 // Per-hook settings (max retries, timeout, secret, event filter) are
 // configured on each Hook via the API.

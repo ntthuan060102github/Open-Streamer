@@ -124,6 +124,12 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 	slog.Info("publisher: SRT play session started", "stream_code", streamCode, "remote", conn.RemoteAddr())
 	defer slog.Info("publisher: SRT play session ended", "stream_code", streamCode)
 
+	// Track the session for the API. The tracker is nil-safe; openSRTSession
+	// returns the running byte counter and a closer the deferred cleanup
+	// invokes with the final transferred byte count.
+	srtSess := openSRTSession(ctx, s.tracker, streamCode, conn)
+	defer srtSess.close()
+
 	// Close the connection when the server context is cancelled so the write
 	// loop below unblocks.
 	watchDone := make(chan struct{})
@@ -160,9 +166,12 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 					if writeErr != nil {
 						return
 					}
-					if _, err := conn.Write(aligned); err != nil {
+					n, err := conn.Write(aligned)
+					if err != nil {
 						writeErr = err
+						return
 					}
+					srtSess.add(int64(n))
 				})
 			})
 			if writeErr != nil {

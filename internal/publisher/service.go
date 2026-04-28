@@ -22,13 +22,16 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/samber/do/v2"
 )
 
 // Compile-time assertion: rtspHandler implements the ServerHandler interfaces it claims.
 var (
-	_ gortsplib.ServerHandlerOnDescribe = (*rtspHandler)(nil)
-	_ gortsplib.ServerHandlerOnSetup    = (*rtspHandler)(nil)
+	_ gortsplib.ServerHandlerOnDescribe     = (*rtspHandler)(nil)
+	_ gortsplib.ServerHandlerOnSetup        = (*rtspHandler)(nil)
+	_ gortsplib.ServerHandlerOnPlay         = (*rtspHandler)(nil)
+	_ gortsplib.ServerHandlerOnSessionClose = (*rtspHandler)(nil)
 )
 
 // ABRRepMeta carries updated metadata for one ABR rendition used in in-place master
@@ -75,6 +78,7 @@ type Service struct {
 	listeners  config.ListenersConfig
 	buf        *buffer.Service
 	bus        events.Bus
+	tracker    sessions.Tracker
 	ffmpegPath string
 
 	// hlsFailoverGen: incremented on each input.failover so every ABR variant segmenter
@@ -95,6 +99,13 @@ type Service struct {
 	rtmpActive   map[domain.StreamCode]struct{}
 	srtActive    map[domain.StreamCode]struct{}
 
+	// rtspSessions maps each gortsplib *ServerSession to its tracker session
+	// adapter. Populated in OnPlay, drained in OnSessionClose. Distinct mutex
+	// because RTSP session callbacks fire from gortsplib's worker goroutines
+	// and must not contend on the broader s.mu used during stream lifecycle.
+	rtspSessionsMu sync.Mutex
+	rtspSessions   map[*gortsplib.ServerSession]*playSession
+
 	// pushStates is the per-(stream, url) push destination runtime state used
 	// by RuntimeStatus. Updated by serveRTMPPush at session boundaries.
 	// Separate mutex from s.mu to avoid blocking output orchestration when
@@ -111,6 +122,14 @@ func New(i do.Injector) (*Service, error) {
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
 
+	// Sessions tracker is optional — if no provider is registered, the
+	// publisher silently skips tracking. Lets the feature ship without
+	// forcing every test harness to wire it.
+	var tracker sessions.Tracker
+	if t, err := do.Invoke[*sessions.Service](i); err == nil {
+		tracker = t
+	}
+
 	ffmpegPath := tc.FFmpegPath
 	if ffmpegPath == "" {
 		ffmpegPath = domain.DefaultFFmpegPath
@@ -121,6 +140,7 @@ func New(i do.Injector) (*Service, error) {
 		listeners:      listeners,
 		buf:            buf,
 		bus:            bus,
+		tracker:        tracker,
 		ffmpegPath:     ffmpegPath,
 		hlsFailoverGen: make(map[domain.StreamCode]uint64),
 		streams:        make(map[domain.StreamCode]*streamState),
@@ -130,6 +150,7 @@ func New(i do.Injector) (*Service, error) {
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
 		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
+		rtspSessions:   make(map[*gortsplib.ServerSession]*playSession),
 	}
 	bus.Subscribe(domain.EventInputFailover, func(_ context.Context, e domain.Event) error {
 		svc.hlsFailoverMu.Lock()
@@ -158,6 +179,7 @@ func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus e
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
 		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
+		rtspSessions:   make(map[*gortsplib.ServerSession]*playSession),
 	}
 }
 

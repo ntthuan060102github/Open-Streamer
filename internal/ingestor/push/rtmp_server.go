@@ -38,7 +38,20 @@ type ConnectFunc func(ctx context.Context, streamID, bufferWriteID domain.Stream
 // no active ingest relay. It should stream frames to the client via writeFrame
 // until ctx is cancelled or an error occurs. Return a non-nil error only when
 // the stream is not available (causes the client to receive NOTFOUND).
-type PlayFunc func(ctx context.Context, key string, writeFrame func(cid gocodec.CodecID, data []byte, pts, dts uint32) error) error
+//
+// info carries per-connection metadata captured at OnPlay handshake time.
+// Callers that don't care can ignore it; current consumer is the play-sessions
+// tracker.
+type PlayFunc func(ctx context.Context, key string, info PlayInfo, writeFrame func(cid gocodec.CodecID, data []byte, pts, dts uint32) error) error
+
+// PlayInfo describes the remote peer of an external RTMP play client.
+type PlayInfo struct {
+	// RemoteAddr is the peer's "ip:port" string from the underlying TCP conn.
+	RemoteAddr string
+	// FlashVer is the client-supplied "flashVer" from the RTMP connect command.
+	// Loosely equivalent to a User-Agent — populated by VLC, ffplay, OBS etc.
+	FlashVer string
+}
 
 // RTMPServer accepts RTMP push connections from encoders, validates them
 // against the push Registry, and relays each live stream to an internal
@@ -239,8 +252,11 @@ func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		slog.Info("rtmp server: external play client connected", "key", key)
+		// FlashVer would need a patched gomedia to expose — left empty for
+		// now. RemoteAddr alone is enough to populate the sessions tracker.
+		info := PlayInfo{RemoteAddr: conn.RemoteAddr().String()}
 		go func() {
-			err := fn(connCtx, key, func(cid gocodec.CodecID, data []byte, pts, dts uint32) error {
+			err := fn(connCtx, key, info, func(cid gocodec.CodecID, data []byte, pts, dts uint32) error {
 				return handle.WriteFrame(cid, data, pts, dts)
 			})
 			if err != nil {

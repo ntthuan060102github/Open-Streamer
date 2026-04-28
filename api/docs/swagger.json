@@ -685,6 +685,105 @@
                 }
             }
         },
+        "/sessions": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "List play sessions",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by protocol (hls|dash|rtmp|srt|rtsp)",
+                        "name": "proto",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by status (active|closed)",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Max sessions to return (default 0 = no cap)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.SessionList"
+                        }
+                    }
+                }
+            }
+        },
+        "/sessions/{id}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "Get a play session by ID",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Session ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/domain.PlaySession"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "Kick a play session",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Session ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "kicked"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
         "/streams": {
             "get": {
                 "produces": [
@@ -974,6 +1073,58 @@
                     },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
+        "/streams/{code}/sessions": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "sessions"
+                ],
+                "summary": "List sessions for a stream",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Stream code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by protocol",
+                        "name": "proto",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by status",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Max sessions to return",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.SessionList"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
                         "schema": {
                             "$ref": "#/definitions/apidocs.ErrorBody"
                         }
@@ -1585,6 +1736,43 @@
                 }
             }
         },
+        "apidocs.SessionList": {
+            "type": "object",
+            "properties": {
+                "sessions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.PlaySession"
+                    }
+                },
+                "stats": {
+                    "$ref": "#/definitions/apidocs.SessionStats"
+                },
+                "total_count": {
+                    "type": "integer"
+                }
+            }
+        },
+        "apidocs.SessionStats": {
+            "type": "object",
+            "properties": {
+                "active": {
+                    "type": "integer"
+                },
+                "closed_total": {
+                    "type": "integer"
+                },
+                "idle_closed_total": {
+                    "type": "integer"
+                },
+                "kicked_total": {
+                    "type": "integer"
+                },
+                "opened_total": {
+                    "type": "integer"
+                }
+            }
+        },
         "apidocs.StreamActionData": {
             "type": "object",
             "properties": {
@@ -2041,6 +2229,27 @@
                 }
             }
         },
+        "config.SessionsConfig": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "description": "Enabled toggles the entire feature. When false, the tracker no-ops and\nthe API endpoints return empty.",
+                    "type": "boolean"
+                },
+                "geoip_db_path": {
+                    "description": "GeoIPDBPath is reserved for future MaxMind/IP2Location integration.\nCurrently unused — the default GeoIP resolver is a no-op (Country=\"\").\nOperators wanting GeoIP can wire their own resolver via DI.",
+                    "type": "string"
+                },
+                "idle_timeout_sec": {
+                    "description": "IdleTimeoutSec is how long a session may go without activity before the\nreaper closes it. Default 30 s when \u003c= 0.",
+                    "type": "integer"
+                },
+                "max_lifetime_sec": {
+                    "description": "MaxLifetimeSec, when \u003e 0, hard-closes any session older than this even\nif it's still seeing activity. 0 disables the cap.",
+                    "type": "integer"
+                }
+            }
+        },
         "config.TranscoderConfig": {
             "type": "object",
             "properties": {
@@ -2154,7 +2363,9 @@
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error"
+                "transcoder.error",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2179,6 +2390,8 @@
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
@@ -2197,7 +2410,9 @@
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError"
+                "EventTranscoderError",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {
@@ -2226,6 +2441,9 @@
                 },
                 "server": {
                     "$ref": "#/definitions/config.ServerConfig"
+                },
+                "sessions": {
+                    "$ref": "#/definitions/config.SessionsConfig"
                 },
                 "transcoder": {
                     "$ref": "#/definitions/config.TranscoderConfig"
@@ -2449,6 +2667,99 @@
                 }
             }
         },
+        "domain.PlaySession": {
+            "type": "object",
+            "properties": {
+                "bytes": {
+                    "description": "Bytes is the cumulative bytes sent to this client since session open.\nHLS/DASH: sum of segment + manifest response bodies. RTMP/SRT: write\nbytes from the publisher's outbound pipeline.",
+                    "type": "integer"
+                },
+                "close_reason": {
+                    "description": "CloseReason explains why the session ended. Empty while active.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.SessionCloseReason"
+                        }
+                    ]
+                },
+                "closed_at": {
+                    "description": "ClosedAt is set when the session ends. nil while active.",
+                    "type": "string"
+                },
+                "country": {
+                    "description": "Country is an ISO 3166-1 alpha-2 country code from the configured\nGeoIP resolver, or \"\" when GeoIP is disabled / lookup failed.",
+                    "type": "string"
+                },
+                "dvr": {
+                    "description": "DVR is true when playback originated from the DVR window (timeshift),\nfalse for live edge. Open-Streamer's DVR delivery is not yet routed\nthrough here so this is currently always false; field reserved.",
+                    "type": "boolean"
+                },
+                "id": {
+                    "description": "ID uniquely identifies the session across the server's lifetime. For\nsegment protocols (HLS/DASH) it is the deterministic fingerprint hash\n(so reconnects within the idle window collapse onto one session); for\nconnection-bound protocols (RTMP/SRT/RTSP) it is a random UUID.",
+                    "type": "string"
+                },
+                "ip": {
+                    "description": "IP is the remote peer address (no port). For HTTP-based protocols this\nis the X-Forwarded-For head when present, otherwise the RemoteAddr.",
+                    "type": "string"
+                },
+                "named_by": {
+                    "description": "NamedBy records how UserName was resolved.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.SessionNamedBy"
+                        }
+                    ]
+                },
+                "opened_at": {
+                    "description": "OpenedAt is the time the first activity for this session was observed.",
+                    "type": "string"
+                },
+                "proto": {
+                    "description": "Protocol is the wire protocol used to deliver this session.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.SessionProto"
+                        }
+                    ]
+                },
+                "query_string": {
+                    "description": "QueryString is the raw query of the FIRST request that opened the\nsession (HLS/DASH) — useful when token/abr-variant info is encoded there.",
+                    "type": "string"
+                },
+                "referer": {
+                    "description": "Referer is the HTTP Referer when present (HLS/DASH only).",
+                    "type": "string"
+                },
+                "secure": {
+                    "description": "Secure is true when the underlying transport was TLS / SRTS / RTMPS.",
+                    "type": "boolean"
+                },
+                "started_at": {
+                    "description": "StartedAt is when the first byte of media was delivered (segment data\nfor HLS/DASH, first frame after RTMP play handshake). Zero before\nmedia flows.",
+                    "type": "string"
+                },
+                "stream_code": {
+                    "description": "StreamCode is the foreign key to Stream.Code.",
+                    "type": "string"
+                },
+                "token": {
+                    "description": "Token is the value of `?token=` from the first request, when present.\nWhen set, NamedBy is SessionNamedByToken.",
+                    "type": "string"
+                },
+                "updated_at": {
+                    "description": "UpdatedAt is the time of the most recent activity. Idle reaper closes\nsessions whose UpdatedAt is older than (now - idle_timeout).",
+                    "type": "string"
+                },
+                "user_agent": {
+                    "description": "UserAgent is the browser/player User-Agent (HTTP) or the equivalent\nflashVer field for RTMP. May be empty.",
+                    "type": "string"
+                },
+                "user_name": {
+                    "description": "UserName is a human label. Resolved from token claims if available,\notherwise the fingerprint hash short form. Empty when no identity could\nbe resolved.",
+                    "type": "string"
+                }
+            }
+        },
         "domain.PushDestination": {
             "type": "object",
             "properties": {
@@ -2567,6 +2878,73 @@
                 "ResizeModeCrop",
                 "ResizeModeStretch",
                 "ResizeModeFit"
+            ]
+        },
+        "domain.SessionCloseReason": {
+            "type": "string",
+            "enum": [
+                "idle",
+                "client_gone",
+                "shutdown",
+                "kicked"
+            ],
+            "x-enum-comments": {
+                "SessionCloseClient": "TCP/UDP peer closed (RTMP/SRT/RTSP)",
+                "SessionCloseIdle": "no activity within the configured idle window",
+                "SessionCloseKicked": "operator force-closed via API",
+                "SessionCloseShutdown": "server shutting down"
+            },
+            "x-enum-descriptions": [
+                "no activity within the configured idle window",
+                "TCP/UDP peer closed (RTMP/SRT/RTSP)",
+                "server shutting down",
+                "operator force-closed via API"
+            ],
+            "x-enum-varnames": [
+                "SessionCloseIdle",
+                "SessionCloseClient",
+                "SessionCloseShutdown",
+                "SessionCloseKicked"
+            ]
+        },
+        "domain.SessionNamedBy": {
+            "type": "string",
+            "enum": [
+                "token",
+                "config",
+                "fingerprint"
+            ],
+            "x-enum-comments": {
+                "SessionNamedByConfig": "resolved from server-side config (future: signed URL)",
+                "SessionNamedByFingerprint": "synthesised hash of ip+ua+stream",
+                "SessionNamedByToken": "resolved from a `token` query param"
+            },
+            "x-enum-descriptions": [
+                "resolved from a `token` query param",
+                "resolved from server-side config (future: signed URL)",
+                "synthesised hash of ip+ua+stream"
+            ],
+            "x-enum-varnames": [
+                "SessionNamedByToken",
+                "SessionNamedByConfig",
+                "SessionNamedByFingerprint"
+            ]
+        },
+        "domain.SessionProto": {
+            "type": "string",
+            "enum": [
+                "hls",
+                "dash",
+                "rtmp",
+                "srt",
+                "rtsp"
+            ],
+            "x-enum-varnames": [
+                "SessionProtoHLS",
+                "SessionProtoDASH",
+                "SessionProtoRTMP",
+                "SessionProtoSRT",
+                "SessionProtoRTSP"
             ]
         },
         "domain.StreamCodeFilter": {

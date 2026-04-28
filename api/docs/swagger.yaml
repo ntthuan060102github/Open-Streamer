@@ -120,6 +120,30 @@ definitions:
       total:
         type: integer
     type: object
+  apidocs.SessionList:
+    properties:
+      sessions:
+        items:
+          $ref: '#/definitions/domain.PlaySession'
+        type: array
+      stats:
+        $ref: '#/definitions/apidocs.SessionStats'
+      total_count:
+        type: integer
+    type: object
+  apidocs.SessionStats:
+    properties:
+      active:
+        type: integer
+      closed_total:
+        type: integer
+      idle_closed_total:
+        type: integer
+      kicked_total:
+        type: integer
+      opened_total:
+        type: integer
+    type: object
   apidocs.StreamActionData:
     properties:
       data:
@@ -451,6 +475,30 @@ definitions:
       http_addr:
         type: string
     type: object
+  config.SessionsConfig:
+    properties:
+      enabled:
+        description: |-
+          Enabled toggles the entire feature. When false, the tracker no-ops and
+          the API endpoints return empty.
+        type: boolean
+      geoip_db_path:
+        description: |-
+          GeoIPDBPath is reserved for future MaxMind/IP2Location integration.
+          Currently unused — the default GeoIP resolver is a no-op (Country="").
+          Operators wanting GeoIP can wire their own resolver via DI.
+        type: string
+      idle_timeout_sec:
+        description: |-
+          IdleTimeoutSec is how long a session may go without activity before the
+          reaper closes it. Default 30 s when <= 0.
+        type: integer
+      max_lifetime_sec:
+        description: |-
+          MaxLifetimeSec, when > 0, hard-closes any session older than this even
+          if it's still seeing activity. 0 disables the cap.
+        type: integer
+    type: object
   config.TranscoderConfig:
     properties:
       ffmpeg_path:
@@ -555,6 +603,8 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
+    - session.opened
+    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -579,6 +629,8 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
     - EventStreamCreated
     - EventStreamStarted
@@ -596,6 +648,8 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
+    - EventSessionOpened
+    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -614,6 +668,8 @@ definitions:
         $ref: '#/definitions/config.PublisherConfig'
       server:
         $ref: '#/definitions/config.ServerConfig'
+      sessions:
+        $ref: '#/definitions/config.SessionsConfig'
       transcoder:
         $ref: '#/definitions/config.TranscoderConfig'
     type: object
@@ -816,6 +872,99 @@ definitions:
         description: SRT opens an SRT listener port for contribution-quality pull.
         type: boolean
     type: object
+  domain.PlaySession:
+    properties:
+      bytes:
+        description: |-
+          Bytes is the cumulative bytes sent to this client since session open.
+          HLS/DASH: sum of segment + manifest response bodies. RTMP/SRT: write
+          bytes from the publisher's outbound pipeline.
+        type: integer
+      close_reason:
+        allOf:
+        - $ref: '#/definitions/domain.SessionCloseReason'
+        description: CloseReason explains why the session ended. Empty while active.
+      closed_at:
+        description: ClosedAt is set when the session ends. nil while active.
+        type: string
+      country:
+        description: |-
+          Country is an ISO 3166-1 alpha-2 country code from the configured
+          GeoIP resolver, or "" when GeoIP is disabled / lookup failed.
+        type: string
+      dvr:
+        description: |-
+          DVR is true when playback originated from the DVR window (timeshift),
+          false for live edge. Open-Streamer's DVR delivery is not yet routed
+          through here so this is currently always false; field reserved.
+        type: boolean
+      id:
+        description: |-
+          ID uniquely identifies the session across the server's lifetime. For
+          segment protocols (HLS/DASH) it is the deterministic fingerprint hash
+          (so reconnects within the idle window collapse onto one session); for
+          connection-bound protocols (RTMP/SRT/RTSP) it is a random UUID.
+        type: string
+      ip:
+        description: |-
+          IP is the remote peer address (no port). For HTTP-based protocols this
+          is the X-Forwarded-For head when present, otherwise the RemoteAddr.
+        type: string
+      named_by:
+        allOf:
+        - $ref: '#/definitions/domain.SessionNamedBy'
+        description: NamedBy records how UserName was resolved.
+      opened_at:
+        description: OpenedAt is the time the first activity for this session was
+          observed.
+        type: string
+      proto:
+        allOf:
+        - $ref: '#/definitions/domain.SessionProto'
+        description: Protocol is the wire protocol used to deliver this session.
+      query_string:
+        description: |-
+          QueryString is the raw query of the FIRST request that opened the
+          session (HLS/DASH) — useful when token/abr-variant info is encoded there.
+        type: string
+      referer:
+        description: Referer is the HTTP Referer when present (HLS/DASH only).
+        type: string
+      secure:
+        description: Secure is true when the underlying transport was TLS / SRTS /
+          RTMPS.
+        type: boolean
+      started_at:
+        description: |-
+          StartedAt is when the first byte of media was delivered (segment data
+          for HLS/DASH, first frame after RTMP play handshake). Zero before
+          media flows.
+        type: string
+      stream_code:
+        description: StreamCode is the foreign key to Stream.Code.
+        type: string
+      token:
+        description: |-
+          Token is the value of `?token=` from the first request, when present.
+          When set, NamedBy is SessionNamedByToken.
+        type: string
+      updated_at:
+        description: |-
+          UpdatedAt is the time of the most recent activity. Idle reaper closes
+          sessions whose UpdatedAt is older than (now - idle_timeout).
+        type: string
+      user_agent:
+        description: |-
+          UserAgent is the browser/player User-Agent (HTTP) or the equivalent
+          flashVer field for RTMP. May be empty.
+        type: string
+      user_name:
+        description: |-
+          UserName is a human label. Resolved from token claims if available,
+          otherwise the fingerprint hash short form. Empty when no identity could
+          be resolved.
+        type: string
+    type: object
   domain.PushDestination:
     properties:
       comment:
@@ -913,6 +1062,60 @@ definitions:
     - ResizeModeCrop
     - ResizeModeStretch
     - ResizeModeFit
+  domain.SessionCloseReason:
+    enum:
+    - idle
+    - client_gone
+    - shutdown
+    - kicked
+    type: string
+    x-enum-comments:
+      SessionCloseClient: TCP/UDP peer closed (RTMP/SRT/RTSP)
+      SessionCloseIdle: no activity within the configured idle window
+      SessionCloseKicked: operator force-closed via API
+      SessionCloseShutdown: server shutting down
+    x-enum-descriptions:
+    - no activity within the configured idle window
+    - TCP/UDP peer closed (RTMP/SRT/RTSP)
+    - server shutting down
+    - operator force-closed via API
+    x-enum-varnames:
+    - SessionCloseIdle
+    - SessionCloseClient
+    - SessionCloseShutdown
+    - SessionCloseKicked
+  domain.SessionNamedBy:
+    enum:
+    - token
+    - config
+    - fingerprint
+    type: string
+    x-enum-comments:
+      SessionNamedByConfig: 'resolved from server-side config (future: signed URL)'
+      SessionNamedByFingerprint: synthesised hash of ip+ua+stream
+      SessionNamedByToken: resolved from a `token` query param
+    x-enum-descriptions:
+    - resolved from a `token` query param
+    - 'resolved from server-side config (future: signed URL)'
+    - synthesised hash of ip+ua+stream
+    x-enum-varnames:
+    - SessionNamedByToken
+    - SessionNamedByConfig
+    - SessionNamedByFingerprint
+  domain.SessionProto:
+    enum:
+    - hls
+    - dash
+    - rtmp
+    - srt
+    - rtsp
+    type: string
+    x-enum-varnames:
+    - SessionProtoHLS
+    - SessionProtoDASH
+    - SessionProtoRTMP
+    - SessionProtoSRT
+    - SessionProtoRTSP
   domain.StreamCodeFilter:
     properties:
       except:
@@ -2005,6 +2208,70 @@ paths:
       summary: Timeshift VOD playlist
       tags:
       - recordings
+  /sessions:
+    get:
+      parameters:
+      - description: Filter by protocol (hls|dash|rtmp|srt|rtsp)
+        in: query
+        name: proto
+        type: string
+      - description: Filter by status (active|closed)
+        in: query
+        name: status
+        type: string
+      - description: Max sessions to return (default 0 = no cap)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apidocs.SessionList'
+      summary: List play sessions
+      tags:
+      - sessions
+  /sessions/{id}:
+    delete:
+      parameters:
+      - description: Session ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: kicked
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Kick a play session
+      tags:
+      - sessions
+    get:
+      parameters:
+      - description: Session ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/domain.PlaySession'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Get a play session by ID
+      tags:
+      - sessions
   /streams:
     get:
       parameters:
@@ -2198,6 +2465,40 @@ paths:
       summary: Restart stream pipeline
       tags:
       - streams
+  /streams/{code}/sessions:
+    get:
+      parameters:
+      - description: Stream code
+        in: path
+        name: code
+        required: true
+        type: string
+      - description: Filter by protocol
+        in: query
+        name: proto
+        type: string
+      - description: Filter by status
+        in: query
+        name: status
+        type: string
+      - description: Max sessions to return
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apidocs.SessionList'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: List sessions for a stream
+      tags:
+      - sessions
   /vod:
     get:
       produces:

@@ -18,6 +18,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
 	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
+	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samber/do/v2"
 )
@@ -33,6 +34,12 @@ type Server struct {
 	hookH      *handler.HookHandler
 	configH    *handler.ConfigHandler
 	vodH       *handler.VODHandler
+	sessionH   *handler.SessionHandler
+
+	// sessTracker is the shared play-sessions tracker. Used to wrap the
+	// mediaserve mount with a tracking middleware so HLS / DASH segment
+	// fetches are recorded as sessions. nil disables tracking entirely.
+	sessTracker sessions.Tracker
 
 	router *chi.Mux
 	http   *http.Server
@@ -56,6 +63,13 @@ func New(i do.Injector) (*Server, error) {
 		hookH:      do.MustInvoke[*handler.HookHandler](i),
 		configH:    do.MustInvoke[*handler.ConfigHandler](i),
 		vodH:       do.MustInvoke[*handler.VODHandler](i),
+		sessionH:   do.MustInvoke[*handler.SessionHandler](i),
+	}
+	// Tracker is optional: only wrap mediaserve when the sessions feature is
+	// wired in DI. Treats a missing provider as "feature disabled" rather
+	// than a startup error.
+	if t, err := do.Invoke[*sessions.Service](i); err == nil {
+		s.sessTracker = t
 	}
 	return s, nil
 }
@@ -86,7 +100,15 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	r.Get("/swagger", http.RedirectHandler("/swagger/", http.StatusMovedPermanently).ServeHTTP)
 	r.Get("/swagger/", serveSwaggerIndex)
 
-	mediaserve.Mount(r, s.hlsDir, s.dashDir)
+	// Mount media routes under a sub-router so we can attach the play-sessions
+	// middleware ONLY to /<code>/<segment> paths and not to the API endpoints
+	// above. Chi composes Use+Mount cleanly here.
+	r.Group(func(mr chi.Router) {
+		if s.sessTracker != nil {
+			mr.Use(sessions.HTTPMiddleware(s.sessTracker))
+		}
+		mediaserve.Mount(mr, s.hlsDir, s.dashDir)
+	})
 
 	r.Route("/streams", func(r chi.Router) {
 		r.Get("/", s.streamH.List)
@@ -98,6 +120,15 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 			r.Post("/inputs/switch", s.streamH.SwitchInput)
 
 			r.Get("/recordings", s.recordingH.ListByStream)
+			r.Get("/sessions", s.sessionH.ListByStream)
+		})
+	})
+
+	r.Route("/sessions", func(r chi.Router) {
+		r.Get("/", s.sessionH.List)
+		r.Route("/{id}", func(r chi.Router) {
+			r.Get("/", s.sessionH.Get)
+			r.Delete("/", s.sessionH.Delete)
 		})
 	})
 

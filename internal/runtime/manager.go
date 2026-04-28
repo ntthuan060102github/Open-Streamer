@@ -19,6 +19,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
+	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
@@ -38,6 +39,7 @@ type Deps struct {
 	Coordinator      *coordinator.Coordinator
 	Transcoder       *transcoder.Service
 	HooksSvc         *hooks.Service
+	SessionsSvc      *sessions.Service
 	APISrv           *api.Server
 	Bus              events.Bus
 	StreamRepo       store.StreamRepository
@@ -174,6 +176,17 @@ func (m *Manager) applyAll(cfg *domain.GlobalConfig) {
 	if cfg.Hooks != nil {
 		m.startService("hooks", func(ctx context.Context) error {
 			return m.deps.HooksSvc.Start(ctx)
+		})
+	}
+
+	// Sessions tracker: idle reaper runs only when the feature is enabled in
+	// config. Tracker.Run is a no-op (and returns immediately) when disabled,
+	// so it's safe to spawn unconditionally — but we gate on the section
+	// being present to keep the service list honest.
+	if cfg.Sessions != nil && m.deps.SessionsSvc != nil {
+		m.startService("sessions", func(ctx context.Context) error {
+			m.deps.SessionsSvc.Run(ctx)
+			return nil
 		})
 	}
 

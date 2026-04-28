@@ -92,6 +92,18 @@ func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
 
 type rtspHandler struct{ svc *Service }
 
+// rtspPathStreamCode extracts the StreamCode from an RTSP request path.
+// Accepts "live/<code>", "/live/<code>", or bare "<code>". Path may also
+// contain a track suffix (e.g. /live/foo/trackID=0) — we trim that.
+func rtspPathStreamCode(path string) domain.StreamCode {
+	p := strings.TrimPrefix(path, "/")
+	p = strings.TrimPrefix(p, "live/")
+	if i := strings.IndexByte(p, '/'); i > 0 {
+		p = p[:i]
+	}
+	return domain.StreamCode(strings.TrimSpace(p))
+}
+
 // OnDescribe handles DESCRIBE — returns the ServerStream for the requested path.
 func (h *rtspHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
 	stream := h.lookupStream(ctx.Path)
@@ -108,6 +120,43 @@ func (h *rtspHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Res
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
 	return &base.Response{StatusCode: base.StatusOK}, stream, nil
+}
+
+// OnPlay opens a tracker session for one RTSP client. Bytes are not credited
+// (gortsplib writes the wire format internally and we have no per-subscriber
+// hook); the open / close events still record the viewer's IP, UA, duration.
+func (h *rtspHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+	code := rtspPathStreamCode(ctx.Path)
+	if code == "" {
+		return &base.Response{StatusCode: base.StatusBadRequest}, nil
+	}
+	ua := ""
+	if ctx.Request != nil {
+		if v, ok := ctx.Request.Header["User-Agent"]; ok && len(v) > 0 {
+			ua = v[0]
+		}
+	}
+	sess := openRTSPSession(context.Background(), h.svc.tracker, code, ctx.Conn.NetConn().RemoteAddr(), ua)
+	if sess != nil {
+		h.svc.rtspSessionsMu.Lock()
+		h.svc.rtspSessions[ctx.Session] = sess
+		h.svc.rtspSessionsMu.Unlock()
+	}
+	return &base.Response{StatusCode: base.StatusOK}, nil
+}
+
+// OnSessionClose closes the tracker session that mirrored this RTSP one.
+// Idempotent on missing entries (a session that never reached PLAY).
+func (h *rtspHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
+	h.svc.rtspSessionsMu.Lock()
+	sess, ok := h.svc.rtspSessions[ctx.Session]
+	if ok {
+		delete(h.svc.rtspSessions, ctx.Session)
+	}
+	h.svc.rtspSessionsMu.Unlock()
+	if ok {
+		sess.close()
+	}
 }
 
 // lookupStream matches a request path to a registered ServerStream.
