@@ -47,6 +47,13 @@ type configDefaultsResponse struct {
 	Hook struct {
 		MaxRetries int `json:"max_retries"`
 		TimeoutSec int `json:"timeout_sec"`
+		// Batch* defaults apply to HTTP hooks only — file hooks always
+		// write one event per line. The dispatcher's mergeBatchConfig
+		// uses the same Default* constants, so the API surface and the
+		// runtime fallback can never drift.
+		BatchMaxItems         int `json:"batch_max_items"`
+		BatchFlushIntervalSec int `json:"batch_flush_interval_sec"`
+		BatchMaxQueueItems    int `json:"batch_max_queue_items"`
 	} `json:"hook"`
 
 	Push struct {
@@ -202,6 +209,9 @@ func buildConfigDefaults() configDefaultsResponse {
 
 	resp.Hook.MaxRetries = domain.DefaultHookMaxRetries
 	resp.Hook.TimeoutSec = domain.DefaultHookTimeoutSec
+	resp.Hook.BatchMaxItems = domain.DefaultHookBatchMaxItems
+	resp.Hook.BatchFlushIntervalSec = domain.DefaultHookBatchFlushIntervalSec
+	resp.Hook.BatchMaxQueueItems = domain.DefaultHookBatchMaxQueueItems
 
 	resp.Push.TimeoutSec = domain.DefaultPushTimeoutSec
 	resp.Push.RetryTimeoutSec = domain.DefaultPushRetryTimeoutSec

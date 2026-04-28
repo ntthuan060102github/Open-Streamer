@@ -38,6 +38,9 @@ func TestGetConfigDefaultsShape(t *testing.T) {
 
 	assert.Equal(t, domain.DefaultHookMaxRetries, got.Hook.MaxRetries)
 	assert.Equal(t, domain.DefaultHookTimeoutSec, got.Hook.TimeoutSec)
+	assert.Equal(t, domain.DefaultHookBatchMaxItems, got.Hook.BatchMaxItems)
+	assert.Equal(t, domain.DefaultHookBatchFlushIntervalSec, got.Hook.BatchFlushIntervalSec)
+	assert.Equal(t, domain.DefaultHookBatchMaxQueueItems, got.Hook.BatchMaxQueueItems)
 
 	assert.Equal(t, domain.DefaultPushTimeoutSec, got.Push.TimeoutSec)
 	assert.Equal(t, domain.DefaultPushRetryTimeoutSec, got.Push.RetryTimeoutSec)

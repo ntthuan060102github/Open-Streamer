@@ -2590,6 +2590,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2605,9 +2607,7 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error",
-                "session.opened",
-                "session.closed"
+                "transcoder.error"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2617,6 +2617,8 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -2632,11 +2634,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2652,9 +2654,7 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTranscoderError"
             ]
         },
         "domain.GlobalConfig": {
@@ -3619,6 +3619,16 @@ const docTemplate = `{
                 "hook": {
                     "type": "object",
                     "properties": {
+                        "batch_flush_interval_sec": {
+                            "type": "integer"
+                        },
+                        "batch_max_items": {
+                            "description": "Batch* defaults apply to HTTP hooks only — file hooks always\nwrite one event per line. The dispatcher's mergeBatchConfig\nuses the same Default* constants, so the API surface and the\nruntime fallback can never drift.",
+                            "type": "integer"
+                        },
+                        "batch_max_queue_items": {
+                            "type": "integer"
+                        },
                         "max_retries": {
                             "type": "integer"
                         },
