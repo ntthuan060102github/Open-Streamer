@@ -27,6 +27,74 @@ func baseStream() *domain.Stream {
 	}
 }
 
+// passthroughStream returns a baseStream variant with both video and audio
+// in copy mode so needsFFmpeg returns false. Used by watermark tests that
+// need to verify the "no FFmpeg ever runs → watermark change is moot" path.
+func passthroughStream() *domain.Stream {
+	s := baseStream()
+	s.Transcoder = &domain.TranscoderConfig{
+		Video: domain.VideoTranscodeConfig{Copy: true},
+		Audio: domain.AudioTranscodeConfig{Copy: true},
+	}
+	return s
+}
+
+func TestComputeDiff_WatermarkAddedTriggersTopology(t *testing.T) {
+	old := baseStream()
+	new := baseStream()
+	new.Watermark = &domain.WatermarkConfig{
+		Enabled: true, Type: domain.WatermarkTypeText, Text: "LIVE",
+	}
+
+	d := ComputeDiff(old, new)
+	// Filter graph baked into FFmpeg argv → must restart to pick up.
+	assert.True(t, d.TranscoderChanged)
+	assert.True(t, d.TranscoderTopologyChanged)
+}
+
+func TestComputeDiff_WatermarkRemovedTriggersTopology(t *testing.T) {
+	old := baseStream()
+	old.Watermark = &domain.WatermarkConfig{
+		Enabled: true, Type: domain.WatermarkTypeText, Text: "LIVE",
+	}
+	new := baseStream()
+
+	d := ComputeDiff(old, new)
+	assert.True(t, d.TranscoderChanged)
+	assert.True(t, d.TranscoderTopologyChanged)
+}
+
+func TestComputeDiff_WatermarkChangedAlongsideProfileForcesTopology(t *testing.T) {
+	old := baseStream()
+	old.Watermark = &domain.WatermarkConfig{
+		Enabled: true, Type: domain.WatermarkTypeText, Text: "LIVE",
+	}
+	new := baseStream()
+	new.Watermark = &domain.WatermarkConfig{
+		Enabled: true, Type: domain.WatermarkTypeText, Text: "ON AIR",
+	}
+	new.Transcoder.Video.Profiles[0].Bitrate = 4000 // also bump bitrate
+
+	d := ComputeDiff(old, new)
+	assert.True(t, d.TranscoderChanged)
+	// Watermark forces topology even when profiles also changed — per-profile
+	// path can't refresh sw.tc cleanly.
+	assert.True(t, d.TranscoderTopologyChanged)
+}
+
+func TestComputeDiff_WatermarkOnPassthroughIsNoop(t *testing.T) {
+	old := passthroughStream()
+	new := passthroughStream()
+	new.Watermark = &domain.WatermarkConfig{
+		Enabled: true, Type: domain.WatermarkTypeText, Text: "LIVE",
+	}
+
+	d := ComputeDiff(old, new)
+	// Both ends are passthrough — no FFmpeg → watermark is moot.
+	assert.False(t, d.TranscoderChanged, "watermark on passthrough should not trigger restart")
+	assert.False(t, d.TranscoderTopologyChanged)
+}
+
 func TestComputeDiff_MetadataOnly(t *testing.T) {
 	old := baseStream()
 	new := baseStream()

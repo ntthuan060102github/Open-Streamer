@@ -101,12 +101,34 @@ func diffInputs(old, new *domain.Stream, d *StreamDiff) {
 }
 
 // diffTranscoder compares transcoder configs with two granularity levels:
-// 1. Topology change (buffer layout changes) → full restart needed
-// 2. Per-profile diff (only specific FFmpeg processes need restart).
+//  1. Topology change (buffer layout changes OR watermark filter graph change)
+//     → full restart needed
+//  2. Per-profile diff (only specific FFmpeg processes need restart).
+//
+// Watermark belongs in this function because the filter graph it produces
+// lives in `-vf` baked into the FFmpeg argv — there's no way to swap it
+// without restarting the encoder. Coordinator's `transcoderConfigWithWatermark`
+// rebuilds the runtime config on each `tc.Start`, so a topology reload is
+// the cheapest reliable path that picks up the new watermark across both
+// legacy and multi-output modes.
 func diffTranscoder(old, new *domain.Stream, d *StreamDiff) {
-	if reflect.DeepEqual(old.Transcoder, new.Transcoder) {
+	transcoderEq := reflect.DeepEqual(old.Transcoder, new.Transcoder)
+	watermarkEq := reflect.DeepEqual(old.Watermark, new.Watermark)
+	if transcoderEq && watermarkEq {
 		return
 	}
+
+	// Watermark-only change: route to topology reload when FFmpeg is
+	// actually running on either side. Passthrough streams (no FFmpeg)
+	// never see the filter graph so the change is moot.
+	if transcoderEq && !watermarkEq {
+		if needsFFmpeg(old.Transcoder) || needsFFmpeg(new.Transcoder) {
+			d.TranscoderChanged = true
+			d.TranscoderTopologyChanged = true
+		}
+		return
+	}
+
 	d.TranscoderChanged = true
 
 	// nil ↔ non-nil is a topology change.
@@ -132,6 +154,14 @@ func diffTranscoder(old, new *domain.Stream, d *StreamDiff) {
 
 	// If neither config needs FFmpeg, there are no profiles to diff.
 	if !needsFFmpeg(nt) {
+		return
+	}
+
+	// Watermark change alongside transcoder change still forces topology
+	// reload — cheaper than trying to compose a per-profile path that
+	// would need a sw.tc refresh transcoder doesn't currently expose.
+	if !watermarkEq {
+		d.TranscoderTopologyChanged = true
 		return
 	}
 
