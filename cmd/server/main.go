@@ -225,10 +225,17 @@ func deref[T any](p *T) T {
 
 // wireServices registers all non-storage services into the DI injector.
 func wireServices(i *do.RootScope) {
-	// Infrastructure
+	// Infrastructure. WorkerCount=0 → default 4. With batched HTTP hook
+	// delivery, hook handlers are ~µs (just enqueue) so even 1 worker
+	// handles every realistic event throughput; 4 keeps headroom for
+	// future bus subscribers.
 	do.Provide(i, func(inj do.Injector) (events.Bus, error) {
 		cfg := do.MustInvoke[config.HooksConfig](inj)
-		bus := events.New(cfg.WorkerCount, 512)
+		workers := cfg.WorkerCount
+		if workers <= 0 {
+			workers = 4
+		}
+		bus := events.New(workers, 512)
 		return bus, nil
 	})
 

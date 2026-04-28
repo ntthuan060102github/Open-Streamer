@@ -70,10 +70,29 @@ type Hook struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// MaxRetries is the number of delivery attempts before giving up.
-	// 0 means use the server default (3).
+	// 0 means use the server default (3). For HTTP hooks this caps retries
+	// inside a single batch flush; events that still fail are re-queued
+	// for the next flush regardless of MaxRetries.
 	MaxRetries int `json:"max_retries" yaml:"max_retries"`
 
 	// TimeoutSec is the per-attempt delivery timeout in seconds.
 	// 0 means use the server default (10s).
 	TimeoutSec int `json:"timeout_sec" yaml:"timeout_sec"`
+
+	// BatchMaxItems caps the number of events bundled into one HTTP POST
+	// body. 0 = use HooksConfig.BatchMaxItems, then DefaultHookBatchMaxItems.
+	// Ignored for File hooks (they always write one event per line).
+	BatchMaxItems int `json:"batch_max_items,omitempty" yaml:"batch_max_items,omitempty"`
+
+	// BatchFlushIntervalSec is the maximum time a batch may sit before being
+	// flushed even when below BatchMaxItems. 0 = use HooksConfig default,
+	// then DefaultHookBatchFlushIntervalSec.
+	BatchFlushIntervalSec int `json:"batch_flush_interval_sec,omitempty" yaml:"batch_flush_interval_sec,omitempty"`
+
+	// BatchMaxQueueItems caps the per-hook in-memory queue (pending +
+	// re-queued failures). When exceeded, the OLDEST events are dropped
+	// with a warning log so the queue never grows unbounded against an
+	// unreachable target. 0 = use HooksConfig default, then
+	// DefaultHookBatchMaxQueueItems.
+	BatchMaxQueueItems int `json:"batch_max_queue_items,omitempty" yaml:"batch_max_queue_items,omitempty"`
 }

@@ -2279,8 +2279,20 @@ const docTemplate = `{
         "config.HooksConfig": {
             "type": "object",
             "properties": {
+                "batch_flush_interval_sec": {
+                    "description": "BatchFlushIntervalSec is the global default for the per-hook flush\ntimer in seconds. Per-hook overrides win; code default is\nDefaultHookBatchFlushIntervalSec.",
+                    "type": "integer"
+                },
+                "batch_max_items": {
+                    "description": "BatchMaxItems is the global default for HTTP hook batch size.\nPer-hook BatchMaxItems overrides this; the code default\n(DefaultHookBatchMaxItems) wins only when both are 0.",
+                    "type": "integer"
+                },
+                "batch_max_queue_items": {
+                    "description": "BatchMaxQueueItems is the global default for the per-hook in-memory\nqueue cap. Per-hook overrides win; code default is\nDefaultHookBatchMaxQueueItems.",
+                    "type": "integer"
+                },
                 "worker_count": {
-                    "description": "WorkerCount is the number of concurrent hook delivery goroutines.",
+                    "description": "WorkerCount sizes the events.Bus worker pool that fans events out\nto subscribers. Each worker invokes the registered handler for an\nincoming event; with the batched HTTP delivery, the hook handler\njust enqueues into a per-hook batcher (~µs) so this number rarely\nneeds tuning. 1-4 covers nearly every workload. 0 = use 4.",
                     "type": "integer"
                 }
             }
@@ -2717,6 +2729,18 @@ const docTemplate = `{
         "domain.Hook": {
             "type": "object",
             "properties": {
+                "batch_flush_interval_sec": {
+                    "description": "BatchFlushIntervalSec is the maximum time a batch may sit before being\nflushed even when below BatchMaxItems. 0 = use HooksConfig default,\nthen DefaultHookBatchFlushIntervalSec.",
+                    "type": "integer"
+                },
+                "batch_max_items": {
+                    "description": "BatchMaxItems caps the number of events bundled into one HTTP POST\nbody. 0 = use HooksConfig.BatchMaxItems, then DefaultHookBatchMaxItems.\nIgnored for File hooks (they always write one event per line).",
+                    "type": "integer"
+                },
+                "batch_max_queue_items": {
+                    "description": "BatchMaxQueueItems caps the per-hook in-memory queue (pending +\nre-queued failures). When exceeded, the OLDEST events are dropped\nwith a warning log so the queue never grows unbounded against an\nunreachable target. 0 = use HooksConfig default, then\nDefaultHookBatchMaxQueueItems.",
+                    "type": "integer"
+                },
                 "enabled": {
                     "type": "boolean"
                 },
@@ -2731,7 +2755,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "max_retries": {
-                    "description": "MaxRetries is the number of delivery attempts before giving up.\n0 means use the server default (3).",
+                    "description": "MaxRetries is the number of delivery attempts before giving up.\n0 means use the server default (3). For HTTP hooks this caps retries\ninside a single batch flush; events that still fail are re-queued\nfor the next flush regardless of MaxRetries.",
                     "type": "integer"
                 },
                 "metadata": {

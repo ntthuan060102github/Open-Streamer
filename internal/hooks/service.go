@@ -1,18 +1,23 @@
 // Package hooks implements the Hook dispatcher.
 // It subscribes to the Event Bus and delivers events to registered external hooks
-// via HTTP webhook or local JSON-lines file — asynchronously and with retry logic.
+// via batched HTTP webhook OR per-event JSON-lines file — asynchronously.
+//
+// Per-protocol delivery shape:
+//
+//   - HTTP: events buffered into a per-hook batcher; flushed when the batch
+//     hits BatchMaxItems OR when the BatchFlushIntervalSec timer fires. Failed
+//     batches re-queue at the front for the next flush. The queue is bounded
+//     by BatchMaxQueueItems — older events drop on overflow.
+//
+//   - File: each event appended as a single JSON line. No batching — log
+//     shippers (Filebeat / Vector / Promtail) tail one line at a time.
 package hooks
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -34,17 +39,25 @@ var ErrHookTestUnsupported = errors.New("hooks: test delivery not supported for 
 
 // Service subscribes to the event bus and dispatches events to registered hooks.
 //
-// File hooks share a process-wide lock map keyed by the absolute target path
-// so concurrent deliveries against the same file serialise without
-// interleaving partial JSON lines. Different paths run in parallel.
+// HTTP hooks share an http.Client and route through per-hook batchers.
+// File hooks share a per-target write mutex map so concurrent deliveries to
+// the same path serialise without interleaving partial JSON lines.
 type Service struct {
 	cfg      config.HooksConfig
 	hookRepo store.HookRepository
 	bus      events.Bus
 	client   *http.Client
 
+	// HTTP batchers: lazy-created on first dispatch for an HTTP hook.
+	// Lifetime-tied to Start's ctx — every batcher is stopped + drained
+	// when ctx ends.
+	batchersMu sync.Mutex
+	batchers   map[domain.HookID]*httpBatcher
+	startCtx   context.Context // captured in Start so dispatch can pass it to batchers
+
+	// File hook serialisation: one mutex per absolute target path.
 	fileMu    sync.Mutex
-	fileLocks map[string]*sync.Mutex // absolute target path → write mutex
+	fileLocks map[string]*sync.Mutex
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -57,15 +70,25 @@ func New(i do.Injector) (*Service, error) {
 		cfg:      cfg,
 		hookRepo: hookRepo,
 		bus:      bus,
-		// No client-level timeout — each delivery applies its own per-hook timeout
-		// via context.WithTimeout in deliverHTTP.
+		// No client-level timeout — each delivery applies its own per-hook
+		// timeout via context.WithTimeout in postOnce / deliverFile.
 		client:    &http.Client{},
+		batchers:  make(map[domain.HookID]*httpBatcher),
 		fileLocks: make(map[string]*sync.Mutex),
 	}
 	return svc, nil
 }
 
-// DeliverTestEvent sends a single synthetic event to the hook using the same path as live delivery.
+// DeliverTestEvent sends a single synthetic event to the hook using the same
+// path as live delivery. For HTTP hooks the test event is enqueued into the
+// batcher and shipped on the next flush — typically within a second when
+// BatchFlushIntervalSec is 5 and the queue is otherwise empty (the test
+// event triggers a size-1 batch only if BatchMaxItems=1).
+//
+// To make tests visible quickly without forcing the operator to set
+// BatchMaxItems=1, we explicitly signal the batcher right after enqueuing.
+// The signal is a no-op when MaxItems hasn't been reached, so production
+// behaviour is unaffected.
 func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error {
 	h, err := s.hookRepo.FindByID(ctx, id)
 	if err != nil {
@@ -79,15 +102,24 @@ func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error 
 		Payload:    map[string]any{"test": true, "hook_id": string(h.ID)},
 	}
 	switch h.Type {
-	case domain.HookTypeHTTP, domain.HookTypeFile:
-		return s.deliver(ctx, h, ev)
+	case domain.HookTypeHTTP:
+		b := s.batcherFor(ctx, h)
+		b.enqueue(ev)
+		// Test path: don't make the operator wait a full flush interval.
+		// signal() forces an immediate dispatch attempt; if the receiver is
+		// reachable the test response shows up in seconds.
+		b.signal()
+		return nil
+	case domain.HookTypeFile:
+		return s.deliverFile(h, ev)
 	default:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	}
 }
 
 // Start subscribes to all domain events and begins dispatching.
-// It blocks until ctx is cancelled.
+// It blocks until ctx is cancelled, then drains and stops every active
+// HTTP batcher so buffered events get one final flush before exit.
 func (s *Service) Start(ctx context.Context) error {
 	allEvents := []domain.EventType{
 		domain.EventStreamCreated, domain.EventStreamStarted,
@@ -102,6 +134,8 @@ func (s *Service) Start(ctx context.Context) error {
 		domain.EventSessionOpened, domain.EventSessionClosed,
 	}
 
+	s.startCtx = ctx
+
 	unsubs := make([]func(), 0, len(allEvents))
 	for _, et := range allEvents {
 		unsub := s.bus.Subscribe(et, func(ctx context.Context, event domain.Event) error {
@@ -114,6 +148,19 @@ func (s *Service) Start(ctx context.Context) error {
 
 	for _, unsub := range unsubs {
 		unsub()
+	}
+
+	// Stop every HTTP batcher — each does a best-effort drain of pending
+	// events on its way out so a graceful shutdown loses minimal data.
+	s.batchersMu.Lock()
+	batchers := make([]*httpBatcher, 0, len(s.batchers))
+	for _, b := range s.batchers {
+		batchers = append(batchers, b)
+	}
+	s.batchers = make(map[domain.HookID]*httpBatcher)
+	s.batchersMu.Unlock()
+	for _, b := range batchers {
+		b.stop()
 	}
 	return nil
 }
@@ -132,16 +179,67 @@ func (s *Service) dispatch(ctx context.Context, event domain.Event) error {
 			continue
 		}
 
-		if err := s.deliverWithRetry(ctx, h, withMetadata(event, h.Metadata)); err != nil {
-			slog.Error("hooks: delivery failed",
-				"hook_id", h.ID,
-				"event_type", event.Type,
-				"stream_code", event.StreamCode,
-				"err", err,
-			)
+		ev := withMetadata(event, h.Metadata)
+		switch h.Type {
+		case domain.HookTypeHTTP:
+			s.batcherFor(ctx, h).enqueue(ev)
+		case domain.HookTypeFile:
+			if err := s.deliverFile(h, ev); err != nil {
+				slog.Error("hooks: file delivery failed",
+					"hook_id", h.ID,
+					"event_type", event.Type,
+					"stream_code", event.StreamCode,
+					"err", err,
+				)
+			}
+		default:
+			slog.Warn("hooks: unknown hook type", "hook_id", h.ID, "type", h.Type)
 		}
 	}
 	return nil
+}
+
+// batcherFor returns (and lazily creates) the HTTP batcher for one hook.
+//
+// The dispatch ctx parameter is intentionally unused for batcher lifetime
+// — batchers must outlive any single dispatch call so future deliveries
+// can land on them. We bind to s.startCtx (set in Start) so the batcher
+// dies on graceful shutdown rather than on the bus worker's per-event ctx
+// completing. The unused ctx argument keeps callers in the bus dispatch
+// path satisfied (contextcheck linter).
+//
+// Existing batchers keep their original config for their lifetime; hot-
+// reloading per-hook batch settings without a restart would require
+// deeper plumbing — out of scope for this revision.
+func (s *Service) batcherFor(_ context.Context, h *domain.Hook) *httpBatcher {
+	s.batchersMu.Lock()
+	defer s.batchersMu.Unlock()
+	b, ok := s.batchers[h.ID]
+	if ok {
+		return b
+	}
+	cfg := mergeBatchConfig(h, batchGlobalDefaults{
+		maxItems:         s.cfg.BatchMaxItems,
+		flushIntervalSec: s.cfg.BatchFlushIntervalSec,
+		maxQueueItems:    s.cfg.BatchMaxQueueItems,
+	})
+	bctx := s.startCtx
+	if bctx == nil {
+		bctx = context.Background()
+	}
+	// Batcher must be tied to the SERVICE lifetime (s.startCtx), NOT the
+	// per-event dispatch ctx — using the dispatch ctx here would kill the
+	// batcher as soon as the bus worker that happened to create it returns.
+	b = newHTTPBatcher(bctx, cfg, s.client) //nolint:contextcheck // service-lifetime ctx, see comment above
+	s.batchers[h.ID] = b
+	slog.Info("hooks: HTTP batcher started",
+		"hook_id", h.ID,
+		"target", h.Target,
+		"max_items", cfg.maxItems,
+		"flush_interval", cfg.flushInterval,
+		"max_queue", cfg.maxQueue,
+	)
+	return b
 }
 
 // withMetadata returns a shallow copy of event with hook metadata merged into the payload.
@@ -177,64 +275,17 @@ func (s *Service) matches(h *domain.Hook, event domain.Event) bool {
 	return h.StreamCodes.Matches(event.StreamCode)
 }
 
-func (s *Service) deliverWithRetry(ctx context.Context, h *domain.Hook, event domain.Event) error {
-	backoffs := []time.Duration{1 * time.Second, 5 * time.Second, 30 * time.Second}
-	maxRetries := h.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = domain.DefaultHookMaxRetries
-	}
-	if maxRetries > len(backoffs) {
-		maxRetries = len(backoffs)
-	}
-
-	var lastErr error
-	for attempt := range maxRetries + 1 {
-		lastErr = s.deliver(ctx, h, event)
-		if lastErr == nil {
-			return nil
-		}
-		if attempt < maxRetries {
-			slog.Warn("hooks: retrying delivery",
-				"hook_id", h.ID,
-				"attempt", attempt+1,
-				"err", lastErr,
-			)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoffs[attempt]):
-			}
-		}
-	}
-	return fmt.Errorf("hooks: all %d attempts failed: %w", maxRetries+1, lastErr)
-}
-
-func (s *Service) deliver(ctx context.Context, h *domain.Hook, event domain.Event) error {
-	switch h.Type {
-	case domain.HookTypeHTTP:
-		return s.deliverHTTP(ctx, h, event)
-	case domain.HookTypeFile:
-		return s.deliverFile(ctx, h, event)
-	default:
-		return fmt.Errorf("unknown hook type: %s", h.Type)
-	}
-}
-
 // deliverFile appends one JSON-encoded event followed by a newline to the
 // file at h.Target. Each call is atomic on POSIX filesystems thanks to
 // O_APPEND — concurrent deliveries from different processes interleave at
 // line boundaries. We additionally hold a per-target mutex so different
 // goroutines in THIS process don't race the open/write/close cycle.
 //
-// Failure modes the caller should know about:
-//   - parent dir missing: returned as-is; operator should pre-create the dir
-//   - target is a directory: returned as a clear error
-//   - permission denied: bubbled up unchanged
-//
-// We do NOT fsync per write — the file is meant for downstream tail+ship
-// (Filebeat, Vector). Crashing the server may lose the last 1-2 buffered
-// lines, which matches the "best effort, retry on failure" hook contract.
-func (s *Service) deliverFile(_ context.Context, h *domain.Hook, event domain.Event) error {
+// We do NOT batch file deliveries — log shippers (Filebeat, Vector, Promtail)
+// expect one event per line and tail-and-ship that way. Batching would
+// either need a custom delimiter (breaking the JSON-lines contract) or
+// chunked writes (defeating the per-line atomicity).
+func (s *Service) deliverFile(h *domain.Hook, event domain.Event) error {
 	target := strings.TrimSpace(h.Target)
 	if target == "" {
 		return errors.New("file delivery: empty target path")
@@ -266,9 +317,6 @@ func (s *Service) deliverFile(_ context.Context, h *domain.Hook, event domain.Ev
 }
 
 // lockForFile returns the per-target mutex, lazy-creating one on first use.
-// Mutexes are never deleted — paths are cheap to cache and operators rarely
-// rotate hook targets in volume. Bounded by the number of distinct file
-// hooks the operator has configured.
 func (s *Service) lockForFile(target string) *sync.Mutex {
 	s.fileMu.Lock()
 	defer s.fileMu.Unlock()
@@ -278,49 +326,4 @@ func (s *Service) lockForFile(target string) *sync.Mutex {
 		s.fileLocks[target] = mu
 	}
 	return mu
-}
-
-func (s *Service) deliverHTTP(ctx context.Context, h *domain.Hook, event domain.Event) error {
-	body, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
-	}
-
-	timeoutSec := h.TimeoutSec
-	if timeoutSec == 0 {
-		timeoutSec = domain.DefaultHookTimeoutSec
-	}
-	deliverCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(deliverCtx, http.MethodPost, h.Target, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	if h.Secret != "" {
-		mac := hmac.New(sha256.New, []byte(h.Secret))
-		mac.Write(body)
-		req.Header.Set("X-OpenStreamer-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
-	}
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("http post: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Read up to 512 bytes of the response so the user can see *why* the webhook
-		// target rejected — without this, "unexpected status: 500" gives no hint.
-		const maxBody = 512
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-		body := strings.TrimSpace(string(snippet))
-		if body == "" {
-			return fmt.Errorf("unexpected status: %d", resp.StatusCode)
-		}
-		return fmt.Errorf("unexpected status: %d body=%q", resp.StatusCode, body)
-	}
-	return nil
 }

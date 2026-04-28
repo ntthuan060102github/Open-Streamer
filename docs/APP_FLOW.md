@@ -876,13 +876,24 @@ explicitly to filter it out:
 
 ## 12. Hook delivery
 
-### HTTP hooks
+### HTTP hooks (batched)
 
 - Method: `POST`
-- Body: JSON event envelope
-- HMAC: `X-OpenStreamer-Signature: sha256=<hex>` when `secret` is set
-- Retries: up to `max_retries` (default 3) with backoff 1s / 5s / 30s
-- Timeout: per-hook `timeout_sec` (default 10)
+- Body: **JSON array** of event envelopes, e.g. `[{event1}, {event2}, …]`
+- Headers: `Content-Type: application/json`,
+  `X-OpenStreamer-Batch-Size: <N>`, optional
+  `X-OpenStreamer-Signature: sha256=<hex>` (HMAC over the entire array body
+  when `secret` is set)
+- Flush trigger: whichever comes first — buffer reached `BatchMaxItems` OR
+  `BatchFlushIntervalSec` elapsed since the last flush
+- Per-flush retries: up to `max_retries` (default 3) with backoff
+  1s / 5s / 30s. **All retries fail** → events re-queue at the FRONT of
+  the buffer for the next flush
+- Queue cap: `BatchMaxQueueItems` (default 10000). Overflow drops the
+  OLDEST events
+- Timeout: per-attempt `timeout_sec` (default 10)
+- On graceful shutdown: each batcher gets one final best-effort flush of
+  whatever is still queued
 
 ### File hooks
 

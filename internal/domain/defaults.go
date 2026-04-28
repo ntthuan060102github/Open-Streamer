@@ -49,11 +49,28 @@ const (
 	DefaultPushRetryTimeoutSec = 5
 
 	// DefaultHookMaxRetries is the per-hook retry budget when the user
-	// leaves Hook.MaxRetries=0.
+	// leaves Hook.MaxRetries=0. For HTTP hooks this caps retries WITHIN a
+	// single batch flush; events still re-queue across flushes regardless.
 	DefaultHookMaxRetries = 3
 	// DefaultHookTimeoutSec is the per-attempt delivery timeout when
 	// Hook.TimeoutSec=0.
 	DefaultHookTimeoutSec = 10
+	// DefaultHookBatchMaxItems is the cap on events per HTTP POST body
+	// when neither Hook.BatchMaxItems nor HooksConfig.BatchMaxItems is set.
+	// Picked to keep payloads under typical 1 MiB receiver caps (each event
+	// ~1-3 KiB after JSON encoding). File hooks ignore this — they always
+	// write one line per event.
+	DefaultHookBatchMaxItems = 100
+	// DefaultHookBatchFlushIntervalSec is the maximum time a batch waits
+	// before flushing even when below BatchMaxItems. Trade-off: lower =
+	// fresher delivery, more requests; higher = bigger batches, more lag
+	// for low-volume hooks.
+	DefaultHookBatchFlushIntervalSec = 5
+	// DefaultHookBatchMaxQueueItems caps the per-hook in-memory queue.
+	// Events that fail delivery are re-queued for the next flush; if the
+	// downstream stays unreachable, the queue eventually overflows and the
+	// OLDEST events are dropped (with a warn log) to bound memory.
+	DefaultHookBatchMaxQueueItems = 10000
 
 	// DefaultVideoBitrateK is the fallback target video bitrate (kbps)
 	// when a profile leaves Bitrate=0.

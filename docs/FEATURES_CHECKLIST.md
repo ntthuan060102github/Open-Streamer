@@ -201,14 +201,17 @@ Legend:
 
 | Feature | Status | Notes |
 |---|---|---|
-| In-process event bus | Complete | Typed events, bounded queue (512), worker pool |
-| HTTP webhook delivery | Complete | Retries, timeout, optional HMAC `X-OpenStreamer-Signature` |
-| File delivery | Complete | Appends one JSON line per event to an absolute target path; per-target mutex serialises concurrent writes; line-atomic at filesystem level via O_APPEND |
+| In-process event bus | Complete | Typed events, bounded queue (512), worker pool sized via `hooks.worker_count` (default 4; rarely needs tuning after batching) |
+| HTTP webhook delivery (batched) | Complete | Per-hook batcher; flushes on `BatchMaxItems` OR `BatchFlushIntervalSec`; POST body is a JSON array; `X-OpenStreamer-Batch-Size` header reports cardinality; HMAC `X-OpenStreamer-Signature` covers the array body |
+| HTTP retry + re-queue on failure | Complete | Up to `max_retries` retries within a flush (1s/5s/30s backoff); failed batches re-queue at the front for next flush; queue capped by `BatchMaxQueueItems` (drops oldest on overflow) |
+| File delivery | Complete | Appends one JSON line per event to an absolute target path; per-target mutex serialises concurrent writes; line-atomic at filesystem level via O_APPEND. **Not batched** to keep the JSON-lines contract intact |
 | Per-hook event filter | Complete | `event_types[]` whitelist |
 | Per-hook stream filter | Complete | `stream_codes.only[]` / `.except[]` |
 | Per-hook metadata injection | Complete | Merged into payload as `metadata.*` |
 | Per-hook MaxRetries / TimeoutSec | Complete | Defaults: 3 retries, 10s timeout (from `domain.Default*`) |
-| Test endpoint (HTTP + File) | Complete | `POST /hooks/{id}/test` |
+| Per-hook batch overrides | Complete | `batch_max_items` / `batch_flush_interval_sec` / `batch_max_queue_items` on Hook record override `hooks.batch_*` global defaults |
+| Graceful drain on shutdown | Complete | Service.Start exits → each HTTP batcher gets a final best-effort flush before goroutine returns |
+| Test endpoint (HTTP + File) | Complete | `POST /hooks/{id}/test` — for HTTP, signals an immediate flush so the test response is visible in seconds rather than waiting a full flush interval |
 | Event documentation | Complete | See [APP_FLOW.md](./APP_FLOW.md#events-reference) |
 
 ---

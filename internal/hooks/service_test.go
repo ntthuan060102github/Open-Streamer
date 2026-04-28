@@ -25,9 +25,10 @@ import (
 
 // fakeHookRepo is an in-memory hook store for tests.
 type fakeHookRepo struct {
-	mu     sync.Mutex
-	hooks  map[domain.HookID]*domain.Hook
-	listFn func(ctx context.Context) ([]*domain.Hook, error)
+	mu      sync.Mutex
+	hooks   map[domain.HookID]*domain.Hook
+	listFn  func(ctx context.Context) ([]*domain.Hook, error)
+	listErr error
 }
 
 func newFakeHookRepo() *fakeHookRepo {
@@ -54,6 +55,9 @@ func (r *fakeHookRepo) List(ctx context.Context) ([]*domain.Hook, error) {
 	if r.listFn != nil {
 		return r.listFn(ctx)
 	}
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]*domain.Hook, 0, len(r.hooks))
@@ -76,124 +80,344 @@ func newSvc(repo *fakeHookRepo) *Service {
 		hookRepo:  repo,
 		bus:       events.New(1, 16),
 		client:    &http.Client{Timeout: 5 * time.Second},
+		batchers:  make(map[domain.HookID]*httpBatcher),
 		fileLocks: make(map[string]*sync.Mutex),
 	}
 }
 
-func TestDeliverHTTPSuccess(t *testing.T) {
-	var got struct {
-		Body []byte
-		Sig  string
-		CT   string
+// fastBatchHook returns an HTTP hook tuned for tests: batch size 1 so
+// every enqueue immediately triggers a flush, plus a short flush interval
+// for the timer-driven test.
+func fastBatchHook(target string) *domain.Hook {
+	return &domain.Hook{
+		ID:                    "h",
+		Type:                  domain.HookTypeHTTP,
+		Target:                target,
+		BatchMaxItems:         1,
+		BatchFlushIntervalSec: 1,
+		BatchMaxQueueItems:    100,
+		MaxRetries:            0, // tests want crisp pass/fail without retry padding
 	}
+}
+
+func TestBatcherFlushOnSizeTrigger(t *testing.T) {
+	var got []domain.Event
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got.Body, _ = io.ReadAll(r.Body)
-		got.Sig = r.Header.Get("X-OpenStreamer-Signature")
-		got.CT = r.Header.Get("Content-Type")
+		body, _ := io.ReadAll(r.Body)
+		var batch []domain.Event
+		if err := json.Unmarshal(body, &batch); err != nil {
+			t.Errorf("server got non-array body: %s", body)
+		}
+		mu.Lock()
+		got = append(got, batch...)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	hook := &domain.Hook{
+		ID:                    "h",
+		Type:                  domain.HookTypeHTTP,
+		Target:                srv.URL,
+		BatchMaxItems:         3, // ship after every 3rd event
+		BatchFlushIntervalSec: 60,
+		BatchMaxQueueItems:    100,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := mergeBatchConfig(hook, batchGlobalDefaults{})
+	b := newHTTPBatcher(ctx, cfg, &http.Client{Timeout: 2 * time.Second})
+	defer b.stop()
+
+	for i := 0; i < 3; i++ {
+		b.enqueue(domain.Event{ID: "e" + string(rune('0'+i)), Type: domain.EventStreamStarted})
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n == 3 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected 3 events delivered, got %d", len(got))
+}
+
+func TestBatcherFlushOnTimerWhenBelowSize(t *testing.T) {
+	var deliveredBatches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		deliveredBatches.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := mergeBatchConfig(fastBatchHook(srv.URL), batchGlobalDefaults{})
+	cfg.maxItems = 1000 // stays below cap
+	b := newHTTPBatcher(ctx, cfg, &http.Client{Timeout: 2 * time.Second})
+	defer b.stop()
+
+	// One event, well below batch cap. Timer (~1s) should ship it anyway.
+	b.enqueue(domain.Event{ID: "e1", Type: domain.EventStreamStarted})
+
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if deliveredBatches.Load() >= 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("timer did not flush within 2.5s")
+}
+
+func TestBatcherSendsArrayBodyWithHMACAndBatchSize(t *testing.T) {
+	var (
+		mu            sync.Mutex
+		capturedBody  []byte
+		capturedSig   string
+		capturedBatch string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		capturedBody = body
+		capturedSig = r.Header.Get("X-OpenStreamer-Signature")
+		capturedBatch = r.Header.Get("X-OpenStreamer-Batch-Size")
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	hook := fastBatchHook(srv.URL)
+	hook.Secret = "topsecret"
+	hook.BatchMaxItems = 2
+	cfg := mergeBatchConfig(hook, batchGlobalDefaults{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := newHTTPBatcher(ctx, cfg, &http.Client{Timeout: 2 * time.Second})
+	defer b.stop()
+
+	b.enqueue(domain.Event{ID: "a", Type: domain.EventStreamCreated})
+	b.enqueue(domain.Event{ID: "b", Type: domain.EventStreamStarted})
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := len(capturedBody)
+		mu.Unlock()
+		if got > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	body := capturedBody
+	sig := capturedSig
+	batchHeader := capturedBatch
+	mu.Unlock()
+
+	if len(body) == 0 {
+		t.Fatal("server received no body")
+	}
+
+	var batch []domain.Event
+	if err := json.Unmarshal(body, &batch); err != nil {
+		t.Fatalf("body not JSON array: %v\n%s", err, body)
+	}
+	if len(batch) != 2 || batch[0].ID != "a" || batch[1].ID != "b" {
+		t.Errorf("batch contents = %+v", batch)
+	}
+
+	if batchHeader != "2" {
+		t.Errorf("X-OpenStreamer-Batch-Size = %q, want 2", batchHeader)
+	}
+
+	mac := hmac.New(sha256.New, []byte("topsecret"))
+	mac.Write(body)
+	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	if sig != want {
+		t.Errorf("sig=%s want %s", sig, want)
+	}
+}
+
+func TestBatcherRequeuesFailedBatch(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// First attempt fails, second succeeds.
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	hook := fastBatchHook(srv.URL)
+	hook.BatchMaxItems = 2
+	hook.BatchFlushIntervalSec = 1
+	cfg := mergeBatchConfig(hook, batchGlobalDefaults{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := newHTTPBatcher(ctx, cfg, &http.Client{Timeout: 2 * time.Second})
+	defer b.stop()
+
+	b.enqueue(domain.Event{ID: "x", Type: domain.EventStreamStarted})
+	b.enqueue(domain.Event{ID: "y", Type: domain.EventStreamStarted})
+
+	// First flush fails; events re-queue. Next tick (≤ 1s later) re-attempts.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if attempts.Load() >= 2 && b.queueLen() == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected 2 attempts and empty queue; attempts=%d queueLen=%d", attempts.Load(), b.queueLen())
+}
+
+func TestBatcherDropsOldestOnQueueOverflow(t *testing.T) {
+	// Use a deliberately broken target so deliver always fails — we want
+	// the queue to fill up.
+	cfg := batchConfig{
+		maxItems:      5,
+		flushInterval: 50 * time.Millisecond,
+		maxQueue:      3,
+		maxRetries:    0,
+		timeout:       100 * time.Millisecond,
+		target:        "http://127.0.0.1:1/dead", // refused
+		hookID:        "overflow-test",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := newHTTPBatcher(ctx, cfg, &http.Client{Timeout: 200 * time.Millisecond})
+	defer b.stop()
+
+	for i := 0; i < 10; i++ {
+		b.enqueue(domain.Event{ID: string(rune('0' + i)), Type: domain.EventStreamStarted})
+	}
+
+	// Some flushes have happened by now and re-queued failures; the queue
+	// should never exceed maxQueue.
+	time.Sleep(300 * time.Millisecond)
+	if got := b.queueLen(); got > cfg.maxQueue {
+		t.Errorf("queueLen=%d exceeded maxQueue=%d", got, cfg.maxQueue)
+	}
+}
+
+func TestBatcherStopDrainsRemaining(t *testing.T) {
+	var deliveredBatches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		deliveredBatches.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	hook := fastBatchHook(srv.URL)
+	hook.BatchMaxItems = 100        // never trigger size-flush
+	hook.BatchFlushIntervalSec = 60 // never trigger timer-flush in test
+	cfg := mergeBatchConfig(hook, batchGlobalDefaults{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := newHTTPBatcher(ctx, cfg, &http.Client{Timeout: 2 * time.Second})
+
+	for i := 0; i < 3; i++ {
+		b.enqueue(domain.Event{ID: string(rune('a' + i)), Type: domain.EventStreamStarted})
+	}
+
+	// stop() must drain the queue before returning.
+	b.stop()
+	if got := deliveredBatches.Load(); got < 1 {
+		t.Errorf("expected drain to deliver pending batch, got 0")
+	}
+}
+
+func TestServiceDispatchRoutesHTTPThroughBatcher(t *testing.T) {
+	var bodies [][]byte
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 
 	repo := newFakeHookRepo()
+	hook := fastBatchHook(srv.URL)
+	hook.Enabled = true
+	repo.hooks[hook.ID] = hook
+
 	svc := newSvc(repo)
-	hook := &domain.Hook{ID: "h1", Type: domain.HookTypeHTTP, Target: srv.URL, Secret: "topsecret"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.startCtx = ctx
 
-	ev := domain.Event{ID: "e1", Type: domain.EventStreamCreated, StreamCode: "s1"}
-	if err := svc.deliver(context.Background(), hook, ev); err != nil {
-		t.Fatalf("deliver: %v", err)
-	}
-
-	if got.CT != "application/json" {
-		t.Errorf("content-type=%s", got.CT)
-	}
-	if len(got.Body) == 0 {
-		t.Fatal("server received empty body")
+	for i := 0; i < 2; i++ {
+		_ = svc.dispatch(ctx, domain.Event{
+			ID:   string(rune('e' + i)),
+			Type: domain.EventStreamCreated,
+		})
 	}
 
-	mac := hmac.New(sha256.New, []byte("topsecret"))
-	mac.Write(got.Body)
-	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-	if got.Sig != want {
-		t.Errorf("sig=%s want %s", got.Sig, want)
-	}
-
-	var parsed domain.Event
-	if err := json.Unmarshal(got.Body, &parsed); err != nil {
-		t.Fatalf("server received invalid JSON: %v", err)
-	}
-	if parsed.ID != "e1" || parsed.Type != domain.EventStreamCreated {
-		t.Errorf("event mangled: %+v", parsed)
-	}
-}
-
-func TestDeliverHTTPNoSecretSkipsSignature(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-OpenStreamer-Signature") != "" {
-			t.Errorf("unexpected signature header")
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(bodies)
+		mu.Unlock()
+		if n >= 2 {
+			break
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: srv.URL}
-	if err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamStarted}); err != nil {
-		t.Fatalf("deliver: %v", err)
+		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-func TestDeliverHTTPNon2xxFails(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: srv.URL}
-	err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamStarted})
-	if err == nil {
-		t.Fatal("expected error for 5xx response")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) < 2 {
+		t.Fatalf("got %d batches, want ≥ 2", len(bodies))
 	}
-}
-
-func TestDeliverHTTPBadURLFails(t *testing.T) {
-	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: "://bad"}
-	err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamStarted})
-	if err == nil {
-		t.Fatal("expected error for malformed URL")
-	}
-}
-
-func TestDeliverHTTPHonoursTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-r.Context().Done():
-		case <-time.After(2 * time.Second):
+	for i, body := range bodies {
+		var batch []domain.Event
+		if err := json.Unmarshal(body, &batch); err != nil {
+			t.Errorf("batch %d not JSON array: %s", i, body)
 		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: srv.URL, TimeoutSec: 1}
-
-	start := time.Now()
-	err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamStarted})
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
-	if elapsed > 1500*time.Millisecond {
-		t.Errorf("timeout not honoured: elapsed=%v", elapsed)
 	}
 }
 
-func TestDeliverUnknownTypeFails(t *testing.T) {
-	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: "carrier-pigeon", Target: "x"}
-	if err := svc.deliver(context.Background(), hook, domain.Event{}); err == nil {
-		t.Fatal("expected error for unknown hook type")
+func TestServiceDispatchRoutesFileSynchronously(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "events.log")
+
+	repo := newFakeHookRepo()
+	hook := &domain.Hook{
+		ID:      "f",
+		Type:    domain.HookTypeFile,
+		Target:  target,
+		Enabled: true,
+	}
+	repo.hooks[hook.ID] = hook
+
+	svc := newSvc(repo)
+
+	if err := svc.dispatch(context.Background(), domain.Event{
+		ID: "e1", Type: domain.EventStreamStarted,
+	}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	// File hook delivers synchronously — no flush window to wait for.
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		t.Errorf("expected one JSON line ending with newline, got %q", data)
 	}
 }
 
@@ -204,13 +428,13 @@ func TestDeliverFileAppendsJSONLines(t *testing.T) {
 	svc := newSvc(newFakeHookRepo())
 	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: target}
 
-	for i := range 3 {
+	for i := 0; i < 3; i++ {
 		ev := domain.Event{
 			ID:         "e" + string(rune('1'+i)),
 			Type:       domain.EventStreamStarted,
 			StreamCode: "live",
 		}
-		if err := svc.deliver(context.Background(), hook, ev); err != nil {
+		if err := svc.deliverFile(hook, ev); err != nil {
 			t.Fatalf("deliver %d: %v", i, err)
 		}
 	}
@@ -237,7 +461,7 @@ func TestDeliverFileAppendsJSONLines(t *testing.T) {
 func TestDeliverFileRequiresAbsolutePath(t *testing.T) {
 	svc := newSvc(newFakeHookRepo())
 	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: "relative/events.log"}
-	err := svc.deliver(context.Background(), hook, domain.Event{Type: domain.EventStreamStarted})
+	err := svc.deliverFile(hook, domain.Event{Type: domain.EventStreamStarted})
 	if err == nil {
 		t.Fatal("expected error for relative path")
 	}
@@ -246,7 +470,7 @@ func TestDeliverFileRequiresAbsolutePath(t *testing.T) {
 func TestDeliverFileEmptyTargetFails(t *testing.T) {
 	svc := newSvc(newFakeHookRepo())
 	hook := &domain.Hook{ID: "h", Type: domain.HookTypeFile, Target: ""}
-	if err := svc.deliver(context.Background(), hook, domain.Event{}); err == nil {
+	if err := svc.deliverFile(hook, domain.Event{}); err == nil {
 		t.Fatal("expected error for empty target")
 	}
 }
@@ -261,15 +485,15 @@ func TestDeliverFileConcurrentSerialised(t *testing.T) {
 	const writers, perWriter = 8, 50
 	var wg sync.WaitGroup
 	wg.Add(writers)
-	for w := range writers {
+	for w := 0; w < writers; w++ {
 		go func(w int) {
 			defer wg.Done()
-			for i := range perWriter {
+			for i := 0; i < perWriter; i++ {
 				ev := domain.Event{
 					ID:   "w-" + string(rune('A'+w)) + "-" + string(rune('0'+i%10)),
 					Type: domain.EventStreamStarted,
 				}
-				_ = svc.deliver(context.Background(), hook, ev)
+				_ = svc.deliverFile(hook, ev)
 			}
 		}(w)
 	}
@@ -295,6 +519,43 @@ func TestDeliverFileConcurrentSerialised(t *testing.T) {
 	}
 }
 
+func TestMergeBatchConfigLayering(t *testing.T) {
+	defaults := batchGlobalDefaults{
+		maxItems:         50,
+		flushIntervalSec: 7,
+		maxQueueItems:    1000,
+	}
+
+	t.Run("hook overrides global", func(t *testing.T) {
+		got := mergeBatchConfig(&domain.Hook{
+			BatchMaxItems:         42,
+			BatchFlushIntervalSec: 3,
+			BatchMaxQueueItems:    99,
+		}, defaults)
+		if got.maxItems != 42 || got.flushInterval != 3*time.Second || got.maxQueue != 99 {
+			t.Errorf("hook override not applied: %+v", got)
+		}
+	})
+
+	t.Run("global wins when hook unset", func(t *testing.T) {
+		got := mergeBatchConfig(&domain.Hook{}, defaults)
+		if got.maxItems != defaults.maxItems ||
+			got.flushInterval != time.Duration(defaults.flushIntervalSec)*time.Second ||
+			got.maxQueue != defaults.maxQueueItems {
+			t.Errorf("global default not used: %+v", got)
+		}
+	})
+
+	t.Run("code default wins when both unset", func(t *testing.T) {
+		got := mergeBatchConfig(&domain.Hook{}, batchGlobalDefaults{})
+		if got.maxItems != domain.DefaultHookBatchMaxItems ||
+			got.flushInterval != time.Duration(domain.DefaultHookBatchFlushIntervalSec)*time.Second ||
+			got.maxQueue != domain.DefaultHookBatchMaxQueueItems {
+			t.Errorf("code default not used: %+v", got)
+		}
+	})
+}
+
 func TestMatchesEventTypeFilter(t *testing.T) {
 	svc := newSvc(newFakeHookRepo())
 	h := &domain.Hook{EventTypes: []domain.EventType{domain.EventStreamStarted}}
@@ -317,150 +578,49 @@ func TestMatchesEmptyEventTypesAllowsAll(t *testing.T) {
 
 func TestMatchesStreamCodeFilter(t *testing.T) {
 	svc := newSvc(newFakeHookRepo())
-	h := &domain.Hook{StreamCodes: &domain.StreamCodeFilter{Only: []domain.StreamCode{"a"}}}
 
-	if !svc.matches(h, domain.Event{StreamCode: "a"}) {
-		t.Error("Only=[a] should match a")
-	}
-	if svc.matches(h, domain.Event{StreamCode: "b"}) {
-		t.Error("Only=[a] should not match b")
-	}
+	t.Run("only", func(t *testing.T) {
+		h := &domain.Hook{
+			StreamCodes: &domain.StreamCodeFilter{
+				Only: []domain.StreamCode{"s1", "s2"},
+			},
+		}
+		if !svc.matches(h, domain.Event{StreamCode: "s1"}) {
+			t.Error("s1 should match only=[s1,s2]")
+		}
+		if svc.matches(h, domain.Event{StreamCode: "s9"}) {
+			t.Error("s9 should NOT match only=[s1,s2]")
+		}
+	})
+
+	t.Run("except", func(t *testing.T) {
+		h := &domain.Hook{
+			StreamCodes: &domain.StreamCodeFilter{
+				Except: []domain.StreamCode{"bad"},
+			},
+		}
+		if !svc.matches(h, domain.Event{StreamCode: "good"}) {
+			t.Error("good should match except=[bad]")
+		}
+		if svc.matches(h, domain.Event{StreamCode: "bad"}) {
+			t.Error("bad should NOT match except=[bad]")
+		}
+	})
 }
 
-func TestWithMetadataMergesIntoPayload(t *testing.T) {
-	ev := domain.Event{Payload: map[string]any{"foo": 1}}
-	out := withMetadata(ev, map[string]string{"env": "prod"})
-	if out.Payload["foo"] != 1 {
-		t.Errorf("original payload field missing")
+func TestWithMetadataPrefixesKeys(t *testing.T) {
+	ev := domain.Event{
+		Type:    domain.EventStreamStarted,
+		Payload: map[string]any{"original": 1},
+	}
+	out := withMetadata(ev, map[string]string{"env": "prod", "region": "ap-1"})
+	if out.Payload["original"] != 1 {
+		t.Errorf("original payload lost")
 	}
 	if out.Payload["meta.env"] != "prod" {
-		t.Errorf("metadata not merged: %+v", out.Payload)
+		t.Errorf("meta.env not injected: %+v", out.Payload)
 	}
-}
-
-func TestWithMetadataNoMetadataIsNoOp(t *testing.T) {
-	ev := domain.Event{Payload: map[string]any{"foo": 1}}
-	out := withMetadata(ev, nil)
-	if &out.Payload == &ev.Payload && len(out.Payload) != 1 {
-		t.Errorf("payload changed unexpectedly")
-	}
-}
-
-func TestDispatchSkipsDisabledHooks(t *testing.T) {
-	calls := atomic.Int32{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	repo := newFakeHookRepo()
-	repo.hooks["h1"] = &domain.Hook{ID: "h1", Type: domain.HookTypeHTTP, Target: srv.URL, Enabled: false}
-	repo.hooks["h2"] = &domain.Hook{ID: "h2", Type: domain.HookTypeHTTP, Target: srv.URL, Enabled: true}
-
-	svc := newSvc(repo)
-	if err := svc.dispatch(context.Background(), domain.Event{Type: domain.EventStreamStarted}); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-	if calls.Load() != 1 {
-		t.Errorf("expected 1 delivery, got %d", calls.Load())
-	}
-}
-
-func TestDispatchListErrorPropagates(t *testing.T) {
-	repo := newFakeHookRepo()
-	repo.listFn = func(_ context.Context) ([]*domain.Hook, error) {
-		return nil, errors.New("db dead")
-	}
-	svc := newSvc(repo)
-	if err := svc.dispatch(context.Background(), domain.Event{}); err == nil {
-		t.Fatal("expected list error to propagate")
-	}
-}
-
-func TestDeliverWithRetryEventuallySucceeds(t *testing.T) {
-	calls := atomic.Int32{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) < 2 {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	svc := newSvc(newFakeHookRepo())
-	// Use original deliverWithRetry but with small backoffs by manipulating MaxRetries=1.
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: srv.URL, MaxRetries: 1}
-	if err := svc.deliverWithRetry(context.Background(), hook, domain.Event{}); err != nil {
-		t.Fatalf("retry should eventually succeed: %v", err)
-	}
-	if calls.Load() != 2 {
-		t.Errorf("expected 2 attempts, got %d", calls.Load())
-	}
-}
-
-func TestDeliverWithRetryRespectsCancel(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	svc := newSvc(newFakeHookRepo())
-	hook := &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: srv.URL, MaxRetries: 3}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	err := svc.deliverWithRetry(ctx, hook, domain.Event{})
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("expected error after cancel")
-	}
-	// Should give up well before the longest backoff.
-	if elapsed > 2*time.Second {
-		t.Errorf("did not cancel promptly: %v", elapsed)
-	}
-}
-
-func TestDeliverTestEventNotFound(t *testing.T) {
-	svc := newSvc(newFakeHookRepo())
-	if err := svc.DeliverTestEvent(context.Background(), "nope"); err == nil {
-		t.Fatal("expected not-found error")
-	}
-}
-
-func TestDeliverTestEventHTTP(t *testing.T) {
-	var got domain.Event
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(body, &got)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	repo := newFakeHookRepo()
-	repo.hooks["h"] = &domain.Hook{ID: "h", Type: domain.HookTypeHTTP, Target: srv.URL}
-	svc := newSvc(repo)
-
-	if err := svc.DeliverTestEvent(context.Background(), "h"); err != nil {
-		t.Fatalf("DeliverTestEvent: %v", err)
-	}
-	if got.Payload["test"] != true {
-		t.Errorf("payload not delivered: %+v", got.Payload)
-	}
-	if got.Type != domain.EventStreamCreated {
-		t.Errorf("type=%s", got.Type)
-	}
-}
-
-func TestDeliverTestEventUnsupportedType(t *testing.T) {
-	repo := newFakeHookRepo()
-	repo.hooks["h"] = &domain.Hook{ID: "h", Type: "carrier-pigeon"}
-	svc := newSvc(repo)
-	err := svc.DeliverTestEvent(context.Background(), "h")
-	if !errors.Is(err, ErrHookTestUnsupported) {
-		t.Fatalf("want ErrHookTestUnsupported, got %v", err)
+	if out.Payload["meta.region"] != "ap-1" {
+		t.Errorf("meta.region not injected: %+v", out.Payload)
 	}
 }

@@ -285,7 +285,8 @@ curl -XDELETE http://localhost:8080/api/v1/streams/news
 Subscribe to lifecycle events with one of two delivery backends:
 
 ```bash
-# HTTP webhook with HMAC signing.
+# HTTP webhook — events ship as a JSON ARRAY (batched). HMAC signing
+# covers the entire array body when `secret` is set.
 curl -XPOST http://localhost:8080/api/v1/hooks -d '{
   "id":        "log-everything",
   "type":      "http",
@@ -293,11 +294,17 @@ curl -XPOST http://localhost:8080/api/v1/hooks -d '{
   "secret":    "shared-secret-for-hmac",
   "enabled":   true,
   "max_retries": 5,
-  "timeout_sec": 10
+  "timeout_sec": 10,
+
+  // HTTP batching knobs — leave 0 to use server-wide defaults.
+  "batch_max_items":          50,    // ship after every 50 events
+  "batch_flush_interval_sec": 2,     // ... or every 2 seconds, whichever first
+  "batch_max_queue_items":    20000  // memory cap if target goes down
 }'
 
-# File sink — appends one JSON event per line. Pair with Filebeat / Vector /
-# Promtail / your favourite tail-and-ship agent for downstream pipelines.
+# File sink — appends one JSON event per line. NOT batched (one event per
+# write) so log shippers (Filebeat / Vector / Promtail) tail-and-ship one
+# line at a time.
 curl -XPOST http://localhost:8080/api/v1/hooks -d '{
   "id":      "audit-log",
   "type":    "file",
@@ -307,12 +314,30 @@ curl -XPOST http://localhost:8080/api/v1/hooks -d '{
 }'
 ```
 
+### HTTP batching semantics
+
+- Each event is enqueued to a per-hook in-memory buffer (~µs latency).
+- A flusher goroutine ships the buffer when EITHER `batch_max_items` is
+  reached OR `batch_flush_interval_sec` elapses since the last flush.
+- POST body is a JSON array (`[{event1},{event2},…]`). The
+  `X-OpenStreamer-Batch-Size` header reports the array length so receivers
+  can tune ingestion.
+- `max_retries` retries within a single flush attempt (with 1s/5s/30s
+  backoff). If all retries fail, events re-queue at the FRONT of the
+  buffer for the next flush — chronological order preserved.
+- `batch_max_queue_items` caps the buffer when the downstream is
+  unreachable. Overflow drops the OLDEST events with a warning log.
+- On graceful server shutdown (SIGTERM), every batcher gets one last
+  best-effort flush.
+
+### File backend behaviour
+
 The file backend creates the target on first delivery (mode 0644). The
 parent directory must already exist and be writable by the open-streamer
-process. Concurrent deliveries on the same path are serialised by a
+process. Concurrent deliveries on the same path serialise via a
 per-target mutex; different paths run in parallel. Each line is one
-complete JSON event followed by `\n` — the same envelope the HTTP backend
-posts.
+complete JSON event followed by `\n` — the same envelope the HTTP
+backend wraps in an array.
 
 Filter by event type or stream code:
 

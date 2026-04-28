@@ -168,20 +168,35 @@ Toggling this hot-restarts every running stream's transcoder (~2-3s downtime per
 
 ```yaml
 hooks:
-  worker_count:  4    # Concurrent delivery goroutines.
+  worker_count:               4     # Default 4. events.Bus worker pool size.
+  batch_max_items:            100   # Default. HTTP hook batch size cap.
+  batch_flush_interval_sec:   5     # Default. HTTP hook flush timer.
+  batch_max_queue_items:      10000 # Default. Per-hook in-memory queue cap.
 ```
 
-`worker_count` validation: must be > 0 if hooks section is set.
+**`worker_count`** sizes the events.Bus worker pool that fans events out
+to subscribers. With batched HTTP hook delivery (see below), the hook
+handler just enqueues into a per-hook batcher (~µs) so this number rarely
+needs tuning — 1-4 covers nearly every workload. Keep at default unless
+you have a specific bottleneck. Operators may set 0 to fall back to 4.
 
-Per-hook `type` / `target` / `max_retries` (default 3) / `timeout_sec`
-(default 10) live on each Hook record, not GlobalConfig. Two delivery
-backends are supported:
+**`batch_max_items` / `batch_flush_interval_sec` / `batch_max_queue_items`**
+are GLOBAL DEFAULTS for HTTP hooks; each Hook record can override via its
+own fields with the same names. Resolution order:
+hook value → global → code default.
 
-- **HTTP** webhook (`type: http`, `target: https://…`) with optional HMAC
-  signing.
+Per-hook `type` / `target` / `secret` / `max_retries` / `timeout_sec` live
+on each Hook record. Two delivery backends are supported:
+
+- **HTTP** webhook (`type: http`, `target: https://…`) — events accumulate
+  in a per-hook batcher and ship as a JSON array on `BatchMaxItems` or
+  `BatchFlushIntervalSec`, whichever comes first. Optional HMAC signing.
+  Failed batches re-queue to the front for the next flush; the queue is
+  bounded by `BatchMaxQueueItems` (oldest events dropped on overflow).
 - **File** sink (`type: file`, `target: /var/log/open-streamer/events.log`)
   appends one JSON event per line — drop-in for Filebeat / Vector / Promtail
-  tail-and-ship pipelines, or just an audit log.
+  tail-and-ship pipelines. **Never batched** to keep the JSON-lines
+  contract intact.
 
 ### 2.9 sessions
 
@@ -473,6 +488,11 @@ metadata:                           # merged into every payload as `metadata.*`
 enabled:      true
 max_retries:  3                     # Per-attempt retry budget. 0 = use default (3).
 timeout_sec:  10                    # Per-attempt deadline. 0 = use default (10).
+
+# HTTP-only batching knobs (override global hooks.batch_*).
+batch_max_items:           100      # 0 = use global / code default.
+batch_flush_interval_sec:  5        # 0 = use global / code default.
+batch_max_queue_items:     10000    # 0 = use global / code default.
 ```
 
 For event payload schemas see [APP_FLOW.md § Events reference](./APP_FLOW.md#events-reference).
@@ -520,6 +540,10 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 | `push.limit` | — | **0 = unlimited retries** |
 | `hook.max_retries` | 3 | 0 = use default |
 | `hook.timeout_sec` | 10 | 0 = use default |
+| `hooks.worker_count` | 4 | 0 = 4 |
+| `hooks.batch_max_items` (HTTP) | 100 | 0 = 100 |
+| `hooks.batch_flush_interval_sec` (HTTP) | 5 | 0 = 5 |
+| `hooks.batch_max_queue_items` (HTTP) | 10000 | 0 = 10000 |
 | `sessions.idle_timeout_sec` | 30 | 0 = use default |
 | `sessions.max_lifetime_sec` | — | **0 = no cap** |
 | `watermarks.dir` | `./watermarks` | empty = `./watermarks` |

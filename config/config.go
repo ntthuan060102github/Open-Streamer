@@ -214,12 +214,31 @@ type SessionsConfig struct {
 	GeoIPDBPath string `mapstructure:"geoip_db_path" json:"geoip_db_path,omitempty" yaml:"geoip_db_path,omitempty"`
 }
 
-// HooksConfig controls the hook dispatcher worker pool.
-// Per-hook settings (max retries, timeout, secret, target, event filter) are
-// configured on each Hook via the API.
+// HooksConfig controls server-wide hook dispatcher defaults. Per-hook
+// settings (target, retries, timeout, secret, batch sizing, event filter)
+// are configured on each Hook via the API.
 type HooksConfig struct {
-	// WorkerCount is the number of concurrent hook delivery goroutines.
+	// WorkerCount sizes the events.Bus worker pool that fans events out
+	// to subscribers. Each worker invokes the registered handler for an
+	// incoming event; with the batched HTTP delivery, the hook handler
+	// just enqueues into a per-hook batcher (~µs) so this number rarely
+	// needs tuning. 1-4 covers nearly every workload. 0 = use 4.
 	WorkerCount int `mapstructure:"worker_count" json:"worker_count" yaml:"worker_count"`
+
+	// BatchMaxItems is the global default for HTTP hook batch size.
+	// Per-hook BatchMaxItems overrides this; the code default
+	// (DefaultHookBatchMaxItems) wins only when both are 0.
+	BatchMaxItems int `mapstructure:"batch_max_items" json:"batch_max_items,omitempty" yaml:"batch_max_items,omitempty"`
+
+	// BatchFlushIntervalSec is the global default for the per-hook flush
+	// timer in seconds. Per-hook overrides win; code default is
+	// DefaultHookBatchFlushIntervalSec.
+	BatchFlushIntervalSec int `mapstructure:"batch_flush_interval_sec" json:"batch_flush_interval_sec,omitempty" yaml:"batch_flush_interval_sec,omitempty"`
+
+	// BatchMaxQueueItems is the global default for the per-hook in-memory
+	// queue cap. Per-hook overrides win; code default is
+	// DefaultHookBatchMaxQueueItems.
+	BatchMaxQueueItems int `mapstructure:"batch_max_queue_items" json:"batch_max_queue_items,omitempty" yaml:"batch_max_queue_items,omitempty"`
 }
 
 // LogConfig controls structured logging output.

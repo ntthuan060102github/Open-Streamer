@@ -1,0 +1,358 @@
+package hooks
+
+// batcher.go — per-hook HTTP delivery queue with size+timer triggered flush.
+//
+// Design summary:
+//   - One httpBatcher per HTTP hook (lazy-created in dispatch).
+//   - Each batcher owns a single goroutine that wakes on either a flush-tick
+//     or a "queue full" signal pushed by enqueue().
+//   - Flush takes the entire pending queue, POSTs it as a JSON array, and
+//     on failure re-queues the events for the next flush. Re-queued events
+//     are merged at the FRONT of the buffer so chronological ordering is
+//     preserved across retries.
+//   - The queue is bounded by maxQueue. When new events would push it past
+//     the cap, the OLDEST events are dropped (with a counter+warn) — this
+//     stops a persistently-down target from ballooning memory.
+//
+// The Service holds a map[HookID]*httpBatcher; lifecycle is tied to the
+// Service.Start ctx — every batcher is stopped + drained when ctx ends.
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+)
+
+// batchConfig snapshots the per-hook dispatch parameters at batcher
+// construction time. The values are resolved by mergeBatchConfig from
+// HooksConfig + Hook fields + code defaults so the batcher itself stays
+// agnostic of the layered defaults.
+type batchConfig struct {
+	maxItems      int
+	flushInterval time.Duration
+	maxQueue      int
+	maxRetries    int
+	timeout       time.Duration
+	secret        string
+	target        string
+	hookID        domain.HookID
+}
+
+// httpBatcher accumulates events for one HTTP hook and posts them as a
+// JSON array. Methods are safe for concurrent use.
+type httpBatcher struct {
+	cfg    batchConfig
+	client *http.Client
+
+	mu          sync.Mutex
+	queue       []domain.Event
+	droppedSize int64 // cumulative count of events evicted on overflow
+
+	flushSig chan struct{} // size-trigger wake-up; depth 1 (coalesced)
+
+	// Lifecycle plumbing. closeOnce guards stop()'s "send done + wait wg" so
+	// duplicate stop calls (Service.Start ctx exit + a hot-removal path)
+	// don't double-close the channel.
+	done      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+}
+
+// newHTTPBatcher constructs a batcher and launches its flusher goroutine.
+// The goroutine returns when ctx is cancelled OR stop() is called; in
+// either case the queue is drained on the way out (best-effort POST).
+func newHTTPBatcher(ctx context.Context, cfg batchConfig, client *http.Client) *httpBatcher {
+	b := &httpBatcher{
+		cfg:      cfg,
+		client:   client,
+		queue:    make([]domain.Event, 0, cfg.maxItems),
+		flushSig: make(chan struct{}, 1),
+		done:     make(chan struct{}),
+	}
+	b.wg.Add(1)
+	go b.run(ctx)
+	return b
+}
+
+// enqueue appends an event to the queue, trimming the oldest entries when
+// the cap is exceeded. Signals the flusher when the queue reaches the
+// maxItems threshold so the batch ships immediately rather than waiting
+// for the next tick.
+func (b *httpBatcher) enqueue(ev domain.Event) {
+	b.mu.Lock()
+	b.queue = append(b.queue, ev)
+	if len(b.queue) > b.cfg.maxQueue {
+		drop := len(b.queue) - b.cfg.maxQueue
+		b.queue = b.queue[drop:]
+		b.droppedSize += int64(drop)
+		slog.Warn("hooks: batch queue overflow — oldest events dropped",
+			"hook_id", b.cfg.hookID,
+			"dropped", drop,
+			"dropped_total", b.droppedSize,
+			"queue_cap", b.cfg.maxQueue,
+		)
+	}
+	full := len(b.queue) >= b.cfg.maxItems
+	b.mu.Unlock()
+	if full {
+		b.signal()
+	}
+}
+
+// signal nudges the flusher to wake up. The buffered channel + non-blocking
+// send means repeated signals coalesce into one wake-up, matching the
+// "flush at most once per cycle" behaviour we want.
+func (b *httpBatcher) signal() {
+	select {
+	case b.flushSig <- struct{}{}:
+	default:
+	}
+}
+
+// stop signals the flusher to exit and waits for it to finish draining.
+// Idempotent. Subsequent calls return immediately.
+func (b *httpBatcher) stop() {
+	b.closeOnce.Do(func() { close(b.done) })
+	b.wg.Wait()
+}
+
+// run is the flusher loop. It exits on ctx cancellation OR stop().
+func (b *httpBatcher) run(ctx context.Context) {
+	defer b.wg.Done()
+	ticker := time.NewTicker(b.cfg.flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Best-effort drain on shutdown. We deliberately detach from
+			// the cancelled parent ctx so the final POST gets a fair
+			// chance to land — using ctx here would cancel the in-flight
+			// HTTP request immediately.
+			b.flushOnce(context.Background()) //nolint:contextcheck // see comment above
+			return
+		case <-b.done:
+			b.flushOnce(context.Background()) //nolint:contextcheck // graceful drain — see ctx.Done branch
+			return
+		case <-ticker.C:
+			b.flushOnce(ctx)
+		case <-b.flushSig:
+			b.flushOnce(ctx)
+		}
+	}
+}
+
+// flushOnce takes the current queue and ships it. On failure the events
+// are merged back into the queue head so the next flush retries them
+// in chronological order.
+func (b *httpBatcher) flushOnce(ctx context.Context) {
+	batch := b.takeBatch()
+	if len(batch) == 0 {
+		return
+	}
+	if err := b.deliverBatch(ctx, batch); err != nil {
+		b.requeue(batch, err)
+	}
+}
+
+// takeBatch pulls up to maxItems events off the queue head and returns
+// them. The remaining queue stays in place — partial flushes (when more
+// events arrived than the batch can hold) preserve order for the next tick.
+func (b *httpBatcher) takeBatch() []domain.Event {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.queue) == 0 {
+		return nil
+	}
+	n := len(b.queue)
+	if n > b.cfg.maxItems {
+		n = b.cfg.maxItems
+	}
+	out := make([]domain.Event, n)
+	copy(out, b.queue[:n])
+	b.queue = b.queue[n:]
+	return out
+}
+
+// requeue inserts the failed batch at the FRONT of the queue so retries
+// preserve event order. The combined (failed + new) queue is still capped
+// at maxQueue — when over-capacity, we drop from the OLDEST end (which
+// after re-queue is the failed batch's head — older events lose to fresher
+// ones, matching the "best effort, don't ballon RAM" contract).
+func (b *httpBatcher) requeue(batch []domain.Event, deliverErr error) {
+	b.mu.Lock()
+	combined := make([]domain.Event, 0, len(batch)+len(b.queue))
+	combined = append(combined, batch...)
+	combined = append(combined, b.queue...)
+	if len(combined) > b.cfg.maxQueue {
+		drop := len(combined) - b.cfg.maxQueue
+		combined = combined[drop:]
+		b.droppedSize += int64(drop)
+		slog.Warn("hooks: requeue overflow — oldest events dropped",
+			"hook_id", b.cfg.hookID,
+			"dropped", drop,
+			"dropped_total", b.droppedSize,
+			"queue_cap", b.cfg.maxQueue,
+		)
+	}
+	b.queue = combined
+	b.mu.Unlock()
+
+	slog.Warn("hooks: batch delivery failed, re-queued for next flush",
+		"hook_id", b.cfg.hookID,
+		"batch_size", len(batch),
+		"err", deliverErr,
+	)
+}
+
+// deliverBatch is the single HTTP attempt with internal retry/backoff. It
+// returns nil only when one of the attempts returned 2xx; otherwise the
+// last error is returned and the caller re-queues.
+//
+// MaxRetries here governs RETRIES INSIDE this flush — if the target is
+// momentarily flaky, we'd rather stay on this batch (~36s with default
+// backoff) than fail fast and immediately re-queue. Operators wanting
+// pure flush-cadence retries can set MaxRetries=0.
+func (b *httpBatcher) deliverBatch(ctx context.Context, batch []domain.Event) error {
+	body, err := json.Marshal(batch)
+	if err != nil {
+		return fmt.Errorf("marshal batch: %w", err)
+	}
+
+	backoffs := []time.Duration{1 * time.Second, 5 * time.Second, 30 * time.Second}
+	maxRetries := b.cfg.maxRetries
+	if maxRetries > len(backoffs) {
+		maxRetries = len(backoffs)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		lastErr = b.postOnce(ctx, body, len(batch))
+		if lastErr == nil {
+			return nil
+		}
+		if attempt < maxRetries {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoffs[attempt]):
+			}
+		}
+	}
+	return lastErr
+}
+
+// postOnce makes a single HTTP request with the per-hook timeout applied.
+// HMAC signs the entire body when Hook.Secret is set.
+func (b *httpBatcher) postOnce(ctx context.Context, body []byte, batchSize int) error {
+	deliverCtx, cancel := context.WithTimeout(ctx, b.cfg.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(deliverCtx, http.MethodPost, b.cfg.target, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-OpenStreamer-Batch-Size", strconv.Itoa(batchSize))
+	if b.cfg.secret != "" {
+		mac := hmac.New(sha256.New, []byte(b.cfg.secret))
+		mac.Write(body)
+		req.Header.Set("X-OpenStreamer-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http post: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		const maxBody = 512
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+		trimmed := strings.TrimSpace(string(snippet))
+		if trimmed == "" {
+			return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		}
+		return fmt.Errorf("unexpected status: %d body=%q", resp.StatusCode, trimmed)
+	}
+	return nil
+}
+
+// queueLen returns the current number of pending events. Test-only helper
+// — production code should never poll this.
+func (b *httpBatcher) queueLen() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.queue)
+}
+
+// mergeBatchConfig resolves the layered defaults for one hook.
+// Order: hook value → global config value → code default.
+func mergeBatchConfig(h *domain.Hook, gc batchGlobalDefaults) batchConfig {
+	maxItems := h.BatchMaxItems
+	if maxItems <= 0 {
+		maxItems = gc.maxItems
+	}
+	if maxItems <= 0 {
+		maxItems = domain.DefaultHookBatchMaxItems
+	}
+
+	flushSec := h.BatchFlushIntervalSec
+	if flushSec <= 0 {
+		flushSec = gc.flushIntervalSec
+	}
+	if flushSec <= 0 {
+		flushSec = domain.DefaultHookBatchFlushIntervalSec
+	}
+
+	maxQueue := h.BatchMaxQueueItems
+	if maxQueue <= 0 {
+		maxQueue = gc.maxQueueItems
+	}
+	if maxQueue <= 0 {
+		maxQueue = domain.DefaultHookBatchMaxQueueItems
+	}
+
+	timeoutSec := h.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = domain.DefaultHookTimeoutSec
+	}
+
+	maxRetries := h.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = domain.DefaultHookMaxRetries
+	}
+
+	return batchConfig{
+		maxItems:      maxItems,
+		flushInterval: time.Duration(flushSec) * time.Second,
+		maxQueue:      maxQueue,
+		maxRetries:    maxRetries,
+		timeout:       time.Duration(timeoutSec) * time.Second,
+		secret:        h.Secret,
+		target:        h.Target,
+		hookID:        h.ID,
+	}
+}
+
+// batchGlobalDefaults is the subset of HooksConfig the resolver needs.
+// Wrapping it here keeps mergeBatchConfig free of config import cycles
+// in test utilities.
+type batchGlobalDefaults struct {
+	maxItems         int
+	flushIntervalSec int
+	maxQueueItems    int
+}

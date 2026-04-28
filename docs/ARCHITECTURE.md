@@ -423,10 +423,25 @@ type Event struct {
 ```
 
 Hooks subscribe via API. Per-hook filters (event types, stream codes
-only/except). Per-hook delivery config (max retries, timeout, HMAC
-signing for HTTP). File delivery appends one JSON-encoded event per
-line to an absolute target path; concurrent deliveries serialise via
-a per-target mutex while different paths run in parallel.
+only/except). Two delivery shapes:
+
+- **HTTP** — events accumulate in a per-hook batcher; flushes when the
+  buffer reaches `BatchMaxItems` OR `BatchFlushIntervalSec` elapses.
+  POST body is a JSON array of event envelopes; HMAC signs the entire
+  body. Failed batches re-queue at the FRONT of the buffer for the next
+  flush — chronological order preserved across retries. The buffer is
+  bounded by `BatchMaxQueueItems`; overflow drops the OLDEST events
+  (warn-logged) so a persistently-down target can't balloon RAM.
+- **File** — appends one JSON-encoded event per line to an absolute
+  target path. Concurrent deliveries serialise via a per-target mutex
+  while different paths run in parallel. Never batched — log shippers
+  (Filebeat / Vector / Promtail) tail-and-ship one line at a time.
+
+Bus worker pool (sized via `hooks.worker_count`, default 4) processes
+publishes — but with batched HTTP delivery the hook handler just
+enqueues into a per-hook batcher (~µs), so the worker count rarely
+needs tuning. Each batcher owns its own goroutine; bus workers are no
+longer the place HTTP latency lives.
 
 ### API Server (`internal/api`)
 
