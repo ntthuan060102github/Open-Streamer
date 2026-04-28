@@ -4,7 +4,7 @@ go 1.25.9
 
 require (
 	github.com/Eyevinn/mp4ff v0.51.0
-	github.com/bluenviron/gortsplib/v5 v5.5.1
+	github.com/bluenviron/gortsplib/v5 v5.5.2
 	github.com/bluenviron/mediacommon/v2 v2.8.3
 	github.com/datarhei/gosrt v0.10.0
 	github.com/go-chi/chi/v5 v5.2.5
