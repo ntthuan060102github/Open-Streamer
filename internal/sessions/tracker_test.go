@@ -27,6 +27,7 @@ func TestTrackHTTPOpensThenAccumulates(t *testing.T) {
 	first := s.TrackHTTP(context.Background(), hit)
 	if first == nil {
 		t.Fatal("TrackHTTP returned nil on first hit")
+		return // unreachable; satisfies staticcheck SA5011
 	}
 	if first.Bytes != 1024 {
 		t.Errorf("first.Bytes = %d, want 1024", first.Bytes)
@@ -85,6 +86,7 @@ func TestOpenConnReturnsCloserAndCounts(t *testing.T) {
 	})
 	if sess == nil {
 		t.Fatal("nil session from OpenConn")
+		return // unreachable; satisfies staticcheck SA5011
 	}
 	if sess.IP != "1.2.3.4" {
 		t.Errorf("IP = %s, want 1.2.3.4 (port stripped)", sess.IP)
