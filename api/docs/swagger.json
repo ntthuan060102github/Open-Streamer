@@ -2579,8 +2579,6 @@
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2596,7 +2594,9 @@
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error"
+                "transcoder.error",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2606,8 +2606,6 @@
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "",
                 "",
@@ -2623,11 +2621,11 @@
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2643,7 +2641,9 @@
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError"
+                "EventTranscoderError",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {
@@ -3353,11 +3353,11 @@
             "type": "string",
             "enum": [
                 "multi",
-                "legacy"
+                "per_profile"
             ],
             "x-enum-varnames": [
                 "TranscoderModeMulti",
-                "TranscoderModeLegacy"
+                "TranscoderModePerProfile"
             ]
         },
         "domain.VODMount": {

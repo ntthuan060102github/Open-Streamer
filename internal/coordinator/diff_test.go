@@ -46,12 +46,12 @@ func TestComputeDiffTranscoderModeToggleTriggersTopology(t *testing.T) {
 	t.Run("multi → legacy", func(t *testing.T) {
 		old := baseStream()
 		new := baseStream()
-		new.Transcoder.Mode = domain.TranscoderModeLegacy
+		new.Transcoder.Mode = domain.TranscoderModePerProfile
 		assert.True(t, ComputeDiff(old, new).TranscoderTopologyChanged)
 	})
 	t.Run("legacy → multi", func(t *testing.T) {
 		old := baseStream()
-		old.Transcoder.Mode = domain.TranscoderModeLegacy
+		old.Transcoder.Mode = domain.TranscoderModePerProfile
 		new := baseStream()
 		new.Transcoder.Mode = domain.TranscoderModeMulti
 		assert.True(t, ComputeDiff(old, new).TranscoderTopologyChanged)

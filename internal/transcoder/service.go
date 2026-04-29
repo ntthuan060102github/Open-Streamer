@@ -345,7 +345,7 @@ func (s *Service) Config() config.TranscoderConfig {
 // Start launches the transcoder pipeline for a stream. The Stream's
 // `transcoder.mode` selects topology: "" / "multi" (default) spawns ONE
 // FFmpeg per stream that emits all renditions via separate output pipes;
-// "legacy" spawns one FFmpeg per RenditionTarget. See multi_output_run.go
+// "per_profile" spawns one FFmpeg per RenditionTarget. See multi_output_run.go
 // for rationale and trade-offs.
 func (s *Service) Start(
 	ctx context.Context,

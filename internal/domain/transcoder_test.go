@@ -9,10 +9,10 @@ func TestTranscoderConfigIsMultiOutput(t *testing.T) {
 		cfg  *TranscoderConfig
 		want bool
 	}{
-		"nil":                {nil, true},
-		"empty mode → multi": {&TranscoderConfig{}, true},
-		"explicit multi":     {&TranscoderConfig{Mode: TranscoderModeMulti}, true},
-		"explicit legacy":    {&TranscoderConfig{Mode: TranscoderModeLegacy}, false},
+		"nil":                  {nil, true},
+		"empty mode → multi":   {&TranscoderConfig{}, true},
+		"explicit multi":       {&TranscoderConfig{Mode: TranscoderModeMulti}, true},
+		"explicit per_profile": {&TranscoderConfig{Mode: TranscoderModePerProfile}, false},
 		"unknown reads as not-multi (validation rejects elsewhere)": {
 			&TranscoderConfig{Mode: "weird"}, false,
 		},
@@ -34,9 +34,10 @@ func TestTranscoderConfigValidateMode(t *testing.T) {
 		"nil":         {nil, false},
 		"empty mode":  {&TranscoderConfig{}, false},
 		"multi":       {&TranscoderConfig{Mode: TranscoderModeMulti}, false},
-		"legacy":      {&TranscoderConfig{Mode: TranscoderModeLegacy}, false},
-		"typo":        {&TranscoderConfig{Mode: "leggacy"}, true},
+		"per_profile": {&TranscoderConfig{Mode: TranscoderModePerProfile}, false},
+		"typo":        {&TranscoderConfig{Mode: "per_pofile"}, true},
 		"empty space": {&TranscoderConfig{Mode: " "}, true},
+		"old legacy":  {&TranscoderConfig{Mode: "legacy"}, true}, // hold the line on the rename
 	}
 	for name, c := range cases {
 		err := c.cfg.ValidateMode()

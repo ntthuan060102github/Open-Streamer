@@ -213,11 +213,11 @@ const (
 	// 2–3 s it takes to respawn.
 	TranscoderModeMulti TranscoderMode = "multi"
 
-	// TranscoderModeLegacy runs ONE FFmpeg per rendition. Higher RAM /
+	// TranscoderModePerProfile runs ONE FFmpeg per rendition. Higher RAM /
 	// decode cost in exchange for per-rendition crash isolation: a single
 	// rendition's encoder failing doesn't disrupt the others. Recommended
 	// for upstreams known to deliver bursts of malformed packets.
-	TranscoderModeLegacy TranscoderMode = "legacy"
+	TranscoderModePerProfile TranscoderMode = "per_profile"
 )
 
 // TranscoderConfig is the complete transcoding configuration for a stream.
@@ -259,10 +259,10 @@ func (t *TranscoderConfig) ValidateMode() error {
 		return nil
 	}
 	switch t.Mode {
-	case "", TranscoderModeMulti, TranscoderModeLegacy:
+	case "", TranscoderModeMulti, TranscoderModePerProfile:
 		return nil
 	default:
 		return fmt.Errorf("transcoder: unknown mode %q (want %q or %q)",
-			t.Mode, TranscoderModeMulti, TranscoderModeLegacy)
+			t.Mode, TranscoderModeMulti, TranscoderModePerProfile)
 	}
 }
