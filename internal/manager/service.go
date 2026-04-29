@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/config"
@@ -268,16 +269,44 @@ type ingestorDep interface {
 
 // Service monitors all streams and orchestrates source failover.
 type Service struct {
-	bus           events.Bus
-	ingestor      ingestorDep
-	m             *metrics.Metrics
-	packetTimeout time.Duration
+	bus      events.Bus
+	ingestor ingestorDep
+	m        *metrics.Metrics
+
+	// packetTimeoutNs is the active-input silence threshold in nanoseconds.
+	// Stored atomically so SetConfig can hot-swap the value while the
+	// monitor's checkHealth tick reads it without locking.
+	packetTimeoutNs atomic.Int64
 
 	mu      sync.RWMutex
 	streams map[domain.StreamCode]*streamState
 
 	onExhausted func(streamCode domain.StreamCode) // all inputs degraded — no ingest possible
 	onRestored  func(streamCode domain.StreamCode) // at least one input active again after exhaustion
+}
+
+// packetTimeoutFromCfg normalises ManagerConfig.InputPacketTimeoutSec into
+// a usable Duration, falling back to the package default for zero / negative
+// values. Used by both New constructors and SetConfig so the resolution
+// rule stays in one place.
+func packetTimeoutFromCfg(sec int) time.Duration {
+	if sec <= 0 {
+		sec = domain.DefaultInputPacketTimeoutSec
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// SetConfig hot-swaps the manager's runtime parameters. Currently only
+// InputPacketTimeoutSec is exposed for live updates; future fields can
+// be threaded through here as they get added. The new value takes effect
+// on the next monitor tick (≤ monitorInterval = 2s).
+//
+// Does NOT restart the monitor goroutine, ingestor workers, or any
+// downstream pipeline — only the threshold value is replaced. Streams
+// that were degraded under the old threshold stay degraded; the new
+// threshold applies to subsequent silence-gap evaluations.
+func (s *Service) SetConfig(cfg config.ManagerConfig) {
+	s.packetTimeoutNs.Store(int64(packetTimeoutFromCfg(cfg.InputPacketTimeoutSec)))
 }
 
 // SetExhaustedCallback registers a function called when all inputs for a stream are
@@ -301,16 +330,13 @@ func (s *Service) SetRestoredCallback(fn func(domain.StreamCode)) {
 // DI plumbing. packetTimeoutSec mirrors ManagerConfig.InputPacketTimeoutSec
 // (defaults to 30s when ≤ 0).
 func NewForTesting(bus events.Bus, ing ingestorDep, m *metrics.Metrics, packetTimeoutSec int) *Service {
-	if packetTimeoutSec <= 0 {
-		packetTimeoutSec = domain.DefaultInputPacketTimeoutSec
-	}
 	svc := &Service{
-		bus:           bus,
-		ingestor:      ing,
-		m:             m,
-		packetTimeout: time.Duration(packetTimeoutSec) * time.Second,
-		streams:       make(map[domain.StreamCode]*streamState),
+		bus:      bus,
+		ingestor: ing,
+		m:        m,
+		streams:  make(map[domain.StreamCode]*streamState),
 	}
+	svc.packetTimeoutNs.Store(int64(packetTimeoutFromCfg(packetTimeoutSec)))
 	ing.SetPacketObserver(svc.RecordPacket)
 	ing.SetInputErrorObserver(svc.ReportInputError)
 	ing.SetMediaPacketObserver(svc.RecordMediaPacket)
@@ -323,17 +349,13 @@ func New(i do.Injector) (*Service, error) {
 	bus := do.MustInvoke[events.Bus](i)
 	ing := do.MustInvoke[*ingestor.Service](i)
 	m := do.MustInvoke[*metrics.Metrics](i)
-	sec := cfg.InputPacketTimeoutSec
-	if sec <= 0 {
-		sec = domain.DefaultInputPacketTimeoutSec
-	}
 	svc := &Service{
-		bus:           bus,
-		ingestor:      ing,
-		m:             m,
-		packetTimeout: time.Duration(sec) * time.Second,
-		streams:       make(map[domain.StreamCode]*streamState),
+		bus:      bus,
+		ingestor: ing,
+		m:        m,
+		streams:  make(map[domain.StreamCode]*streamState),
 	}
+	svc.packetTimeoutNs.Store(int64(packetTimeoutFromCfg(cfg.InputPacketTimeoutSec)))
 	ing.SetPacketObserver(svc.RecordPacket)
 	ing.SetInputErrorObserver(svc.ReportInputError)
 	ing.SetMediaPacketObserver(svc.RecordMediaPacket)
@@ -662,7 +684,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 	}
 
 	now := time.Now()
-	timeout := s.packetTimeout
+	timeout := time.Duration(s.packetTimeoutNs.Load())
 	timedOutPriority := -1
 	timedOutDetail := ""
 	var probeTasks []probeTask

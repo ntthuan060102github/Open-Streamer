@@ -18,6 +18,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor"
+	"github.com/ntt0601zcoder/open-streamer/internal/manager"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
@@ -38,6 +39,7 @@ type Deps struct {
 	Publisher        *publisher.Service
 	Coordinator      *coordinator.Coordinator
 	Transcoder       *transcoder.Service
+	StreamMgr        *manager.Service
 	HooksSvc         *hooks.Service
 	SessionsSvc      *sessions.Service
 	APISrv           *api.Server
@@ -290,6 +292,21 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 	// takes effect immediately on already-encoding streams.
 	if configChanged(old.Transcoder, new.Transcoder) && m.deps.Transcoder != nil {
 		m.applyTranscoderChange(old.Transcoder, new.Transcoder)
+	}
+
+	// Manager — packet-timeout threshold lives behind an atomic on
+	// manager.Service, so SetConfig swaps the value and the next monitor
+	// tick (≤ 2s) picks it up. No streams restarted, no readers reconnected:
+	// only the silence-detection threshold changes.
+	if configChanged(old.Manager, new.Manager) && m.deps.StreamMgr != nil {
+		cfg := config.ManagerConfig{}
+		if new.Manager != nil {
+			cfg = *new.Manager
+		}
+		m.deps.StreamMgr.SetConfig(cfg)
+		slog.Info("runtime: manager config applied",
+			"input_packet_timeout_sec", cfg.InputPacketTimeoutSec,
+		)
 	}
 }
 

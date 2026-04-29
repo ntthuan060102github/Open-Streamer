@@ -68,8 +68,8 @@ func TestGetConfigDefaultsShape(t *testing.T) {
 	assert.Equal(t, domain.DefaultHLSPlaylistTimeoutSec, got.Ingestor.HLSPlaylistTimeoutSec)
 	assert.Equal(t, domain.DefaultHLSSegmentTimeoutSec, got.Ingestor.HLSSegmentTimeoutSec)
 	assert.Equal(t, domain.DefaultHLSMaxSegmentBuffer, got.Ingestor.HLSMaxSegmentBuffer)
-	assert.Equal(t, domain.DefaultRTMPConnectTimeoutSec, got.Ingestor.RTMPConnectTimeoutSec)
-	assert.Equal(t, domain.DefaultRTSPConnectTimeoutSec, got.Ingestor.RTSPConnectTimeoutSec)
+	assert.Equal(t, domain.DefaultRTMPTimeoutSec, got.Ingestor.RTMPTimeoutSec)
+	assert.Equal(t, domain.DefaultRTSPTimeoutSec, got.Ingestor.RTSPTimeoutSec)
 }
 
 // Codec routing table: empty codec + HW=nvenc must resolve to h264_nvenc;

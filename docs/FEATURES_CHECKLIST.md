@@ -86,8 +86,8 @@ Legend:
 | Push — RTMP listen | Complete | Shared `:1935` (default); RTMP relay → loopback pull |
 | Push — SRT listen | Complete | Shared `:9999`; streamid `live/<code>` dispatch |
 | Multi-input registration with priority | Complete | Lower value = higher priority |
-| Per-input `Net` config | Partial | `connect_timeout_sec`, `insecure_tls`, `reconnect` consumed; `read_timeout_sec`, `reconnect_delay_sec`, `reconnect_max_delay_sec`, `max_reconnects` declared but not yet wired |
-| HLS pull tuning | Complete | Per-stream `connect_timeout_sec`; server-wide `hls_max_segment_buffer` |
+| Per-input `Net` config | Complete | `timeout_sec` (per-protocol op budget) and `insecure_tls`. Reconnect/silence-detection knobs were dropped — pull workers use a hardcoded backoff and stream-level liveness lives in `manager.input_packet_timeout_sec`. |
+| HLS pull tuning | Complete | Per-stream `net.timeout_sec` (sets playlist GET budget; segment timeout auto-derives ×4 floored at server default); server-wide `hls_max_segment_buffer` |
 
 ---
 
@@ -247,7 +247,7 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 | Hook | `DefaultHookMaxRetries=3`, `DefaultHookTimeoutSec=10` |
 | Video | `DefaultVideoBitrateK=2500`, `DefaultVideoResizeMode=pad` |
 | Audio | `DefaultAudioBitrateK=128` |
-| Listeners | `DefaultListenHost="0.0.0.0"`, `DefaultRTMPConnectTimeoutSec=10`, `DefaultRTSPConnectTimeoutSec=10`, `DefaultSRTLatencyMS=120` |
+| Listeners | `DefaultListenHost="0.0.0.0"`, `DefaultRTMPTimeoutSec=10`, `DefaultRTSPTimeoutSec=10`, `DefaultSRTLatencyMS=120` |
 | Ingestor | `DefaultHLSPlaylistTimeoutSec=15`, `DefaultHLSSegmentTimeoutSec=60`, `DefaultHLSMaxSegmentBuffer=8` |
 | Transcoder | `DefaultFFmpegPath="ffmpeg"` |
 

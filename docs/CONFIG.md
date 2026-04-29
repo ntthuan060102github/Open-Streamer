@@ -148,7 +148,7 @@ ingestor:
   hls_max_segment_buffer: 8     # Default. Pre-fetched HLS segments held per stream.
 ```
 
-Server-wide. Per-input HLS connect / segment timeouts come from `inputs[].net.connect_timeout_sec` (defaults 15s playlist / 60s segment).
+Server-wide. Per-input HLS playlist / segment timeouts derive from `inputs[].net.timeout_sec` (defaults 15s playlist / 60s segment).
 
 ### 2.7 transcoder
 
@@ -268,9 +268,8 @@ inputs:                          # Ordered by priority (must be 0..N-1 contiguou
     headers:  { "Authorization": "Bearer X" }       # HTTP/HLS only.
     params:   { "passphrase": "..." }               # SRT/S3.
     net:
-      connect_timeout_sec: 15    # HLS playlist GET timeout. 0 = use defaults.
-      reconnect:           true  # Pull readers auto-reconnect on drop.
-      insecure_tls:        false # HTTPS — allow self-signed (use with care).
+      timeout_sec:  15    # Per-protocol op budget (HLS playlist GET, RTMP/RTSP/SRT dial). 0 = default.
+      insecure_tls: false # HTTPS — allow self-signed (use with care).
   - url:      "rtmp://backup/live"
     priority: 1
 
@@ -519,8 +518,8 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 | `listeners.srt.port` | 9999 | — |
 | `listeners.srt.latency_ms` | 120 | — |
 | `ingestor.hls_max_segment_buffer` | 8 | — |
-| `ingestor.rtmp_connect_timeout_sec` | 10 | — |
-| `ingestor.rtsp_connect_timeout_sec` | 10 | — |
+| `ingestor.rtmp_timeout_sec` | 10 | — |
+| `ingestor.rtsp_timeout_sec` | 10 | — |
 | `ingestor.hls_playlist_timeout_sec` | 15 | — |
 | `ingestor.hls_segment_timeout_sec` | 60 | — |
 | `transcoder.ffmpeg_path` | "ffmpeg" | $PATH lookup |

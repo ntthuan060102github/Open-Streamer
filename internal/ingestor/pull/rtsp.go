@@ -85,9 +85,9 @@ func (r *RTSPReader) Open(ctx context.Context) error {
 		return fmt.Errorf("rtsp reader: parse URL %q: %w", r.input.URL, err)
 	}
 
-	connectTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
+	connectTimeout := time.Duration(r.input.Net.TimeoutSec) * time.Second
 	if connectTimeout == 0 {
-		connectTimeout = time.Duration(domain.DefaultRTSPConnectTimeoutSec) * time.Second
+		connectTimeout = time.Duration(domain.DefaultRTSPTimeoutSec) * time.Second
 	}
 
 	c := &gortsplib.Client{

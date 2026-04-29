@@ -126,6 +126,7 @@ func run() error {
 		Publisher:        do.MustInvoke[*publisher.Service](injector),
 		Coordinator:      do.MustInvoke[*coordinator.Coordinator](injector),
 		Transcoder:       do.MustInvoke[*transcoder.Service](injector),
+		StreamMgr:        do.MustInvoke[*manager.Service](injector),
 		HooksSvc:         do.MustInvoke[*hooks.Service](injector),
 		SessionsSvc:      do.MustInvoke[*sessions.Service](injector),
 		APISrv:           do.MustInvoke[*api.Server](injector),

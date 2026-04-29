@@ -2831,32 +2831,12 @@
         "domain.InputNetConfig": {
             "type": "object",
             "properties": {
-                "connect_timeout_sec": {
-                    "description": "ConnectTimeoutSec caps each HTTP round-trip (headers + full body) for pull\nreaders that use net/http (e.g. HLS playlist and segment GETs). Zero uses\nthe reader's default (30s for HLS).",
-                    "type": "integer"
-                },
                 "insecure_tls": {
                     "description": "InsecureTLS disables TLS certificate verification for HTTPS pulls\n(HLS playlist + segment GETs). Default false — leave secure-by-default\nfor production. Use only when the source uses a self-signed,\nexpired, or otherwise-invalid certificate that you trust at the\nnetwork level (private VLAN, fixed IP allowlist).",
                     "type": "boolean"
                 },
-                "max_reconnects": {
-                    "description": "MaxReconnects is the total number of reconnect attempts (0 = unlimited).",
-                    "type": "integer"
-                },
-                "read_timeout_sec": {
-                    "description": "ReadTimeoutSec is the max silence duration before declaring the input dead.",
-                    "type": "integer"
-                },
-                "reconnect": {
-                    "description": "Reconnect enables automatic reconnection when the input drops.",
-                    "type": "boolean"
-                },
-                "reconnect_delay_sec": {
-                    "description": "ReconnectDelaySec is the initial delay before the first reconnect attempt.",
-                    "type": "integer"
-                },
-                "reconnect_max_delay_sec": {
-                    "description": "ReconnectMaxDelaySec caps the exponential backoff delay.",
+                "timeout_sec": {
+                    "description": "TimeoutSec is the per-protocol operation budget the reader applies\nwhen this input is opened. Semantics differ by protocol:\n\n  - HLS:  HTTP request timeout (entire round-trip incl. body) for\n          the playlist GET. Segment GETs derive from this — typically\n          4× the playlist budget, floored at the segment default.\n  - RTMP: TCP dial timeout (handshake budget).\n  - RTSP: dial + initial read timeout (until first packet).\n  - SRT:  connection / handshake timeout.\n\nZero uses the reader's per-protocol default\n(DefaultHLSPlaylistTimeoutSec for HLS; DefaultRTMPTimeoutSec /\nDefaultRTSPTimeoutSec for the rest).",
                     "type": "integer"
                 }
             }
@@ -3695,11 +3675,11 @@
                         "hls_segment_timeout_sec": {
                             "type": "integer"
                         },
-                        "rtmp_connect_timeout_sec": {
-                            "description": "Per-protocol pull dial timeouts (HLS uses HLSPlaylistTimeoutSec).",
+                        "rtmp_timeout_sec": {
+                            "description": "Per-protocol pull timeouts the server fills when a stream's\n`input.net.timeout_sec` is left zero. UI uses these as the\nplaceholder value on the per-input Timeout (s) field, picking\nthe right one based on the input URL scheme.",
                             "type": "integer"
                         },
-                        "rtsp_connect_timeout_sec": {
+                        "rtsp_timeout_sec": {
                             "type": "integer"
                         }
                     }

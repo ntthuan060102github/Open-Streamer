@@ -81,7 +81,7 @@ const (
 	DefaultAudioBitrateK = 128
 
 	// DefaultHLSPlaylistTimeoutSec is the upstream HLS pull playlist GET
-	// timeout (seconds) when InputNetConfig.ConnectTimeoutSec is zero.
+	// timeout (seconds) when InputNetConfig.TimeoutSec is zero.
 	DefaultHLSPlaylistTimeoutSec = 15
 	// DefaultHLSSegmentTimeoutSec is the upstream HLS segment GET timeout
 	// floor — segments can be many MB so this is held above the playlist
@@ -106,10 +106,10 @@ const (
 	// interfaces — the standard server behaviour.
 	DefaultListenHost = "0.0.0.0"
 
-	// DefaultRTMPConnectTimeoutSec is the dial timeout (seconds) for RTMP
-	// pull when InputNetConfig.ConnectTimeoutSec is zero.
-	DefaultRTMPConnectTimeoutSec = 10
-	// DefaultRTSPConnectTimeoutSec is the dial / read timeout (seconds)
-	// for RTSP pull when InputNetConfig.ConnectTimeoutSec is zero.
-	DefaultRTSPConnectTimeoutSec = 10
+	// DefaultRTMPTimeoutSec is the dial timeout (seconds) for RTMP pull
+	// when InputNetConfig.TimeoutSec is zero.
+	DefaultRTMPTimeoutSec = 10
+	// DefaultRTSPTimeoutSec is the dial / read timeout (seconds) for RTSP
+	// pull when InputNetConfig.TimeoutSec is zero.
+	DefaultRTSPTimeoutSec = 10
 )

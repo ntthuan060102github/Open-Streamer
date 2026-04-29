@@ -23,22 +23,13 @@ func NewFullStream(code domain.StreamCode) *domain.Stream {
 				Headers:  map[string]string{"Authorization": "Bearer tok1"},
 				Params:   map[string]string{"passphrase": "abc"},
 				Net: domain.InputNetConfig{
-					ConnectTimeoutSec:    10,
-					ReadTimeoutSec:       30,
-					Reconnect:            true,
-					ReconnectDelaySec:    2,
-					ReconnectMaxDelaySec: 60,
-					MaxReconnects:        5,
+					TimeoutSec: 10,
 				},
 			},
 			{
 				URL:      "rtmp://backup.example.com/live/key2",
 				Priority: 1,
-				Net: domain.InputNetConfig{
-					Reconnect:            true,
-					ReconnectDelaySec:    5,
-					ReconnectMaxDelaySec: 120,
-				},
+				Net:      domain.InputNetConfig{},
 			},
 		},
 		Transcoder: &domain.TranscoderConfig{

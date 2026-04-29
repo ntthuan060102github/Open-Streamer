@@ -190,7 +190,7 @@ func NewHLSReader(input domain.Input, cfg config.IngestorConfig) *HLSReader {
 // Returns immediately; segments arrive asynchronously via Read.
 // Safe to call again after Close — each call creates a fresh output channel.
 func (r *HLSReader) Open(ctx context.Context) error {
-	plTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
+	plTimeout := time.Duration(r.input.Net.TimeoutSec) * time.Second
 	if plTimeout == 0 {
 		plTimeout = hlsDefaultPlaylistTimeout
 	}

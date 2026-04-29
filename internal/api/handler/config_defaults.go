@@ -107,9 +107,12 @@ type configDefaultsResponse struct {
 		HLSPlaylistTimeoutSec int `json:"hls_playlist_timeout_sec"`
 		HLSSegmentTimeoutSec  int `json:"hls_segment_timeout_sec"`
 		HLSMaxSegmentBuffer   int `json:"hls_max_segment_buffer"`
-		// Per-protocol pull dial timeouts (HLS uses HLSPlaylistTimeoutSec).
-		RTMPConnectTimeoutSec int `json:"rtmp_connect_timeout_sec"`
-		RTSPConnectTimeoutSec int `json:"rtsp_connect_timeout_sec"`
+		// Per-protocol pull timeouts the server fills when a stream's
+		// `input.net.timeout_sec` is left zero. UI uses these as the
+		// placeholder value on the per-input Timeout (s) field, picking
+		// the right one based on the input URL scheme.
+		RTMPTimeoutSec int `json:"rtmp_timeout_sec"`
+		RTSPTimeoutSec int `json:"rtsp_timeout_sec"`
 	} `json:"ingestor"`
 }
 
@@ -252,8 +255,8 @@ func buildConfigDefaults() configDefaultsResponse {
 	resp.Ingestor.HLSPlaylistTimeoutSec = domain.DefaultHLSPlaylistTimeoutSec
 	resp.Ingestor.HLSSegmentTimeoutSec = domain.DefaultHLSSegmentTimeoutSec
 	resp.Ingestor.HLSMaxSegmentBuffer = domain.DefaultHLSMaxSegmentBuffer
-	resp.Ingestor.RTMPConnectTimeoutSec = domain.DefaultRTMPConnectTimeoutSec
-	resp.Ingestor.RTSPConnectTimeoutSec = domain.DefaultRTSPConnectTimeoutSec
+	resp.Ingestor.RTMPTimeoutSec = domain.DefaultRTMPTimeoutSec
+	resp.Ingestor.RTSPTimeoutSec = domain.DefaultRTSPTimeoutSec
 
 	return resp
 }

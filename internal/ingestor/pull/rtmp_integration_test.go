@@ -96,7 +96,7 @@ func TestRTMPReader_PullsFromMediaMTX(t *testing.T) {
 	// stream. Retry Open until it succeeds or a deadline is reached.
 	r := pull.NewRTMPReader(domain.Input{
 		URL: pullURL,
-		Net: domain.InputNetConfig{ConnectTimeoutSec: 10},
+		Net: domain.InputNetConfig{TimeoutSec: 10},
 	})
 	openDeadline := time.Now().Add(30 * time.Second)
 	var openErr error

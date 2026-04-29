@@ -170,8 +170,8 @@ func (r *SRTReader) buildConfig() (srt.Config, string, error) {
 	}
 
 	// Explicit connect timeout from InputNetConfig overrides any ?conntimeo= in the URL.
-	if r.input.Net.ConnectTimeoutSec > 0 {
-		cfg.ConnectionTimeout = time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
+	if r.input.Net.TimeoutSec > 0 {
+		cfg.ConnectionTimeout = time.Duration(r.input.Net.TimeoutSec) * time.Second
 	}
 
 	return cfg, host, nil

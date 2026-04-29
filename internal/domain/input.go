@@ -56,27 +56,28 @@ type Input struct {
 	Alive bool `json:"-" yaml:"-"`
 }
 
-// InputNetConfig controls reconnect and timeout behaviour for an input.
+// InputNetConfig controls per-input network behaviour.
+//
+// Reconnect / silence-detection knobs were removed because they were
+// declared but never consumed by any reader: pull workers use a hardcoded
+// exponential backoff on transient errors (worker.go), and stream-level
+// liveness is the manager's job (manager.input_packet_timeout_sec).
+// Reintroduce specific knobs only when a reader actually wires them.
 type InputNetConfig struct {
-	// ConnectTimeoutSec caps each HTTP round-trip (headers + full body) for pull
-	// readers that use net/http (e.g. HLS playlist and segment GETs). Zero uses
-	// the reader's default (30s for HLS).
-	ConnectTimeoutSec int `json:"connect_timeout_sec,omitempty" yaml:"connect_timeout_sec,omitempty"`
-
-	// ReadTimeoutSec is the max silence duration before declaring the input dead.
-	ReadTimeoutSec int `json:"read_timeout_sec,omitempty" yaml:"read_timeout_sec,omitempty"`
-
-	// Reconnect enables automatic reconnection when the input drops.
-	Reconnect bool `json:"reconnect,omitempty" yaml:"reconnect,omitempty"`
-
-	// ReconnectDelaySec is the initial delay before the first reconnect attempt.
-	ReconnectDelaySec int `json:"reconnect_delay_sec,omitempty" yaml:"reconnect_delay_sec,omitempty"`
-
-	// ReconnectMaxDelaySec caps the exponential backoff delay.
-	ReconnectMaxDelaySec int `json:"reconnect_max_delay_sec,omitempty" yaml:"reconnect_max_delay_sec,omitempty"`
-
-	// MaxReconnects is the total number of reconnect attempts (0 = unlimited).
-	MaxReconnects int `json:"max_reconnects,omitempty" yaml:"max_reconnects,omitempty"`
+	// TimeoutSec is the per-protocol operation budget the reader applies
+	// when this input is opened. Semantics differ by protocol:
+	//
+	//   - HLS:  HTTP request timeout (entire round-trip incl. body) for
+	//           the playlist GET. Segment GETs derive from this — typically
+	//           4× the playlist budget, floored at the segment default.
+	//   - RTMP: TCP dial timeout (handshake budget).
+	//   - RTSP: dial + initial read timeout (until first packet).
+	//   - SRT:  connection / handshake timeout.
+	//
+	// Zero uses the reader's per-protocol default
+	// (DefaultHLSPlaylistTimeoutSec for HLS; DefaultRTMPTimeoutSec /
+	// DefaultRTSPTimeoutSec for the rest).
+	TimeoutSec int `json:"timeout_sec,omitempty" yaml:"timeout_sec,omitempty"`
 
 	// InsecureTLS disables TLS certificate verification for HTTPS pulls
 	// (HLS playlist + segment GETs). Default false — leave secure-by-default

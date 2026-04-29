@@ -73,9 +73,9 @@ func (r *RTMPReader) Open(ctx context.Context) error {
 	r.done = make(chan struct{})
 	r.mu.Unlock()
 
-	connectTimeout := time.Duration(r.input.Net.ConnectTimeoutSec) * time.Second
+	connectTimeout := time.Duration(r.input.Net.TimeoutSec) * time.Second
 	if connectTimeout == 0 {
-		connectTimeout = time.Duration(domain.DefaultRTMPConnectTimeoutSec) * time.Second
+		connectTimeout = time.Duration(domain.DefaultRTMPTimeoutSec) * time.Second
 	}
 
 	conn, err := joyrtmp.DialTimeout(r.input.URL, connectTimeout)
