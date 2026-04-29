@@ -153,8 +153,8 @@ func TestWatermarkResolved(t *testing.T) {
 	w3 := &WatermarkConfig{
 		Enabled: true, Type: WatermarkTypeText, Text: "x", Resize: true,
 	}
-	if r := w3.Resolved(); r.ResizeRatio != defaultWatermarkResizeRatio {
-		t.Errorf("Resize=true, ratio=0 should default to %v, got %v", defaultWatermarkResizeRatio, r.ResizeRatio)
+	if r := w3.Resolved(); r.ResizeRatio != DefaultWatermarkResizeRatio {
+		t.Errorf("Resize=true, ratio=0 should default to %v, got %v", DefaultWatermarkResizeRatio, r.ResizeRatio)
 	}
 
 	// Operator override survives Resolved().

@@ -627,6 +627,8 @@ definitions:
     type: object
   domain.EventType:
     enum:
+    - session.opened
+    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -643,8 +645,6 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
-    - session.opened
-    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -653,6 +653,8 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
+    - ""
+    - ""
     - ""
     - ""
     - ""
@@ -669,9 +671,9 @@ definitions:
     - ""
     - ""
     - ""
-    - ""
-    - ""
     x-enum-varnames:
+    - EventSessionOpened
+    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -688,8 +690,6 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
-    - EventSessionOpened
-    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -1526,7 +1526,7 @@ definitions:
           ResizeRatio sets the watermark size as a fraction of the frame's
           reference dimension when Resize=true. Image uses frame width as
           reference, text uses frame height. Range (0, 1]; 0 = inherit the
-          per-server default (defaultWatermarkResizeRatio). Ignored when
+          per-server default (DefaultWatermarkResizeRatio). Ignored when
           Resize=false.
 
           Per-stream — each WatermarkConfig may pick its own ratio so a station
@@ -1696,6 +1696,17 @@ definitions:
               resize_mode:
                 $ref: '#/definitions/domain.ResizeMode'
             type: object
+        type: object
+      watermark:
+        description: |-
+          Watermark surfaces the per-server defaults the transcoder applies
+          when a stream's WatermarkConfig leaves a field empty / zero. UI
+          reads ResizeRatio to render the "server default" placeholder on the
+          resize_ratio input — falling back to this value when the operator
+          leaves the field blank.
+        properties:
+          resize_ratio:
+            type: number
         type: object
     type: object
   handler.listenerDefaults:

@@ -63,7 +63,7 @@ func appendTextWatermark(base string, r *domain.WatermarkConfig, onGPU bool) str
 	fontsize := itoa(r.FontSize)
 	if r.Resize {
 		// r.ResizeRatio is filled by WatermarkConfig.Resolved() — defaults
-		// to defaultWatermarkResizeRatio when the operator left it 0.
+		// to domain.DefaultWatermarkResizeRatio when the operator left it 0.
 		fontsize = ffmpegQuote(fmt.Sprintf("h*%.4f", r.ResizeRatio))
 	}
 	dt := strings.Join([]string{

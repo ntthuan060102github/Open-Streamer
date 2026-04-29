@@ -70,6 +70,8 @@ func TestGetConfigDefaultsShape(t *testing.T) {
 	assert.Equal(t, domain.DefaultHLSMaxSegmentBuffer, got.Ingestor.HLSMaxSegmentBuffer)
 	assert.Equal(t, domain.DefaultRTMPConnectTimeoutSec, got.Ingestor.RTMPConnectTimeoutSec)
 	assert.Equal(t, domain.DefaultRTSPConnectTimeoutSec, got.Ingestor.RTSPConnectTimeoutSec)
+
+	assert.InDelta(t, domain.DefaultWatermarkResizeRatio, got.Watermark.ResizeRatio, 1e-9)
 }
 
 // Codec routing table: empty codec + HW=nvenc must resolve to h264_nvenc;

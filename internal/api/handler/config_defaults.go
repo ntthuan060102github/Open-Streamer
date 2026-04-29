@@ -107,6 +107,15 @@ type configDefaultsResponse struct {
 		RTMPConnectTimeoutSec int `json:"rtmp_connect_timeout_sec"`
 		RTSPConnectTimeoutSec int `json:"rtsp_connect_timeout_sec"`
 	} `json:"ingestor"`
+
+	// Watermark surfaces the per-server defaults the transcoder applies
+	// when a stream's WatermarkConfig leaves a field empty / zero. UI
+	// reads ResizeRatio to render the "server default" placeholder on the
+	// resize_ratio input — falling back to this value when the operator
+	// leaves the field blank.
+	Watermark struct {
+		ResizeRatio float64 `json:"resize_ratio"`
+	} `json:"watermark"`
 }
 
 type liveSegmentDefaults struct {
@@ -250,6 +259,8 @@ func buildConfigDefaults() configDefaultsResponse {
 	resp.Ingestor.HLSMaxSegmentBuffer = domain.DefaultHLSMaxSegmentBuffer
 	resp.Ingestor.RTMPConnectTimeoutSec = domain.DefaultRTMPConnectTimeoutSec
 	resp.Ingestor.RTSPConnectTimeoutSec = domain.DefaultRTSPConnectTimeoutSec
+
+	resp.Watermark.ResizeRatio = domain.DefaultWatermarkResizeRatio
 
 	return resp
 }

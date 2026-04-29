@@ -2590,6 +2590,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2605,9 +2607,7 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error",
-                "session.opened",
-                "session.closed"
+                "transcoder.error"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2617,6 +2617,8 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -2632,11 +2634,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2652,9 +2654,7 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTranscoderError"
             ]
         },
         "domain.GlobalConfig": {
@@ -3583,7 +3583,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "resize_ratio": {
-                    "description": "ResizeRatio sets the watermark size as a fraction of the frame's\nreference dimension when Resize=true. Image uses frame width as\nreference, text uses frame height. Range (0, 1]; 0 = inherit the\nper-server default (defaultWatermarkResizeRatio). Ignored when\nResize=false.\n\nPer-stream — each WatermarkConfig may pick its own ratio so a station\nlogo (~5%) and a sponsor banner (~20%) on different streams coexist\nwithout a global setting.",
+                    "description": "ResizeRatio sets the watermark size as a fraction of the frame's\nreference dimension when Resize=true. Image uses frame width as\nreference, text uses frame height. Range (0, 1]; 0 = inherit the\nper-server default (DefaultWatermarkResizeRatio). Ignored when\nResize=false.\n\nPer-stream — each WatermarkConfig may pick its own ratio so a station\nlogo (~5%) and a sponsor banner (~20%) on different streams coexist\nwithout a global setting.",
                     "type": "number"
                 },
                 "text": {
@@ -3798,6 +3798,15 @@ const docTemplate = `{
                                     "$ref": "#/definitions/domain.ResizeMode"
                                 }
                             }
+                        }
+                    }
+                },
+                "watermark": {
+                    "description": "Watermark surfaces the per-server defaults the transcoder applies\nwhen a stream's WatermarkConfig leaves a field empty / zero. UI\nreads ResizeRatio to render the \"server default\" placeholder on the\nresize_ratio input — falling back to this value when the operator\nleaves the field blank.",
+                    "type": "object",
+                    "properties": {
+                        "resize_ratio": {
+                            "type": "number"
                         }
                     }
                 }

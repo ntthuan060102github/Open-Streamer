@@ -109,7 +109,7 @@ type WatermarkConfig struct {
 	// ResizeRatio sets the watermark size as a fraction of the frame's
 	// reference dimension when Resize=true. Image uses frame width as
 	// reference, text uses frame height. Range (0, 1]; 0 = inherit the
-	// per-server default (defaultWatermarkResizeRatio). Ignored when
+	// per-server default (DefaultWatermarkResizeRatio). Ignored when
 	// Resize=false.
 	//
 	// Per-stream — each WatermarkConfig may pick its own ratio so a station
@@ -125,12 +125,12 @@ const (
 	defaultWatermarkOpacity   = 1.0
 	defaultWatermarkPosition  = WatermarkBottomRight
 	defaultWatermarkOffset    = 10
-	// defaultWatermarkResizeRatio is the watermark size as a fraction of the
+	// DefaultWatermarkResizeRatio is the watermark size as a fraction of the
 	// main frame's reference dimension when Resize=true. Picked at 8% — small
 	// enough to feel like a station logo on 480p, big enough to stay legible
 	// on 1080p. Image uses width as reference; text uses height (matches
 	// FFmpeg variable conventions: W/H for overlay, h for drawtext).
-	defaultWatermarkResizeRatio = 0.08
+	DefaultWatermarkResizeRatio = 0.08
 )
 
 // IsActive reports whether the watermark should actually be applied.
@@ -251,7 +251,7 @@ func (w *WatermarkConfig) Resolved() *WatermarkConfig {
 	// resize is enabled — leaving the field at zero when Resize=false avoids
 	// surprising operators with phantom values in serialised configs.
 	if out.Resize && out.ResizeRatio == 0 {
-		out.ResizeRatio = defaultWatermarkResizeRatio
+		out.ResizeRatio = DefaultWatermarkResizeRatio
 	}
 	return &out
 }
