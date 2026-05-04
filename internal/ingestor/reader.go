@@ -90,12 +90,16 @@ func NewPacketReader(
 	case protocol.KindRTMP:
 		return pull.NewRTMPReader(input), nil
 	case protocol.KindUDP:
-		return pull.NewTSDemuxPacketReader(pull.NewUDPReader(input)), nil
+		// Raw-TS passthrough: avoid the demux/remux round-trip that scrambles
+		// PCR/PTS and re-assigns PIDs. See pull/ts_passthrough.go.
+		return pull.NewTSPassthroughPacketReader(pull.NewUDPReader(input)), nil
 	case protocol.KindHLS:
-		return pull.NewTSDemuxPacketReader(
-			pull.NewHLSReader(input, cfg),
-			pull.WithRealtimePacing(),
-		), nil
+		// HLS pull also delivers MPEG-TS; same passthrough rationale as UDP.
+		// Note: realtime pacing was previously enabled to throttle the demux
+		// emission rate. With raw-TS passthrough each segment is forwarded
+		// as a chunk-shaped AVPacket; the segmenter/transcoder downstream
+		// already paces by wall-clock, so explicit pacing is not needed.
+		return pull.NewTSPassthroughPacketReader(pull.NewHLSReader(input, cfg)), nil
 	case protocol.KindFile:
 		if vods == nil {
 			return nil, fmt.Errorf("ingestor: cannot resolve %q — no VOD resolver configured", input.URL)
@@ -104,9 +108,9 @@ func NewPacketReader(
 		if err != nil {
 			return nil, fmt.Errorf("ingestor: resolve file url: %w", err)
 		}
-		return pull.NewTSDemuxPacketReader(pull.NewFileReader(path, loop)), nil
+		return pull.NewTSPassthroughPacketReader(pull.NewFileReader(path, loop)), nil
 	case protocol.KindSRT:
-		return pull.NewTSDemuxPacketReader(pull.NewSRTReader(input)), nil
+		return pull.NewTSPassthroughPacketReader(pull.NewSRTReader(input)), nil
 	case protocol.KindCopy:
 		if buf == nil || lookup == nil {
 			return nil, fmt.Errorf(

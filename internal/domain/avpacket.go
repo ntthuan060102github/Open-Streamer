@@ -9,6 +9,18 @@ const (
 	AVCodecH264
 	AVCodecH265
 	AVCodecAAC
+
+	// AVCodecRawTSChunk is a marker codec used to carry raw MPEG-TS bytes
+	// through the AVPacket-shaped pipeline without forcing a demux/remux
+	// round-trip. The buffer-write step recognises this codec and writes the
+	// chunk to `buffer.Packet.TS` instead of `buffer.Packet.AV`. Consumers
+	// that prefer raw TS (HLS/DASH segmenters, transcoder ffmpeg-stdin pump)
+	// then forward bytes verbatim — preserving PCR continuity and original
+	// PIDs that a demux/remux cycle would lose.
+	//
+	// Used only by sources that ingest pre-muxed MPEG-TS (UDP, HLS, SRT,
+	// File). RTSP / RTMP / Copy / Mixer continue to emit decoded AVPackets.
+	AVCodecRawTSChunk
 )
 
 // IsVideo reports whether the codec carries a video elementary stream.

@@ -196,34 +196,85 @@ func readLoop(
 			if len(p.Data) == 0 {
 				continue
 			}
-			cl := p.Clone()
-			if firstPacket {
-				cl.Discontinuity = true
-				firstPacket = false
-			}
-			if writeErr := buf.Write(bufferWriteID, buffer.Packet{AV: cl}); writeErr != nil {
-				slog.Error("ingestor: buffer write failed",
-					"stream_code", streamID,
-					"input_priority", input.Priority,
-					"err", writeErr,
-				)
+			isFirst := firstPacket
+			firstPacket = false
+			if writeErr := writeOnePacket(streamID, bufferWriteID, input, &p, isFirst, buf, cb); writeErr != nil {
 				return writeErr
-			}
-			if cb != nil && cb.onPacket != nil {
-				cb.onPacket(streamID, input.Priority)
-			}
-			if cb != nil && cb.onPacketBytes != nil {
-				cb.onPacketBytes(streamID, input.Priority, len(p.Data))
-			}
-			if cb != nil && cb.onMedia != nil {
-				// Pass the local p (post-clone-into-buffer) — observer must
-				// not retain p.Data; if it needs persisted bytes (e.g. SPS
-				// extracted on a keyframe) it should copy them out itself.
-				pCopy := p
-				cb.onMedia(streamID, input.Priority, &pCopy)
 			}
 		}
 	}
+}
+
+// writeOnePacket forwards one source packet into the buffer, dispatching on
+// the marker codec. Raw-TS sources (UDP/HLS/SRT/File via TSPassthroughPacketReader)
+// emit AVCodecRawTSChunk so we write Packet.TS to preserve the original bytes;
+// AV sources (RTSP/RTMP) write Packet.AV. Extracted from readLoop to keep
+// each function under the cognitive-complexity ceiling.
+func writeOnePacket(
+	streamID, bufferWriteID domain.StreamCode,
+	input domain.Input,
+	p *domain.AVPacket,
+	isFirst bool,
+	buf *buffer.Service,
+	cb *pullWorkerCallbacks,
+) error {
+	if p.Codec == domain.AVCodecRawTSChunk {
+		return writeRawTSChunk(streamID, bufferWriteID, input, p.Data, buf, cb)
+	}
+	cl := p.Clone()
+	if isFirst {
+		cl.Discontinuity = true
+	}
+	if err := buf.Write(bufferWriteID, buffer.Packet{AV: cl}); err != nil {
+		slog.Error("ingestor: buffer write failed",
+			"stream_code", streamID,
+			"input_priority", input.Priority,
+			"err", err,
+		)
+		return err
+	}
+	if cb != nil && cb.onPacket != nil {
+		cb.onPacket(streamID, input.Priority)
+	}
+	if cb != nil && cb.onPacketBytes != nil {
+		cb.onPacketBytes(streamID, input.Priority, len(p.Data))
+	}
+	if cb != nil && cb.onMedia != nil {
+		// Observer must not retain p.Data; if it needs persisted bytes
+		// (e.g. SPS extracted on a keyframe) it should copy them out itself.
+		pCopy := *p
+		cb.onMedia(streamID, input.Priority, &pCopy)
+	}
+	return nil
+}
+
+// writeRawTSChunk handles the AVCodecRawTSChunk path — copies the chunk so
+// the source-side reader buffer can be reused, writes Packet.TS to the buffer
+// hub, and fires the byte-count + packet-count observers (no onMedia: raw TS
+// has no AVPacket-level codec/keyframe info to surface).
+func writeRawTSChunk(
+	streamID, bufferWriteID domain.StreamCode,
+	input domain.Input,
+	chunk []byte,
+	buf *buffer.Service,
+	cb *pullWorkerCallbacks,
+) error {
+	cp := append([]byte(nil), chunk...)
+	if err := buf.Write(bufferWriteID, buffer.Packet{TS: cp}); err != nil {
+		slog.Error("ingestor: buffer write failed (TS passthrough)",
+			"stream_code", streamID,
+			"input_priority", input.Priority,
+			"err", err,
+		)
+		return err
+	}
+	if cb != nil && cb.onPacket != nil {
+		cb.onPacket(streamID, input.Priority)
+	}
+	if cb != nil && cb.onPacketBytes != nil {
+		cb.onPacketBytes(streamID, input.Priority, len(cp))
+	}
+	return nil
 }
 
 // waitBackoff sleeps for d, returning false if ctx is cancelled first.
