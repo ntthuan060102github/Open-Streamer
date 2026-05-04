@@ -29,3 +29,11 @@ func joinIPv4ASMByIfaceName(conn *net.UDPConn, group net.IP, ifaceName string) e
 func setUDPRecvBuffer(conn *net.UDPConn, n int) {
 	_ = conn.SetReadBuffer(n)
 }
+
+// disableIPMulticastAll is a no-op on non-Linux platforms — IP_MULTICAST_ALL
+// is a Linux-specific option. macOS/BSD already filter multicast per-socket
+// based on IP_ADD_MEMBERSHIP, so there is no cross-process delivery leak to
+// guard against.
+func disableIPMulticastAll(_ *net.UDPConn) {
+	// Intentionally empty: see doc comment.
+}

@@ -129,6 +129,15 @@ func (r *UDPReader) Open(_ context.Context) error {
 	// Non-Linux builds use plain SetReadBuffer.
 	setUDPRecvBuffer(conn, r.opts.osBuf)
 
+	// Restrict multicast delivery to groups this socket actually joined.
+	// Go's net.ListenUDP rewrites a multicast bind to 0.0.0.0; on Linux,
+	// wildcard sockets default to IP_MULTICAST_ALL=1, which delivers EVERY
+	// multicast packet joined by ANY socket on the host (e.g. when another
+	// media server is co-located on the same box and has joined other
+	// groups). Disable it so kernel filtering matches our explicit IGMP
+	// memberships. No-op on non-Linux. See udp_join_*.go for details.
+	disableIPMulticastAll(conn)
+
 	if err := r.joinMulticast(conn, addr); err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("udp: multicast join %s: %w", addr.IP, err)

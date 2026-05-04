@@ -62,6 +62,45 @@ func setUDPRecvBuffer(conn *net.UDPConn, n int) {
 	})
 }
 
+// disableIPMulticastAll disables IP_MULTICAST_ALL on the socket so that the
+// kernel only delivers multicast packets for groups this socket has explicitly
+// joined via IP_ADD_MEMBERSHIP — instead of leaking *every* multicast packet
+// that any other process on the host has joined.
+//
+// Why this matters (and why it's not optional on Linux):
+//
+// Go's `net.ListenUDP` for a multicast IPv4 address auto-rewrites the bind
+// address to `0.0.0.0` (see src/net/sock_posix.go listenDatagram) so a single
+// listener can join multiple groups. On Linux, sockets bound to INADDR_ANY
+// have IP_MULTICAST_ALL=1 by default, which means: *every* multicast packet
+// for *every* group joined by *any* socket on the host is delivered to this
+// socket — regardless of whether THIS socket joined that group.
+//
+// Operational impact: when this server runs alongside another multicast
+// receiver (Flussonic, smcroute, mediasrv, …) that has joined groups
+// 239.0.113.2..12, our socket bound to 0.0.0.0:5001 with only group
+// 239.0.113.1 joined still receives the entire 12-channel firehose. The
+// HLS segmenter then writes ~12× the expected bytes per segment, with
+// interleaved DTS values from different programs — players reject the
+// stream as corrupt (decode_slice_header errors, "Packet corrupt", DTS
+// discontinuity), and FFmpeg downstream of any transcoder sees garbage.
+//
+// Setting IP_MULTICAST_ALL=0 restores per-socket multicast filtering so
+// the socket receives ONLY the groups it explicitly joined.
+//
+// Linux 2.6.31+. Errors are swallowed: on older kernels the option doesn't
+// exist (EOPNOTSUPP) and the cross-process leakage is unavoidable, but the
+// caller can't do anything else about it.
+func disableIPMulticastAll(conn *net.UDPConn) {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = rawConn.Control(func(fd uintptr) {
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_MULTICAST_ALL, 0)
+	})
+}
+
 // joinIPv4ASMByIfaceName joins the IPv4 ASM (any-source multicast) group on
 // the named interface using purely ioctl + setsockopt — no netlink calls.
 func joinIPv4ASMByIfaceName(conn *net.UDPConn, group net.IP, ifaceName string) error {
