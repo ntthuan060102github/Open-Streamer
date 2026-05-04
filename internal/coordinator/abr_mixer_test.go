@@ -243,3 +243,74 @@ func TestABRMixerRuntimeStatus_DegradedBeforeFirstPacket(t *testing.T) {
 	assert.Equal(t, domain.StatusDegraded, rt.Inputs[0].Status,
 		"no packets seen yet → degraded")
 }
+
+// ─── ptsRebaser ──────────────────────────────────────────────────────────────
+
+// Two unrelated upstream sources (e.g. video PCR ≈ 12 s, audio PCR ≈ 9.8 Ms)
+// must collapse onto a near-zero offset after rebase — that is exactly what
+// fixes the "black + silent" symptom downstream players show when the gap
+// between video.PTS and audio.PTS exceeds their A/V sync window.
+func TestPTSRebaser_AlignsUnrelatedSourcesToWallClock(t *testing.T) {
+	t.Parallel()
+	t0 := time.Now()
+	video := ptsRebaser{t0: t0}
+	audio := ptsRebaser{t0: t0}
+
+	v := domain.AVPacket{PTSms: 12_000, DTSms: 12_000}
+	a := domain.AVPacket{PTSms: 9_800_000_000, DTSms: 9_800_000_000}
+	video.apply(&v)
+	audio.apply(&a)
+
+	gapMs := int64(v.PTSms) - int64(a.PTSms)
+	if gapMs < 0 {
+		gapMs = -gapMs
+	}
+	require.Less(t, gapMs, int64(100),
+		"after rebase, video and audio first packets must collapse to ~wall-clock arrival skew, got gap=%dms", gapMs)
+}
+
+// Inter-frame deltas inside one source must survive rebase — otherwise the
+// downstream HLS segmenter would see PTS collapsing to a single value and
+// the player would fail to schedule frames.
+func TestPTSRebaser_PreservesInterFrameDeltas(t *testing.T) {
+	t.Parallel()
+	r := ptsRebaser{t0: time.Now()}
+	p1 := domain.AVPacket{PTSms: 100_000, DTSms: 100_000}
+	p2 := domain.AVPacket{PTSms: 100_033, DTSms: 100_033}
+	p3 := domain.AVPacket{PTSms: 100_066, DTSms: 100_066}
+	r.apply(&p1)
+	r.apply(&p2)
+	r.apply(&p3)
+
+	require.Equal(t, uint64(33), p2.PTSms-p1.PTSms)
+	require.Equal(t, uint64(66), p3.PTSms-p1.PTSms)
+}
+
+// Realistic B-frame: PTS<DTS (frame is decoded later than displayed). Verify
+// the rebaser preserves PTS<DTS ordering after rewrite.
+func TestPTSRebaser_PreservesBFramePTSDTSOrder(t *testing.T) {
+	t.Parallel()
+	r := ptsRebaser{t0: time.Now()}
+	iframe := domain.AVPacket{PTSms: 1_000, DTSms: 1_000}
+	r.apply(&iframe)
+	bframe := domain.AVPacket{PTSms: 1_040, DTSms: 1_080}
+	r.apply(&bframe)
+
+	require.Less(t, bframe.PTSms, bframe.DTSms,
+		"B-frame PTS<DTS ordering must survive rebase")
+}
+
+// Out-of-order packet whose DTS dips below the first-seen DTS must not
+// underflow uint64 — ptsRebaserBaseMs provides the headroom.
+func TestPTSRebaser_HandlesOutOfOrderBelowAnchor(t *testing.T) {
+	t.Parallel()
+	r := ptsRebaser{t0: time.Now()}
+	first := domain.AVPacket{PTSms: 1_000, DTSms: 1_000}
+	r.apply(&first)
+	// Reordered packet: DTS 20 ms earlier than the anchor.
+	reordered := domain.AVPacket{PTSms: 985, DTSms: 980}
+	r.apply(&reordered)
+
+	require.Less(t, reordered.DTSms, uint64(1<<40),
+		"DTS must not underflow to a giant uint64; got %d", reordered.DTSms)
+}

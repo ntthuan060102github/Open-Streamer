@@ -47,6 +47,48 @@ type abrMixerEntry struct {
 	videoUpstream     domain.StreamCode
 	audioUpstream     domain.StreamCode
 	lastPacketAtNanos atomic.Int64
+
+	// t0 is the shared wall-clock anchor used by ptsRebaser instances in the
+	// forward goroutines. Both video taps and the audio fan-out reference the
+	// same t0 so packets from the two unrelated upstream clocks land on a
+	// common timeline — without this, the player gets PTS values diverging
+	// by hours and renders black/silence.
+	t0 time.Time
+}
+
+// ptsRebaserBaseMs is the headroom added to every rebased timestamp so that a
+// packet whose DTS or PTS dips slightly below the anchor (out-of-order
+// delivery, brief network reorder) doesn't underflow uint64 when the mixer
+// has only just started and wallOffsetMs is near zero. 1 second is several
+// orders of magnitude larger than any realistic skew.
+const ptsRebaserBaseMs int64 = 1000
+
+// ptsRebaser maps an upstream's PTS/DTS sequence onto a shared wall-clock
+// timeline. The first packet of each cycle anchors itself at the elapsed
+// wall-clock time since t0; subsequent packets preserve their original
+// inter-frame deltas. One instance per source per forward cycle — re-creating
+// it on reconnect is what stitches a restarted upstream's new PCR base back
+// into a continuous downstream timeline.
+type ptsRebaser struct {
+	t0           time.Time
+	has          bool
+	firstPTS     uint64
+	firstDTS     uint64
+	wallOffsetMs int64
+}
+
+// apply rewrites p.PTSms / p.DTSms in place. Signed math + base offset
+// tolerate B-frame DTS<PTS, out-of-order packets, and packets briefly
+// preceding the anchor without uint underflow.
+func (r *ptsRebaser) apply(p *domain.AVPacket) {
+	if !r.has {
+		r.firstPTS = p.PTSms
+		r.firstDTS = p.DTSms
+		r.wallOffsetMs = time.Since(r.t0).Milliseconds() + ptsRebaserBaseMs
+		r.has = true
+	}
+	p.PTSms = uint64(r.wallOffsetMs + (int64(p.PTSms) - int64(r.firstPTS)))
+	p.DTSms = uint64(r.wallOffsetMs + (int64(p.DTSms) - int64(r.firstDTS)))
 }
 
 // detectABRMixer reports whether `s` should run on the ABR-mixer mirror
@@ -160,6 +202,7 @@ func (c *Coordinator) startABRMixer(ctx context.Context, downstream, videoUp, au
 		slugs:         slugs,
 		videoUpstream: videoUp.Code,
 		audioUpstream: audioUp.Code,
+		t0:            time.Now(),
 	}
 
 	c.abrMixers[downstream.Code] = entry
@@ -266,6 +309,12 @@ func (c *Coordinator) runABRMixerVideoTap(
 
 // abrMixerVideoForward runs one demux-and-forward cycle for a single rung.
 // Returns true on ctx cancellation (caller should not retry).
+//
+// PTS/DTS are rebased onto entry.t0 via a per-cycle ptsRebaser so that video
+// from upstream A and audio from upstream B share a common timeline. The
+// rebaser is scoped to the cycle: when an upstream restart triggers a new
+// forward cycle, a fresh rebaser captures the current wall-clock offset, so
+// the new PCR base is stitched in continuously instead of jumping.
 func (c *Coordinator) abrMixerVideoForward(ctx context.Context, entry *abrMixerEntry, upBufID, downBufID domain.StreamCode) bool {
 	demux := pull.NewBufferTSDemuxReader(c.buf, upBufID)
 	if err := demux.Open(ctx); err != nil {
@@ -273,6 +322,7 @@ func (c *Coordinator) abrMixerVideoForward(ctx context.Context, entry *abrMixerE
 	}
 	defer func() { _ = demux.Close() }()
 
+	rebaser := ptsRebaser{t0: entry.t0}
 	for {
 		batch, err := demux.ReadPackets(ctx)
 		if err != nil {
@@ -282,6 +332,7 @@ func (c *Coordinator) abrMixerVideoForward(ctx context.Context, entry *abrMixerE
 			if !p.Codec.IsVideo() {
 				continue
 			}
+			rebaser.apply(&p)
 			if err := c.buf.Write(downBufID, buffer.Packet{AV: &p}); err == nil {
 				entry.lastPacketAtNanos.Store(time.Now().UnixNano())
 			}
@@ -350,6 +401,7 @@ func (c *Coordinator) abrMixerAudioForward(
 
 // abrMixerAudioForwardABR demuxes the audio upstream's best-rendition TS
 // stream into AVPackets and fans audio frames out to every downstream rung.
+// PTS/DTS are rebased against entry.t0 — see abrMixerVideoForward for why.
 func (c *Coordinator) abrMixerAudioForwardABR(
 	ctx context.Context,
 	entry *abrMixerEntry,
@@ -362,6 +414,7 @@ func (c *Coordinator) abrMixerAudioForwardABR(
 	}
 	defer func() { _ = demux.Close() }()
 
+	rebaser := ptsRebaser{t0: entry.t0}
 	for {
 		batch, err := demux.ReadPackets(ctx)
 		if err != nil {
@@ -371,6 +424,7 @@ func (c *Coordinator) abrMixerAudioForwardABR(
 			if !p.Codec.IsAudio() {
 				continue
 			}
+			rebaser.apply(&p)
 			pkt := buffer.Packet{AV: &p}
 			c.fanOutToRenditions(downBufIDs, pkt, entry)
 		}
@@ -379,6 +433,7 @@ func (c *Coordinator) abrMixerAudioForwardABR(
 
 // abrMixerAudioForwardDirect subscribes to a single-stream audio upstream's
 // main buffer (AVPackets) and fans audio frames out to every rung.
+// PTS/DTS are rebased against entry.t0 — see abrMixerVideoForward for why.
 func (c *Coordinator) abrMixerAudioForwardDirect(
 	ctx context.Context,
 	entry *abrMixerEntry,
@@ -391,6 +446,7 @@ func (c *Coordinator) abrMixerAudioForwardDirect(
 	}
 	defer c.buf.Unsubscribe(audioBufID, sub)
 
+	rebaser := ptsRebaser{t0: entry.t0}
 	for {
 		select {
 		case <-ctx.Done():
@@ -402,6 +458,9 @@ func (c *Coordinator) abrMixerAudioForwardDirect(
 			if pkt.AV == nil || !pkt.AV.Codec.IsAudio() {
 				continue
 			}
+			// Subscriber receives a clone of the original Packet, so mutating
+			// AV in place here only affects this consumer's view — safe.
+			rebaser.apply(pkt.AV)
 			c.fanOutToRenditions(downBufIDs, pkt, entry)
 		}
 	}
