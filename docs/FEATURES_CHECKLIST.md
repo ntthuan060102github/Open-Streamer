@@ -152,8 +152,8 @@ Legend:
 | ABR ladder add/remove → `RestartHLSDASH` | Complete | Only HLS+DASH goroutines restart; RTSP/RTMP/SRT viewers preserved |
 | ABR profile metadata update | Complete | `UpdateABRMasterMeta` rewrites HLS master playlist in-place (no FFmpeg restart) |
 | Topology change → `reloadTranscoderFull` | Complete | Full pipeline rebuild when transcoder nil↔non-nil or mode changes |
-| ABR-copy pipeline (`copy://` upstream with ladder) | Complete | N tap goroutines re-publish each upstream rendition; bypasses ingest worker + transcoder; reconnects on upstream restart (relies on `buffer.Delete` channel-close signal) |
-| ABR-mixer pipeline | Complete | Mirror video ladder + audio fan-out from two upstream streams; reconnects on upstream restart; **PTS/DTS rebased per-source against shared wall-clock anchor** so video (upstream A) and audio (upstream B) collapse onto a common timeline — without this, divergent PCR bases between unrelated sources caused players to render black + silent |
+| ABR-copy pipeline (`copy://` upstream with ladder) | Complete | N tap goroutines re-publish each upstream rendition; bypasses ingest worker + transcoder; reconnects on upstream restart (relies on `buffer.Delete` channel-close signal). Note: bypassing manager means `runtime.media` is empty — see Operational Notes |
+| ABR-mixer pipeline | Complete | Mirror video ladder + audio fan-out from two upstream streams; reconnects on upstream restart; **PTS/DTS rebased per-source against shared wall-clock anchor** so video (upstream A) and audio (upstream B) collapse onto a common timeline — without this, divergent PCR bases between unrelated sources caused players to render black + silent. Note: bypassing manager means `runtime.media` is empty — see Operational Notes |
 | Stream-level health reconciliation | Complete | `streamDegradation` flags (`inputsExhausted`, `transcoderUnhealthy`) — Degraded if either set, Active when all clear |
 | DVR hot-reload | Complete | Toggle on/off; restarts with new mediaBuf when best rendition shifts |
 | Narrow service interfaces (`deps.go`) | Complete | `mgrDep`, `tcDep`, `pubDep`, `dvrDep` — spy-based testing |
@@ -378,5 +378,6 @@ ABR, multi-output, libx264 and HLS+DASH multi-protocol phases. See
 - **`PUT /streams/{code}` is non-disruptive** when the stream is running — only changed components restart.
 - **Pipeline never tears down on FFmpeg crash.** Each profile retries forever with backoff. Status flips to `degraded` after 3 consecutive crashes; flips back to `active` after a sustained run (>30s) or hot-restart.
 - **Multi-output toggle restarts running streams** — operator confirmation expected via UI before enabling on a busy server (~2-3s downtime per stream).
+- **ABR-copy / ABR-mixer streams without a downstream transcoder report empty `runtime.media`** — these paths bypass the manager (their pipeline is N in-process taps, not an ingest worker), so the per-input track tracker that fills "Input Media" / "Output Media" / "Input throughput" panels is not exercised. Enable a downstream transcoder if you need those metrics — that routes the stream through the normal ingest+transcode pipeline where tracking is wired (input tracks observed by the ingestor, output tracks derived from the transcoder ladder config).
 - **Build version** stamped at compile time (`make build` runs `git describe --tags --always --dirty`); exposed via `GET /config.version`.
 - **`build/reinstall.sh <tag>`** downloads + verifies + uninstalls + reinstalls a tagged release on Linux/systemd hosts. Data dir preserved.
