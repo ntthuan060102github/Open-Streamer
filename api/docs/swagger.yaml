@@ -611,6 +611,8 @@ definitions:
     type: object
   domain.EventType:
     enum:
+    - session.opened
+    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -627,8 +629,6 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
-    - session.opened
-    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -637,6 +637,8 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
+    - ""
+    - ""
     - ""
     - ""
     - ""
@@ -653,9 +655,9 @@ definitions:
     - ""
     - ""
     - ""
-    - ""
-    - ""
     x-enum-varnames:
+    - EventSessionOpened
+    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -672,8 +674,6 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
-    - EventSessionOpened
-    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -2307,11 +2307,23 @@ paths:
         name: rid
         required: true
         type: string
-      - description: Segment filename (e.g. 000000.ts)
+      - description: Segment filename (e.g. 000000.ts) or playlist.m3u8
         in: path
         name: file
         required: true
         type: string
+      - description: 'Timeshift: absolute start (RFC3339). Implies M3U8 dispatch'
+        in: query
+        name: from
+        type: string
+      - description: 'Timeshift: relative start (seconds from recording start)'
+        in: query
+        name: offset_sec
+        type: integer
+      - description: 'Timeshift: window length in seconds (default: all remaining)'
+        in: query
+        name: duration
+        type: integer
       produces:
       - application/octet-stream
       responses:
@@ -2323,7 +2335,7 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Serve DVR segment
+      summary: Serve recording file (segment or playlist; timeshift via query)
       tags:
       - recordings
   /recordings/{rid}/info:
@@ -2347,66 +2359,6 @@ paths:
           schema:
             $ref: '#/definitions/apidocs.ErrorBody'
       summary: DVR recording info
-      tags:
-      - recordings
-  /recordings/{rid}/playlist.m3u8:
-    get:
-      parameters:
-      - description: Recording ID (= stream code)
-        in: path
-        name: rid
-        required: true
-        type: string
-      produces:
-      - text/plain
-      responses:
-        "200":
-          description: M3U8 body
-          schema:
-            type: string
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Recording M3U8 playlist
-      tags:
-      - recordings
-  /recordings/{rid}/timeshift.m3u8:
-    get:
-      parameters:
-      - description: Recording ID (= stream code)
-        in: path
-        name: rid
-        required: true
-        type: string
-      - description: Absolute start time (RFC3339)
-        in: query
-        name: from
-        type: string
-      - description: Relative start offset in seconds from recording start
-        in: query
-        name: offset_sec
-        type: integer
-      - description: 'Window duration in seconds (default: all remaining)'
-        in: query
-        name: duration
-        type: integer
-      produces:
-      - text/plain
-      responses:
-        "200":
-          description: M3U8 body
-          schema:
-            type: string
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Timeshift VOD playlist
       tags:
       - recordings
   /sessions:

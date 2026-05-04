@@ -559,98 +559,6 @@ const docTemplate = `{
                 }
             }
         },
-        "/recordings/{rid}/playlist.m3u8": {
-            "get": {
-                "produces": [
-                    "text/plain"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Recording M3U8 playlist",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Recording ID (= stream code)",
-                        "name": "rid",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "M3U8 body",
-                        "schema": {
-                            "type": "string"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/recordings/{rid}/timeshift.m3u8": {
-            "get": {
-                "produces": [
-                    "text/plain"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Timeshift VOD playlist",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Recording ID (= stream code)",
-                        "name": "rid",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Absolute start time (RFC3339)",
-                        "name": "from",
-                        "in": "query"
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Relative start offset in seconds from recording start",
-                        "name": "offset_sec",
-                        "in": "query"
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Window duration in seconds (default: all remaining)",
-                        "name": "duration",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "M3U8 body",
-                        "schema": {
-                            "type": "string"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
         "/recordings/{rid}/{file}": {
             "get": {
                 "produces": [
@@ -659,7 +567,7 @@ const docTemplate = `{
                 "tags": [
                     "recordings"
                 ],
-                "summary": "Serve DVR segment",
+                "summary": "Serve recording file (segment or playlist; timeshift via query)",
                 "parameters": [
                     {
                         "type": "string",
@@ -670,10 +578,28 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Segment filename (e.g. 000000.ts)",
+                        "description": "Segment filename (e.g. 000000.ts) or playlist.m3u8",
                         "name": "file",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Timeshift: absolute start (RFC3339). Implies M3U8 dispatch",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Timeshift: relative start (seconds from recording start)",
+                        "name": "offset_sec",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Timeshift: window length in seconds (default: all remaining)",
+                        "name": "duration",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -2586,6 +2512,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2601,9 +2529,7 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error",
-                "session.opened",
-                "session.closed"
+                "transcoder.error"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2613,6 +2539,8 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -2628,11 +2556,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2648,9 +2576,7 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTranscoderError"
             ]
         },
         "domain.GlobalConfig": {

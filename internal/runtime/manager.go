@@ -214,6 +214,25 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 			return m.deps.APISrv.StartWithConfig(ctx, new.Server)
 		})
 
+	// Push the new listeners snapshot to ingestor + publisher BEFORE
+	// diffService can decide to restart them — each Run() reads the cached
+	// listeners value at startup, so the swap must happen before the new
+	// goroutine is spawned. When the listener config is unchanged this is
+	// a cheap atomic store; when it IS changed, diffService also restarts
+	// the service so the new bind address takes effect.
+	if configChanged(old.Listeners, new.Listeners) {
+		listeners := config.ListenersConfig{}
+		if new.Listeners != nil {
+			listeners = *new.Listeners
+		}
+		if m.deps.Ingestor != nil {
+			m.deps.Ingestor.SetListeners(listeners)
+		}
+		if m.deps.Publisher != nil {
+			m.deps.Publisher.SetListeners(listeners)
+		}
+	}
+
 	// Ingestor — owns the shared RTMP listener. Restart on changes to either
 	// IngestorConfig or listeners.RTMP, and treat the listener being enabled
 	// as sufficient reason to keep the service running even when IngestorConfig

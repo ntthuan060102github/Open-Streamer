@@ -56,7 +56,7 @@ func rtspLiveMountPath(code domain.StreamCode) string {
 // RunRTSPPlayServer starts the RTSP play listener.
 // Returns nil immediately when listeners.rtsp is disabled.
 func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
-	rtsp := s.listeners.RTSP
+	rtsp := s.currentListeners().RTSP
 	if !rtsp.Enabled || rtsp.Port == 0 {
 		close(s.rtspSrvReady)
 		return nil

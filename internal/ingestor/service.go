@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -43,8 +44,12 @@ type pullWorkerEntry struct {
 //   - Push inputs: stream key is registered in the push server routing table;
 //     the next encoder connection for that key is accepted and routed here.
 type Service struct {
-	cfg          config.IngestorConfig
-	listeners    config.ListenersConfig
+	cfg config.IngestorConfig
+	// listenersPtr holds the latest ListenersConfig. Stored atomically so
+	// SetListeners can hot-swap the value while Run reads it once at
+	// startup. Runtime.diff calls SetListeners THEN restarts the service
+	// so each new Run() observes the fresh config without a server reboot.
+	listenersPtr atomic.Pointer[config.ListenersConfig]
 	buf          *buffer.Service
 	bus          events.Bus
 	m            *metrics.Metrics
@@ -74,16 +79,36 @@ func New(i do.Injector) (*Service, error) {
 	m := do.MustInvoke[*metrics.Metrics](i)
 	vods := do.MustInvoke[*vod.Registry](i)
 
-	return &Service{
-		cfg:       cfg,
-		listeners: listeners,
-		buf:       buf,
-		bus:       bus,
-		m:         m,
-		vods:      vods,
-		registry:  NewRegistry(),
-		workers:   make(map[domain.StreamCode]*pullWorkerEntry),
-	}, nil
+	svc := &Service{
+		cfg:      cfg,
+		buf:      buf,
+		bus:      bus,
+		m:        m,
+		vods:     vods,
+		registry: NewRegistry(),
+		workers:  make(map[domain.StreamCode]*pullWorkerEntry),
+	}
+	svc.listenersPtr.Store(&listeners)
+	return svc, nil
+}
+
+// SetListeners hot-swaps the shared listeners config. The next invocation
+// of Run() reads the new value at the top of its body. An already-running
+// RTMP listener keeps the old bind address until runtime restarts the
+// ingestor service — see runtime.diff for the "SetListeners then restart"
+// sequencing.
+func (s *Service) SetListeners(l config.ListenersConfig) {
+	cp := l
+	s.listenersPtr.Store(&cp)
+}
+
+// currentListeners returns the latest ListenersConfig snapshot. Always
+// non-nil after construction.
+func (s *Service) currentListeners() config.ListenersConfig {
+	if p := s.listenersPtr.Load(); p != nil {
+		return *p
+	}
+	return config.ListenersConfig{}
 }
 
 // SetPacketObserver configures a callback invoked for each packet read.
@@ -143,9 +168,10 @@ func (s *Service) SetRTMPPlayHandler(fn push.PlayFunc) {
 func (s *Service) Run(ctx context.Context) error {
 	g, _ := errgroup.WithContext(ctx)
 
-	if s.listeners.RTMP.Enabled {
+	listeners := s.currentListeners()
+	if listeners.RTMP.Enabled {
 		rtmpSrv, err := push.NewRTMPServer(
-			rtmpListenAddr(s.listeners.RTMP),
+			rtmpListenAddr(listeners.RTMP),
 			s.registry,
 			func(ctx context.Context, streamID, bufferWriteID domain.StreamCode, input domain.Input) error {
 				return s.startPullWorker(ctx, streamID, input, bufferWriteID)

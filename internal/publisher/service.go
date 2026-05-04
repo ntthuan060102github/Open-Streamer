@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -76,13 +77,18 @@ type streamState struct {
 
 // Service manages all output workers for active streams.
 type Service struct {
-	cfg        config.PublisherConfig
-	listeners  config.ListenersConfig
-	buf        *buffer.Service
-	bus        events.Bus
-	tracker    sessions.Tracker
-	m          *metrics.Metrics
-	ffmpegPath string
+	cfg config.PublisherConfig
+	// listenersPtr holds the latest ListenersConfig. Stored atomically so
+	// SetListeners can hot-swap the value while RunRTSPPlayServer /
+	// RunSRTPlayServer reads it once at startup. Runtime.diff calls
+	// SetListeners THEN restarts the service so each new Run() observes the
+	// fresh config without a server reboot.
+	listenersPtr atomic.Pointer[config.ListenersConfig]
+	buf          *buffer.Service
+	bus          events.Bus
+	tracker      sessions.Tracker
+	m            *metrics.Metrics
+	ffmpegPath   string
 
 	// hlsFailoverGen: incremented on each input.failover so every ABR variant segmenter
 	// can tag exactly one EXT-X-DISCONTINUITY on its next flush.
@@ -146,7 +152,6 @@ func New(i do.Injector) (*Service, error) {
 
 	svc := &Service{
 		cfg:            pub,
-		listeners:      listeners,
 		buf:            buf,
 		bus:            bus,
 		tracker:        tracker,
@@ -162,6 +167,7 @@ func New(i do.Injector) (*Service, error) {
 		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
 		rtspSessions:   make(map[*gortsplib.ServerSession]*playSession),
 	}
+	svc.listenersPtr.Store(&listeners)
 	bus.Subscribe(domain.EventInputFailover, func(_ context.Context, e domain.Event) error {
 		svc.hlsFailoverMu.Lock()
 		svc.hlsFailoverGen[e.StreamCode]++
@@ -176,7 +182,7 @@ func New(i do.Injector) (*Service, error) {
 
 // NewServiceForTesting creates a Service without DI, for use in integration tests.
 func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus events.Bus) *Service {
-	return &Service{
+	svc := &Service{
 		cfg:            cfg,
 		buf:            buf,
 		bus:            bus,
@@ -191,12 +197,28 @@ func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus e
 		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
 		rtspSessions:   make(map[*gortsplib.ServerSession]*playSession),
 	}
+	svc.listenersPtr.Store(&config.ListenersConfig{})
+	return svc
 }
 
-// SetListenersForTesting overrides the shared listeners config without going
-// through DI. Use only from tests that exercise RunRTSPPlayServer / RunSRTPlayServer.
-func (s *Service) SetListenersForTesting(l config.ListenersConfig) {
-	s.listeners = l
+// SetListeners hot-swaps the shared listeners config. The next invocation
+// of RunRTSPPlayServer or RunSRTPlayServer will read the new value at the
+// top of its run loop. Already-running RTSP / SRT servers keep their old
+// bind address until runtime restarts them — see runtime.diff for the
+// "SetListeners then restart" sequencing.
+func (s *Service) SetListeners(l config.ListenersConfig) {
+	cp := l
+	s.listenersPtr.Store(&cp)
+}
+
+// currentListeners returns the latest ListenersConfig snapshot. Always
+// non-nil after construction (New + NewServiceForTesting initialise the
+// pointer with a zero-value or the constructor argument).
+func (s *Service) currentListeners() config.ListenersConfig {
+	if p := s.listenersPtr.Load(); p != nil {
+		return *p
+	}
+	return config.ListenersConfig{}
 }
 
 // cleanupAllOutputDirs wipes the HLS and DASH root directories on startup so

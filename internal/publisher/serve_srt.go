@@ -34,7 +34,7 @@ import (
 // RunSRTPlayServer starts the SRT play listener.
 // Returns nil immediately when listeners.srt is disabled.
 func (s *Service) RunSRTPlayServer(ctx context.Context) error {
-	srtCfg := s.listeners.SRT
+	srtCfg := s.currentListeners().SRT
 	if !srtCfg.Enabled || srtCfg.Port == 0 {
 		return nil
 	}

@@ -137,9 +137,12 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	r.Route("/recordings/{rid}", func(r chi.Router) {
 		r.Get("/", s.recordingH.Get)
 		r.Get("/info", s.recordingH.Info)
-		r.Get("/playlist.m3u8", s.recordingH.Playlist)
-		r.Get("/timeshift.m3u8", s.recordingH.Timeshift)
-		r.Get("/{file}", s.recordingH.ServeSegment)
+		// /{file} handles BOTH segments (*.ts) and playlist (*.m3u8).
+		// When the request is for an m3u8 AND has from / offset_sec query
+		// params, the handler builds a dynamic timeshift slice instead of
+		// serving playlist.m3u8 from disk. The legacy /playlist.m3u8 and
+		// /timeshift.m3u8 routes were removed in favour of this dispatch.
+		r.Get("/{file}", s.recordingH.ServeFile)
 	})
 
 	r.Route("/hooks", func(r chi.Router) {
