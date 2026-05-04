@@ -135,12 +135,17 @@ func TestCopyReader_DropsTSOnlyPackets(t *testing.T) {
 	require.Empty(t, got, "TS-only packets are dropped silently")
 }
 
-// Buffer.Delete only removes the buffer entry; it does NOT close existing
-// subscriber channels. So an upstream tear-down does not surface as EOF
-// here — the manager's packet-timeout machinery is what triggers failover
-// for an upstream that went silent. We document the contract: ReadPackets
-// keeps blocking on the subscriber until ctx is cancelled.
-func TestCopyReader_BlocksAfterUpstreamDeleted(t *testing.T) {
+// Buffer.Delete now closes every subscriber channel before removing the
+// map entry — this is the contract the mixer / copy reconnect logic
+// depends on. So an upstream tear-down surfaces as EOF immediately and
+// downstream readers can decide to retry against the freshly-created
+// upstream buffer instead of staying blocked forever on a stale ringBuffer.
+//
+// The previous design left subscribers dangling and relied on the manager's
+// packet-timeout to eventually fail the stream over; that worked for normal
+// pipelines but broke ABR mixer/copy because their tap goroutines never see
+// the timeout signal (it's reported up to the manager, not down to taps).
+func TestCopyReader_ReturnsEOFAfterUpstreamDeleted(t *testing.T) {
 	t.Parallel()
 	bs := buffer.NewServiceForTesting(8)
 	bs.Create("up")
@@ -153,11 +158,11 @@ func TestCopyReader_BlocksAfterUpstreamDeleted(t *testing.T) {
 
 	bs.Delete("up")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_, err = r.ReadPackets(ctx)
-	require.ErrorIs(t, err, context.DeadlineExceeded,
-		"reader must block until ctx fires; manager handles upstream-gone via packet timeout")
+	require.ErrorIs(t, err, io.EOF,
+		"upstream Delete must surface as EOF so downstream can reconnect")
 }
 
 // Explicit subscriber unsubscribe (rare path — coordinator teardown could

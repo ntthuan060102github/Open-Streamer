@@ -162,6 +162,35 @@ func TestServiceDeleteRemovesBuffer(t *testing.T) {
 	}
 }
 
+// TestServiceDeleteUnsubscribesConsumers regression-tests the fix for the
+// mixer-survives-upstream-restart bug. Delete used to remove the map entry
+// while leaving subscriber channels open, which left mixer/copy taps blocked
+// on Recv() forever — when the upstream came back the new ringBuffer was a
+// different instance, so taps never saw the new packets and the downstream
+// stream went silently dead.
+//
+// Contract: Delete MUST close every subscriber channel before removing the
+// map entry, so consumers observe ok=false and can decide to reconnect.
+func TestServiceDeleteUnsubscribesConsumers(t *testing.T) {
+	s := NewServiceForTesting(4)
+	s.Create(testStream)
+	sub, err := s.Subscribe(testStream)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	s.Delete(testStream)
+
+	select {
+	case _, ok := <-sub.Recv():
+		if ok {
+			t.Fatal("expected channel close after Delete, got a packet")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Delete did not close the subscriber channel — mixer/copy taps would block forever on upstream restart")
+	}
+}
+
 func TestServiceCreateIsIdempotent(t *testing.T) {
 	s := NewServiceForTesting(4)
 	s.Create(testStream)

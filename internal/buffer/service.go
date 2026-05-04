@@ -173,14 +173,23 @@ func (s *Service) Unsubscribe(id domain.StreamCode, sub *Subscriber) {
 	}
 }
 
-// Delete removes the ring buffer for a stream (call when stream is stopped).
-// Existing subscribers stay blocked on their channels — Delete only removes
-// the map entry. Use UnsubscribeAll first if consumers must detect the
-// teardown via Recv-close.
+// Delete tears down the ring buffer for a stream (call when stream is stopped).
+// Closes every subscriber's channel BEFORE removing the map entry so consumers
+// observe a clean EOF (`pkt, ok := <-sub.Recv(); !ok`) and can react — the
+// mixer / copy taps in particular rely on this signal to retry against the
+// freshly-created buffer when an upstream stream restarts. Without the
+// channel-close, taps stay blocked on a stale ringBuffer indefinitely while
+// the new ringBuffer for the same id receives packets they never see.
 func (s *Service) Delete(id domain.StreamCode) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.buffers, id)
+	rb, ok := s.buffers[id]
+	if ok {
+		delete(s.buffers, id)
+	}
+	s.mu.Unlock()
+	if ok {
+		rb.unsubscribeAll()
+	}
 }
 
 // UnsubscribeAll closes every subscriber's channel for the given buffer.
