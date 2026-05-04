@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -163,6 +164,59 @@ func TestABRMixer_TapStopsOnContextCancel(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Stop did not return — taps did not honour ctx cancellation")
 	}
+}
+
+// TestStartABRMixerConcurrentStartIsIdempotent regression-tests the race
+// where two callers both pass the unlocked IsRunning check, both reach
+// startABRMixer, and the second caller's pub.Start fails with
+// "stream already running" while the rollback path then deletes the
+// rendition buffers the first start was using — observed in production
+// as paired errors:
+//
+//	"abr mixer publisher: publisher: stream X already running"
+//	"HLS ABR subscribe failed: buffer ... not found"
+//
+// The fix serialises startABRMixer on c.abrMu so concurrent callers see
+// a consistent state: first one wins, the rest no-op.
+func TestStartABRMixerConcurrentStartIsIdempotent(t *testing.T) {
+	t.Parallel()
+	abr := abrUpstream(2)
+	audio := &domain.Stream{Code: "radio"}
+	h := newABRHarness(t, abr, audio)
+	defer h.coord.Stop(context.Background(), "mix")
+
+	const callers = 10
+	dn := mixerDownstream("up", "radio")
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			errs <- h.coord.Start(context.Background(), dn)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err, "concurrent Start must be idempotent (no errors)")
+	}
+
+	// pub.Start must have been called exactly once across all racers.
+	h.capPub.mu.Lock()
+	pubStarts := len(h.capPub.started)
+	h.capPub.mu.Unlock()
+	assert.Equal(t, 1, pubStarts, "pub.Start should run once; got %d", pubStarts)
+
+	// Rendition buffers must still exist (no rollback misfire).
+	for i := 0; i < 2; i++ {
+		bid := buffer.RenditionBufferID("mix", buffer.VideoTrackSlug(i))
+		_, err := h.buf.Subscribe(bid)
+		assert.NoError(t, err, "rendition buffer track_%d must survive concurrent Start", i+1)
+	}
+
+	assert.True(t, h.coord.IsRunning("mix"))
 }
 
 // ─── runtime status ──────────────────────────────────────────────────────────

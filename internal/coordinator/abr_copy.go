@@ -127,7 +127,20 @@ func mirrorTranscoderForCopy(src *domain.TranscoderConfig) *domain.TranscoderCon
 //     its matching downstream rendition.
 //
 // On any setup failure rolls back partial state in reverse order.
+// Concurrency: holds c.abrMu for the entire body so two callers racing on
+// the same downstream.Code can't both reach pub.Start. See startABRMixer
+// for the full rationale — the same race manifested there with
+// "publisher: stream X already running" and downstream subscribe failures
+// when the rollback path deleted buffers the first start was using.
 func (c *Coordinator) startABRCopy(ctx context.Context, downstream, upstream *domain.Stream) error {
+	c.abrMu.Lock()
+	defer c.abrMu.Unlock()
+
+	// Idempotent guard against the unlocked IsRunning → startABRCopy gap.
+	if _, exists := c.abrCopies[downstream.Code]; exists {
+		return nil
+	}
+
 	upRends := buffer.RenditionsForTranscoder(upstream.Code, upstream.Transcoder)
 	if len(upRends) == 0 {
 		return fmt.Errorf("coordinator: abr copy: upstream %q has no rendition ladder", upstream.Code)
@@ -160,9 +173,7 @@ func (c *Coordinator) startABRCopy(ctx context.Context, downstream, upstream *do
 	wg := &sync.WaitGroup{}
 	entry := &abrCopyEntry{cancel: cancel, wg: wg, slugs: slugs, upstream: upstream.Code}
 
-	c.abrMu.Lock()
 	c.abrCopies[downstream.Code] = entry
-	c.abrMu.Unlock()
 
 	for i := range downRends {
 		wg.Add(1)

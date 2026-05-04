@@ -99,7 +99,31 @@ func (c *Coordinator) detectABRMixer(s *domain.Stream) (videoUp, audioUp *domain
 //  3. start the publisher (it'll subscribe to the rendition buffers);
 //  4. spawn N video tap goroutines (one per upstream rung) + 1 audio
 //     fan-out goroutine.
+//
+// Concurrency: holds c.abrMu for the entire body so two callers racing on
+// the same downstream.Code can't both reach pub.Start. The previous design
+// stored the c.abrMixers entry only AFTER pub.Start returned, leaving a
+// window where a concurrent Start would pass IsRunning, attempt pub.Start,
+// fail with "already running", and then the rollback path would delete
+// the rendition buffers the FIRST start's HLS goroutines were about to
+// subscribe to — manifesting as both
+// "publisher: stream X already running" and
+// "publisher: HLS ABR subscribe failed: buffer ... not found".
+//
+// Holding the lock for the duration is acceptable because mixer pipeline
+// setup is a config-time operation, not a hot path.
 func (c *Coordinator) startABRMixer(ctx context.Context, downstream, videoUp, audioUp *domain.Stream) error {
+	c.abrMu.Lock()
+	defer c.abrMu.Unlock()
+
+	// Re-check idempotency under the lock. Caller (Coordinator.Start) does
+	// an unlocked IsRunning check; a concurrent caller could have stored
+	// the entry between that check and us. Treat a concurrent successful
+	// start as a no-op rather than retrying.
+	if _, exists := c.abrMixers[downstream.Code]; exists {
+		return nil
+	}
+
 	upRends := buffer.RenditionsForTranscoder(videoUp.Code, videoUp.Transcoder)
 	if len(upRends) == 0 {
 		return fmt.Errorf("coordinator: abr mixer: video upstream %q has no rendition ladder", videoUp.Code)
@@ -138,9 +162,7 @@ func (c *Coordinator) startABRMixer(ctx context.Context, downstream, videoUp, au
 		audioUpstream: audioUp.Code,
 	}
 
-	c.abrMu.Lock()
 	c.abrMixers[downstream.Code] = entry
-	c.abrMu.Unlock()
 
 	// N video tap goroutines.
 	for i := range downRends {
