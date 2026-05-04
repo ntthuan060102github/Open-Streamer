@@ -63,29 +63,82 @@ type abrMixerEntry struct {
 // orders of magnitude larger than any realistic skew.
 const ptsRebaserBaseMs int64 = 1000
 
+// ptsRebaserPauseGapMs is the wall-clock gap above which we suspect the
+// source paused (silent audio source, encoder hiccup, network reorder buffer
+// drained). When true, we re-anchor the rebaser to the current wall-clock so
+// output PTS doesn't drift behind — without this, audio with frequent micro-
+// pauses falls 10s+ behind video over a 10-minute session and the player
+// either buffers indefinitely or refuses to A/V sync.
+const ptsRebaserPauseGapMs int64 = 500
+
+// ptsRebaserPauseSrcDeltaSlackMs is the headroom subtracted from the wall-
+// clock gap when comparing against source PTS delta. A real pause means the
+// source produced almost nothing during the wall-clock gap; a packet that
+// merely arrived a bit late (network jitter) will have srcDelta close to
+// wallDelta. This slack avoids re-anchoring on normal jitter.
+const ptsRebaserPauseSrcDeltaSlackMs int64 = 200
+
 // ptsRebaser maps an upstream's PTS/DTS sequence onto a shared wall-clock
 // timeline. The first packet of each cycle anchors itself at the elapsed
 // wall-clock time since t0; subsequent packets preserve their original
 // inter-frame deltas. One instance per source per forward cycle — re-creating
 // it on reconnect is what stitches a restarted upstream's new PCR base back
 // into a continuous downstream timeline.
+//
+// The rebaser also re-anchors mid-cycle when it detects a long pause in the
+// source — see apply() for the pause-detection rule. On every re-anchor (cycle
+// start OR pause re-anchor) the packet is marked Discontinuity so the
+// downstream HLS segmenter inserts #EXT-X-DISCONTINUITY and the player handles
+// the PTS jump cleanly instead of stuttering.
 type ptsRebaser struct {
 	t0           time.Time
 	has          bool
 	firstPTS     uint64
 	firstDTS     uint64
 	wallOffsetMs int64
+	lastSrcPTS   uint64 // for pause detection
+	lastWallMs   int64
 }
 
 // apply rewrites p.PTSms / p.DTSms in place. Signed math + base offset
 // tolerate B-frame DTS<PTS, out-of-order packets, and packets briefly
 // preceding the anchor without uint underflow.
+//
+// Re-anchor conditions:
+//   - First packet of cycle (cold start or post-reconnect)
+//   - Wall-clock gap since last packet > ptsRebaserPauseGapMs AND source PTS
+//     advanced by less than (gap - slack) — i.e., source paused while wall-
+//     clock kept moving, so we slide the anchor forward to current wall-clock
+//     to keep output PTS aligned with real time
+//
+// On any re-anchor the packet's Discontinuity flag is set so the segmenter
+// emits an EXT-X-DISCONTINUITY for the resulting PTS jump.
 func (r *ptsRebaser) apply(p *domain.AVPacket) {
+	nowMs := time.Since(r.t0).Milliseconds()
 	if !r.has {
+		// First packet of cycle. Mark Discontinuity so reconnect-driven PTS
+		// jumps surface as an EXT-X-DISCONTINUITY in the HLS playlist; for
+		// the very first segment of life this is a harmless extra tag.
+		p.Discontinuity = true
 		r.firstPTS = p.PTSms
 		r.firstDTS = p.DTSms
-		r.wallOffsetMs = time.Since(r.t0).Milliseconds() + ptsRebaserBaseMs
+		r.wallOffsetMs = nowMs + ptsRebaserBaseMs
+		r.lastSrcPTS = p.PTSms
+		r.lastWallMs = nowMs
 		r.has = true
+	} else {
+		wallDelta := nowMs - r.lastWallMs
+		srcDelta := int64(p.PTSms) - int64(r.lastSrcPTS)
+		if wallDelta > ptsRebaserPauseGapMs &&
+			srcDelta < wallDelta-ptsRebaserPauseSrcDeltaSlackMs {
+			// Source fell behind wall-clock — re-anchor + signal discontinuity.
+			p.Discontinuity = true
+			r.firstPTS = p.PTSms
+			r.firstDTS = p.DTSms
+			r.wallOffsetMs = nowMs + ptsRebaserBaseMs
+		}
+		r.lastSrcPTS = p.PTSms
+		r.lastWallMs = nowMs
 	}
 	p.PTSms = uint64(r.wallOffsetMs + (int64(p.PTSms) - int64(r.firstPTS)))
 	p.DTSms = uint64(r.wallOffsetMs + (int64(p.DTSms) - int64(r.firstDTS)))

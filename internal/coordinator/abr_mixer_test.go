@@ -314,3 +314,53 @@ func TestPTSRebaser_HandlesOutOfOrderBelowAnchor(t *testing.T) {
 	require.Less(t, reordered.DTSms, uint64(1<<40),
 		"DTS must not underflow to a giant uint64; got %d", reordered.DTSms)
 }
+
+// First packet of a cycle must be marked Discontinuity so the HLS segmenter
+// inserts EXT-X-DISCONTINUITY — without this, reconnect-driven PTS jumps
+// would surface as a player stutter instead of a clean discontinuity.
+func TestPTSRebaser_FirstPacketSignalsDiscontinuity(t *testing.T) {
+	t.Parallel()
+	r := ptsRebaser{t0: time.Now()}
+	p := domain.AVPacket{PTSms: 1_000, DTSms: 1_000}
+	r.apply(&p)
+	require.True(t, p.Discontinuity, "first-of-cycle packet must mark Discontinuity")
+}
+
+// Steady-state packets (no pause) must NOT be marked Discontinuity — that
+// would over-fragment the playlist with spurious EXT-X-DISCONTINUITY tags.
+func TestPTSRebaser_SteadyStatePreservesDiscontinuityFalse(t *testing.T) {
+	t.Parallel()
+	r := ptsRebaser{t0: time.Now()}
+	first := domain.AVPacket{PTSms: 1_000, DTSms: 1_000}
+	r.apply(&first)
+
+	// Wait < pause threshold then send a packet whose PTS advanced normally.
+	time.Sleep(50 * time.Millisecond)
+	steady := domain.AVPacket{PTSms: 1_050, DTSms: 1_050}
+	r.apply(&steady)
+
+	require.False(t, steady.Discontinuity, "steady-state packet must not be marked Discontinuity")
+}
+
+// Source pause (wall-clock advances but source PTS doesn't) triggers a re-
+// anchor + Discontinuity marker. Without this, audio with frequent micro-
+// pauses falls behind video and the player can't A/V sync.
+func TestPTSRebaser_PauseTriggersReanchorAndDiscontinuity(t *testing.T) {
+	t.Parallel()
+	r := ptsRebaser{t0: time.Now()}
+	first := domain.AVPacket{PTSms: 1_000, DTSms: 1_000}
+	r.apply(&first)
+	firstOut := first.PTSms
+
+	// Simulate a long pause: wall-clock advances 600 ms, source PTS only 10 ms.
+	time.Sleep(600 * time.Millisecond)
+	resumed := domain.AVPacket{PTSms: 1_010, DTSms: 1_010}
+	r.apply(&resumed)
+
+	require.True(t, resumed.Discontinuity,
+		"pause-then-resume must signal Discontinuity for downstream EXT-X-DISCONTINUITY")
+	// After re-anchor, output PTS should jump forward to track wall-clock —
+	// at least past first's output + the wall-clock pause we slept through.
+	require.GreaterOrEqual(t, resumed.PTSms, firstOut+500,
+		"after re-anchor, output PTS must catch up to wall-clock")
+}
