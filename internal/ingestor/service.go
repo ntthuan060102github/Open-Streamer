@@ -173,9 +173,6 @@ func (s *Service) Run(ctx context.Context) error {
 		rtmpSrv, err := push.NewRTMPServer(
 			rtmpListenAddr(listeners.RTMP),
 			s.registry,
-			func(ctx context.Context, streamID, bufferWriteID domain.StreamCode, input domain.Input) error {
-				return s.startPullWorker(ctx, streamID, input, bufferWriteID)
-			},
 		)
 		if err != nil {
 			return fmt.Errorf("ingestor: create rtmp server: %w", err)

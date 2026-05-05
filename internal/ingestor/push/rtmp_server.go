@@ -1,446 +1,298 @@
 package push
 
-// rtmp_server.go — RTMP push-ingest server using gomedia.
+// rtmp_server.go — RTMP push-ingest server using lal/pkg/rtmp.
 //
-// Architecture: each encoder pushes to this server (publish mode). When a
-// publisher is accepted, we start an internal RTMP pull worker that connects
-// back to this server in play mode. The stable joy4-based RTMPReader handles
-// all codec conversions and buffer writes — the same code path as a normal
-// pull ingest.
+// Architecture (Path B — no loopback): each encoder pushes to this server
+// in publish mode. The server's lal session decodes RTMP chunks into
+// `base.RtmpMsg` values, which we convert in place to domain.AVPacket via
+// pull.RTMPMsgConverter and write directly into the Buffer Hub.
 //
-//   Encoder ──RTMP push──► RTMPServer (gomedia)
-//                                 │ dispatch goroutine
-//                                 ▼
-//                          rtmpSub.run() ──RTMP play──► joy4 RTMPReader
-//                                                             │
-//                                                             ▼
-//                                                        Buffer Hub
+//   Encoder ──RTMP push──► lal.Server (in this file)
+//                              │ OnReadRtmpAvMsg(RtmpMsg)
+//                              ▼
+//                         RTMPMsgConverter (shared with pull reader)
+//                              │
+//                              ▼
+//                         buffer.Service.Write(bufID, Packet{AV: ...})
+//
+// External RTMP play clients (VLC / ffplay / OBS preview) connect to the
+// same TCP port; lal raises OnNewRtmpSubSession which delegates to the
+// publisher-side PlayFunc — see internal/publisher/serve_rtmp.go for the
+// reader-side that streams from the buffer hub into the lal session.
+//
+// Lifecycle:
+//
+//   - NewRTMPServer(addr, registry, buf): construct, no I/O yet.
+//   - SetPlayFunc(fn): optional, register external play handler.
+//   - Run(ctx): bind listener, accept connections until ctx is cancelled.
+//
+// Each ServerSession runs on its own goroutine inside lal; our callbacks
+// (OnReadRtmpAvMsg for pubs, the PlayFunc loop for subs) execute on those
+// goroutines and must be cheap. Heavy work (codec config parsing,
+// buffer-hub fan-out) happens inside RTMPMsgConverter / buffer.Service
+// which are designed for concurrent callers.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"sync"
 
-	gocodec "github.com/yapingcat/gomedia/go-codec"
-	gortmp "github.com/yapingcat/gomedia/go-rtmp"
+	"github.com/q191201771/lal/pkg/base"
+	"github.com/q191201771/lal/pkg/rtmp"
 
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 )
 
-// ConnectFunc is invoked when an encoder starts publishing a registered stream.
-// The implementation should call ingestor.Service.startPullWorker for the
-// given input (which points to this server's play endpoint).
-type ConnectFunc func(ctx context.Context, streamID, bufferWriteID domain.StreamCode, input domain.Input) error
-
-// PlayFunc is invoked when an external play client connects for a key that has
-// no active ingest relay. It should stream frames to the client via writeFrame
-// until ctx is cancelled or an error occurs. Return a non-nil error only when
-// the stream is not available (causes the client to receive NOTFOUND).
+// PlayFunc is invoked when an external play client connects to the RTMP
+// server. Implementations should subscribe to the Buffer Hub for `key`
+// and feed the lal session frames until ctx is cancelled or the session
+// disconnects.
 //
-// info carries per-connection metadata captured at OnPlay handshake time.
-// Callers that don't care can ignore it; current consumer is the play-sessions
-// tracker.
-type PlayFunc func(ctx context.Context, key string, info PlayInfo, writeFrame func(cid gocodec.CodecID, data []byte, pts, dts uint32) error) error
+// Returning a non-nil error causes the session to be torn down with a
+// "stream not found" status code.
+type PlayFunc func(ctx context.Context, key string, info PlayInfo, session *rtmp.ServerSession) error
 
 // PlayInfo describes the remote peer of an external RTMP play client.
 type PlayInfo struct {
-	// RemoteAddr is the peer's "ip:port" string from the underlying TCP conn.
+	// RemoteAddr is the peer's "ip:port" string from the underlying TCP
+	// connection. Useful for the play-sessions tracker / abuse mitigation.
 	RemoteAddr string
-	// FlashVer is the client-supplied "flashVer" from the RTMP connect command.
-	// Loosely equivalent to a User-Agent — populated by VLC, ffplay, OBS etc.
-	FlashVer string
 }
 
 // RTMPServer accepts RTMP push connections from encoders, validates them
-// against the push Registry, and relays each live stream to an internal
-// RTMP play subscriber (joy4 RTMPReader) via a loopback connection.
-// External play clients (VLC, ffplay) are served via an optional PlayFunc.
+// against the push Registry, and writes decoded AVPackets into the Buffer
+// Hub. External RTMP play clients are served via the optional PlayFunc.
 type RTMPServer struct {
-	addr      string
-	port      string // port extracted from addr, used to build loopback pull URL
-	registry  Registry
-	onConnect ConnectFunc
+	addr     string
+	registry Registry
 
 	mu       sync.Mutex
-	hub      map[string]*rtmpRelay // stream key → active relay
-	playFunc PlayFunc              // optional; serves external play clients
+	pubs     map[*rtmp.ServerSession]*pubState
+	subs     map[*rtmp.ServerSession]*subState
+	playFunc PlayFunc
+
+	server *rtmp.Server
+}
+
+// pubState is the per-publish-session bookkeeping: codec converter +
+// buffer hub target + Discontinuity flag for the first frame after a
+// reconnect.
+type pubState struct {
+	key           string
+	bufferWriteID domain.StreamCode
+	streamID      domain.StreamCode
+	buf           *buffer.Service
+
+	converter   *pull.RTMPMsgConverter
+	firstPacket bool
+}
+
+// subState is the per-play-session bookkeeping: cancel func to stop the
+// PlayFunc goroutine when the session ends.
+type subState struct {
+	cancel context.CancelFunc
+}
+
+// NewRTMPServer creates an RTMPServer. `addr` is the TCP bind address
+// (e.g. ":1935"). `registry` resolves push keys to buffer hub targets.
+func NewRTMPServer(addr string, registry Registry) (*RTMPServer, error) {
+	return &RTMPServer{
+		addr:     addr,
+		registry: registry,
+		pubs:     make(map[*rtmp.ServerSession]*pubState),
+		subs:     make(map[*rtmp.ServerSession]*subState),
+	}, nil
 }
 
 // SetPlayFunc registers a handler for external RTMP play clients.
-// Must be called before Run. Safe to call concurrently.
+// Safe to call concurrently with Run.
 func (s *RTMPServer) SetPlayFunc(fn PlayFunc) {
 	s.mu.Lock()
 	s.playFunc = fn
 	s.mu.Unlock()
 }
 
-// NewRTMPServer creates an RTMPServer. addr is the TCP bind address (e.g. ":1935").
-func NewRTMPServer(addr string, registry Registry, onConnect ConnectFunc) (*RTMPServer, error) {
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("rtmp server: invalid addr %q: %w", addr, err)
-	}
-	return &RTMPServer{
-		addr:      addr,
-		port:      port,
-		registry:  registry,
-		onConnect: onConnect,
-		hub:       make(map[string]*rtmpRelay),
-	}, nil
-}
-
-// Run binds the TCP listener and accepts RTMP connections until ctx is cancelled.
+// Run binds the TCP listener and accepts RTMP connections until ctx is
+// cancelled. lal's RunLoop blocks until the listener closes; we close
+// the listener via Dispose() when ctx fires so RunLoop returns nil.
 func (s *RTMPServer) Run(ctx context.Context) error {
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.addr)
-	if err != nil {
+	srv := rtmp.NewServer(s.addr, s)
+	s.mu.Lock()
+	s.server = srv
+	s.mu.Unlock()
+
+	if err := srv.Listen(); err != nil {
 		return fmt.Errorf("rtmp server: listen %q: %w", s.addr, err)
 	}
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
 	slog.Info("rtmp server: listening", "addr", s.addr)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-				return fmt.Errorf("rtmp server: accept: %w", err)
-			}
-		}
-		go s.handleConn(ctx, conn)
-	}
-}
 
-func (s *RTMPServer) getRelay(key string) *rtmpRelay {
-	s.mu.Lock()
-	r := s.hub[key]
-	s.mu.Unlock()
-	return r
-}
-
-func (s *RTMPServer) setRelay(key string, r *rtmpRelay) {
-	s.mu.Lock()
-	s.hub[key] = r
-	s.mu.Unlock()
-}
-
-func (s *RTMPServer) deleteRelay(key string) {
-	s.mu.Lock()
-	delete(s.hub, key)
-	s.mu.Unlock()
-}
-
-// handleConn drives a single TCP connection. It can be either a publisher
-// (encoder pushing a stream), an internal joy4 pull worker, or an external
-// play client served by the registered PlayFunc.
-//
-// recover guard: gomedia's AMF/chunk parser panics on malformed input from
-// untrusted RTMP peers (e.g. "unsupport amf type N"). One bad publisher would
-// otherwise crash the entire server. We log + close the connection instead.
-func (s *RTMPServer) handleConn(ctx context.Context, conn net.Conn) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("rtmp server: connection handler panic recovered",
-				"remote", conn.RemoteAddr().String(),
-				"err", r,
-			)
-			_ = conn.Close()
+	// Watchdog: close the listener on context cancellation so RunLoop
+	// unblocks. Spawned before RunLoop so it's already armed when accepts
+	// start coming in.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			srv.Dispose()
+		case <-done:
 		}
 	}()
-	// connCtx is cancelled when this connection closes, stopping any play session.
-	connCtx, connCancel := context.WithCancel(ctx)
-	defer connCancel()
 
-	handle := gortmp.NewRtmpServerHandle()
-	handle.SetOutput(func(b []byte) error {
-		_, err := conn.Write(b)
-		return err
-	})
+	err := srv.RunLoop()
+	close(done)
+	if ctx.Err() != nil {
+		//nolint:nilerr // listener was closed by our watchdog on ctx.Done — shutdown, not failure.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("rtmp server: run loop: %w", err)
+	}
+	return nil
+}
 
-	// Track whether this connection ended up as a publisher.
-	var (
-		isPublish  bool
-		publishKey string
-		relay      *rtmpRelay
+// ─── lal IServerObserver ────────────────────────────────────────────────
+
+// OnRtmpConnect is invoked once per accepted TCP connection at the end of
+// the RTMP `connect` command. We log the remote app/tcUrl combo for ops
+// and don't reject anything here — rejections happen at OnNewRtmpPubSession
+// / OnNewRtmpSubSession when we know whether the key is registered.
+func (s *RTMPServer) OnRtmpConnect(session *rtmp.ServerSession, _ rtmp.ObjectPairArray) {
+	slog.Debug("rtmp server: client connected",
+		"remote", session.GetStat().RemoteAddr,
+		"app", session.AppName(),
 	)
+}
 
-	handle.OnPublish(func(app, key string) gortmp.StatusCode {
-		bufWriteID, streamID, _, err := s.registry.Acquire(key)
-		if err != nil {
-			slog.Warn("rtmp server: rejected publisher", "key", key, "err", err)
-			return gortmp.NETSTREAM_CONNECT_REJECTED
-		}
-
-		r := newRTMPRelay(key, streamID)
-		s.setRelay(key, r)
-
-		// Start the internal pull worker. It will dial this same server in play
-		// mode and feed packets into the buffer via the stable RTMPReader path.
-		pullURL := fmt.Sprintf("rtmp://localhost:%s/live/%s", s.port, key)
-		if err := s.onConnect(ctx, streamID, bufWriteID, domain.Input{URL: pullURL}); err != nil {
-			slog.Error("rtmp server: start pull worker failed", "key", key, "err", err)
-			s.deleteRelay(key)
-			s.registry.Release(key)
-			return gortmp.NETSTREAM_CONNECT_REJECTED
-		}
-
-		r.start()
-
-		// Wire incoming frames to the relay dispatch channel.
-		handle.OnFrame(func(cid gocodec.CodecID, pts, dts uint32, frame []byte) {
-			data := make([]byte, len(frame))
-			copy(data, frame)
-			select {
-			case r.frames <- &rtmpFrame{cid: cid, pts: pts, dts: dts, data: data}:
-			default:
-				// Drop frame if the relay is falling behind.
-			}
-		})
-
-		isPublish = true
-		publishKey = key
-		relay = r
-
-		slog.Info("rtmp server: publisher connected", "key", key, "stream_id", streamID)
-		return gortmp.NETSTREAM_PUBLISH_START
-	})
-
-	handle.OnPlay(func(app, key string, start, duration float64, reset bool) gortmp.StatusCode {
-		// Accept play if there is an active ingest relay OR a play handler is registered.
-		if s.getRelay(key) != nil {
-			return gortmp.NETSTREAM_PLAY_START
-		}
-		s.mu.Lock()
-		fn := s.playFunc
-		s.mu.Unlock()
-		if fn != nil {
-			return gortmp.NETSTREAM_PLAY_START
-		}
-		slog.Warn("rtmp server: play rejected, stream not active", "key", key)
-		return gortmp.NETSTREAM_PLAY_NOTFOUND
-	})
-
-	handle.OnStateChange(func(newState gortmp.RtmpState) {
-		if newState != gortmp.STATE_RTMP_PLAY_START {
-			return
-		}
-		key := handle.GetStreamName()
-
-		// Internal joy4 loopback pull → serve via relay.
-		r := s.getRelay(key)
-		if r != nil {
-			sub := newRTMPSub(conn, handle)
-			r.addSub(sub)
-			go func() {
-				sub.run()
-				r.removeSub(sub)
-			}()
-			return
-		}
-
-		// External play client → serve via PlayFunc.
-		s.mu.Lock()
-		fn := s.playFunc
-		s.mu.Unlock()
-		if fn == nil {
-			_ = conn.Close()
-			return
-		}
-		slog.Info("rtmp server: external play client connected", "key", key)
-		// FlashVer would need a patched gomedia to expose — left empty for
-		// now. RemoteAddr alone is enough to populate the sessions tracker.
-		info := PlayInfo{RemoteAddr: conn.RemoteAddr().String()}
-		go func() {
-			err := fn(connCtx, key, info, func(cid gocodec.CodecID, data []byte, pts, dts uint32) error {
-				return handle.WriteFrame(cid, data, pts, dts)
-			})
-			if err != nil {
-				slog.Debug("rtmp server: play session ended", "key", key, "err", err)
-				_ = conn.Close()
-			}
-		}()
-	})
-
-	buf := make([]byte, 65536)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			break
-		}
-		if err := handle.Input(buf[:n]); err != nil {
-			slog.Warn("rtmp server: handle input error", "err", err)
-			break
-		}
+// OnNewRtmpPubSession is invoked when an encoder issues a `publish`
+// command. We acquire the registry slot for the stream key and wire the
+// session's AV-message observer to feed our converter.
+//
+// Returning an error rejects the session — lal sends a NetStream.Publish.BadName
+// status code and tears down the connection.
+func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
+	key := session.StreamName()
+	bufWriteID, streamID, buf, err := s.registry.Acquire(key)
+	if err != nil {
+		slog.Warn("rtmp server: rejected publisher",
+			"key", key,
+			"remote", session.GetStat().RemoteAddr,
+			"err", err,
+		)
+		return err
 	}
-	_ = conn.Close()
 
-	if isPublish {
-		if relay != nil {
-			relay.stop() // closes subscriber conns so joy4 gets EOF
-			s.deleteRelay(publishKey)
+	state := &pubState{
+		key:           key,
+		bufferWriteID: bufWriteID,
+		streamID:      streamID,
+		buf:           buf,
+		converter:     pull.NewRTMPMsgConverter(),
+		firstPacket:   true,
+	}
+	session.SetPubSessionObserver(state)
+
+	s.mu.Lock()
+	s.pubs[session] = state
+	s.mu.Unlock()
+
+	slog.Info("rtmp server: publisher accepted",
+		"key", key, "stream_id", streamID,
+		"remote", session.GetStat().RemoteAddr,
+	)
+	return nil
+}
+
+// OnDelRtmpPubSession is invoked when a publish session ends (encoder
+// disconnect, network error, server shutdown). Releases the registry
+// slot so the next pusher can claim the key.
+func (s *RTMPServer) OnDelRtmpPubSession(session *rtmp.ServerSession) {
+	s.mu.Lock()
+	state, ok := s.pubs[session]
+	delete(s.pubs, session)
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	s.registry.Release(state.key)
+	slog.Info("rtmp server: publisher disconnected",
+		"key", state.key, "stream_id", state.streamID,
+	)
+}
+
+// OnNewRtmpSubSession is invoked when a play client connects. We delegate
+// to the registered PlayFunc (publisher side). If no PlayFunc is wired,
+// reject — playback isn't available without the publisher being present.
+func (s *RTMPServer) OnNewRtmpSubSession(session *rtmp.ServerSession) error {
+	s.mu.Lock()
+	fn := s.playFunc
+	s.mu.Unlock()
+	if fn == nil {
+		slog.Warn("rtmp server: play rejected (no PlayFunc registered)",
+			"key", session.StreamName(),
+		)
+		return errors.New("rtmp server: play handler not configured")
+	}
+
+	key := session.StreamName()
+	info := PlayInfo{RemoteAddr: session.GetStat().RemoteAddr}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.subs[session] = &subState{cancel: cancel}
+	s.mu.Unlock()
+
+	// Run the play handler on its own goroutine — lal will block this
+	// callback until we return, so we can't drive the read loop from
+	// here. The handler is responsible for stopping when ctx fires.
+	go func() {
+		err := fn(ctx, key, info, session)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.Debug("rtmp server: play session ended",
+				"key", key, "err", err)
 		}
-		s.registry.Release(publishKey)
-		slog.Info("rtmp server: publisher disconnected", "key", publishKey)
+		_ = session.Dispose()
+	}()
+
+	slog.Info("rtmp server: play client accepted",
+		"key", key, "remote", info.RemoteAddr,
+	)
+	return nil
+}
+
+// OnDelRtmpSubSession is invoked when a play session ends. Cancels the
+// PlayFunc goroutine so it stops reading from the buffer hub.
+func (s *RTMPServer) OnDelRtmpSubSession(session *rtmp.ServerSession) {
+	s.mu.Lock()
+	state, ok := s.subs[session]
+	delete(s.subs, session)
+	s.mu.Unlock()
+	if ok {
+		state.cancel()
 	}
 }
 
-// ─── rtmpFrame ───────────────────────────────────────────────────────────────
+// ─── lal IPubSessionObserver (implemented by *pubState) ────────────────
 
-type rtmpFrame struct {
-	cid  gocodec.CodecID
-	data []byte
-	pts  uint32
-	dts  uint32
-}
-
-// ─── rtmpRelay ───────────────────────────────────────────────────────────────
-
-// rtmpRelay fans out frames from one publisher to all connected subscribers.
-type rtmpRelay struct {
-	key      string
-	streamID domain.StreamCode
-
-	frames chan *rtmpFrame // publisher writes here
-
-	mu   sync.Mutex
-	subs []*rtmpSub
-
-	quit chan struct{}
-	die  sync.Once
-}
-
-func newRTMPRelay(key string, streamID domain.StreamCode) *rtmpRelay {
-	return &rtmpRelay{
-		key:      key,
-		streamID: streamID,
-		frames:   make(chan *rtmpFrame, 512),
-		quit:     make(chan struct{}),
-	}
-}
-
-func (r *rtmpRelay) start() { go r.dispatch() }
-
-func (r *rtmpRelay) stop() {
-	r.die.Do(func() {
-		// Close subscriber connections first so joy4 gets EOF and the pull
-		// worker exits cleanly before we signal the dispatch goroutine.
-		r.mu.Lock()
-		subs := make([]*rtmpSub, len(r.subs))
-		copy(subs, r.subs)
-		r.mu.Unlock()
-		for _, sub := range subs {
-			sub.stop()           // signal quit channel
-			_ = sub.conn.Close() // unblock any pending TCP write
+// OnReadRtmpAvMsg is invoked by lal for every audio/video RtmpMsg the
+// publisher sends. Convert to AVPackets and write to the buffer hub.
+//
+// The first AV packet after acquisition is marked Discontinuity=true so
+// downstream consumers (HLS / DASH segmenters) flush their accumulated
+// buffer and start fresh. Mirrors the pull-worker firstPacket logic.
+func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
+	for _, av := range p.converter.Convert(msg) {
+		cl := av.Clone()
+		if p.firstPacket {
+			cl.Discontinuity = true
+			p.firstPacket = false
 		}
-		close(r.quit)
-	})
-}
-
-func (r *rtmpRelay) addSub(sub *rtmpSub) {
-	r.mu.Lock()
-	r.subs = append(r.subs, sub)
-	r.mu.Unlock()
-}
-
-func (r *rtmpRelay) removeSub(sub *rtmpSub) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i, s := range r.subs {
-		if s == sub {
-			r.subs = append(r.subs[:i], r.subs[i+1:]...)
-			return
-		}
-	}
-}
-
-func (r *rtmpRelay) dispatch() {
-	for {
-		select {
-		case f := <-r.frames:
-			r.mu.Lock()
-			subs := make([]*rtmpSub, len(r.subs))
-			copy(subs, r.subs)
-			r.mu.Unlock()
-			for _, sub := range subs {
-				sub.enqueue(f)
-			}
-		case <-r.quit:
-			return
-		}
-	}
-}
-
-// ─── rtmpSub ─────────────────────────────────────────────────────────────────
-
-// rtmpSub serves frames to one play-mode client (our internal joy4 pull worker).
-type rtmpSub struct {
-	handle *gortmp.RtmpServerHandle
-	conn   net.Conn
-
-	mu        sync.Mutex
-	pending   []*rtmpFrame
-	frameCome chan struct{}
-
-	quit chan struct{}
-	die  sync.Once
-}
-
-func newRTMPSub(conn net.Conn, handle *gortmp.RtmpServerHandle) *rtmpSub {
-	return &rtmpSub{
-		handle:    handle,
-		conn:      conn,
-		frameCome: make(chan struct{}, 1),
-		quit:      make(chan struct{}),
-	}
-}
-
-func (sub *rtmpSub) stop() {
-	sub.die.Do(func() { close(sub.quit) })
-}
-
-func (sub *rtmpSub) enqueue(f *rtmpFrame) {
-	sub.mu.Lock()
-	sub.pending = append(sub.pending, f)
-	sub.mu.Unlock()
-	select {
-	case sub.frameCome <- struct{}{}:
-	default:
-	}
-}
-
-// run sends frames to the joy4 play client. It waits for the first H.264 IDR
-// frame so that WriteFrame generates a fresh FLV sequence header (SPS+PPS)
-// before any NALU data — joy4 needs this to build its codec config.
-func (sub *rtmpSub) run() {
-	defer sub.stop()
-	firstVideo := true
-	for {
-		select {
-		case <-sub.frameCome:
-			sub.mu.Lock()
-			frames := sub.pending
-			sub.pending = nil
-			sub.mu.Unlock()
-			for _, f := range frames {
-				if firstVideo {
-					isIDR := f.cid == gocodec.CODECID_VIDEO_H264 && gocodec.IsH264IDRFrame(f.data)
-					if !isIDR {
-						continue // skip until keyframe so decoder can initialise
-					}
-					firstVideo = false
-				}
-				if err := sub.handle.WriteFrame(f.cid, f.data, f.pts, f.dts); err != nil {
-					slog.Warn("rtmp server: write to subscriber failed", "err", err)
-					return
-				}
-			}
-		case <-sub.quit:
-			return
+		if err := p.buf.Write(p.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
+			slog.Debug("rtmp server: buffer write failed",
+				"key", p.key, "err", err)
 		}
 	}
 }

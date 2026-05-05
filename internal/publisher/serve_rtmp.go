@@ -23,8 +23,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	gocodec "github.com/yapingcat/gomedia/go-codec"
 	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
+
+	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -34,7 +35,7 @@ import (
 
 // HandleRTMPPlay is the play handler registered with the ingestor's RTMP server.
 // It subscribes to the Buffer Hub for the given stream key, demuxes the TS stream,
-// and calls writeFrame for each H.264/AAC frame until ctx is cancelled.
+// and writes H.264 / AAC frames into the lal RTMP session until ctx is cancelled.
 // Returns an error when the stream is not active (caller closes the connection).
 //
 // Signature matches push.PlayFunc — the info argument carries remote-peer
@@ -44,7 +45,7 @@ func (s *Service) HandleRTMPPlay(
 	ctx context.Context,
 	key string,
 	info push.PlayInfo,
-	writeFrame func(cid gocodec.CodecID, data []byte, pts, dts uint32) error,
+	session *rtmp.ServerSession,
 ) error {
 	code := domain.StreamCode(key)
 
@@ -62,8 +63,13 @@ func (s *Service) HandleRTMPPlay(
 	slog.Info("publisher: RTMP play session started", "stream_code", code, "remote", info.RemoteAddr)
 	defer slog.Info("publisher: RTMP play session ended", "stream_code", code)
 
-	rtmpSess := openRTMPSession(ctx, s.tracker, code, info.RemoteAddr, info.FlashVer)
+	rtmpSess := openRTMPSession(ctx, s.tracker, code, info.RemoteAddr, "")
 	defer rtmpSess.close()
+
+	writer := push.NewRTMPFrameWriter(session)
+	writeFrame := func(kind push.FrameKind, data []byte, pts, dts uint32) error {
+		return writer.WriteFrame(kind, data, pts, dts)
+	}
 
 	runRTMPPlayPipeline(ctx, code, sub, rtmpSess, writeFrame)
 	return nil
@@ -79,7 +85,7 @@ func runRTMPPlayPipeline(
 	streamCode domain.StreamCode,
 	sub *buffer.Subscriber,
 	sess *playSession,
-	writeFrame func(cid gocodec.CodecID, data []byte, pts, dts uint32) error,
+	writeFrame func(kind push.FrameKind, data []byte, pts, dts uint32) error,
 ) {
 	tb := newTSBuffer()
 
@@ -134,8 +140,8 @@ func runRTMPPlayPipeline(
 	// per-session byte counter. Approximation: we count the H.264 / AAC
 	// payload size, ignoring the few-byte RTMP chunk header — bytes total
 	// is for analytics, not billing.
-	trackedWrite := func(cid gocodec.CodecID, data []byte, pts, dts uint32) error {
-		if err := writeFrame(cid, data, pts, dts); err != nil {
+	trackedWrite := func(kind push.FrameKind, data []byte, pts, dts uint32) error {
+		if err := writeFrame(kind, data, pts, dts); err != nil {
 			return err
 		}
 		sess.add(int64(len(data)))
@@ -170,7 +176,7 @@ func runRTMPPlayPipeline(
 
 type rtmpPlaySession struct {
 	streamCode  domain.StreamCode
-	writeFrame  func(cid gocodec.CodecID, data []byte, pts, dts uint32) error
+	writeFrame  func(kind push.FrameKind, data []byte, pts, dts uint32) error
 	baseDTS     uint64
 	baseDTSSet  bool
 	baseADTS    uint64
@@ -211,7 +217,7 @@ func (ps *rtmpPlaySession) writeVideo(frame []byte, pts, dts uint64) {
 	}
 	relDTS := uint32(dts - ps.baseDTS)
 	relPTS := uint32(pts - ps.baseDTS)
-	if err := ps.writeFrame(gocodec.CODECID_VIDEO_H264, frame, relPTS, relDTS); err != nil {
+	if err := ps.writeFrame(push.FrameKindH264, frame, relPTS, relDTS); err != nil {
 		slog.Debug("publisher: RTMP play write video error",
 			"stream_code", ps.streamCode, "err", err)
 	}
@@ -226,7 +232,7 @@ func (ps *rtmpPlaySession) writeAudio(frame []byte, dts uint64) {
 		ps.baseADTSSet = true
 	}
 	relDTS := uint32(dts - ps.baseADTS)
-	if err := ps.writeFrame(gocodec.CODECID_AUDIO_AAC, frame, relDTS, relDTS); err != nil {
+	if err := ps.writeFrame(push.FrameKindAAC, frame, relDTS, relDTS); err != nil {
 		slog.Debug("publisher: RTMP play write audio error",
 			"stream_code", ps.streamCode, "err", err)
 	}

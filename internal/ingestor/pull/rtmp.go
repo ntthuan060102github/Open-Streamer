@@ -36,10 +36,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/q191201771/lal/pkg/aac"
-	"github.com/q191201771/lal/pkg/avc"
 	"github.com/q191201771/lal/pkg/base"
-	"github.com/q191201771/lal/pkg/hevc"
 	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -71,12 +68,11 @@ type RTMPReader struct {
 	closing atomic.Bool
 	closeWg sync.WaitGroup
 
-	// Codec config state — populated on each sequence-header message and
-	// applied to every subsequent frame on the same codec. Reset on Close
-	// so reconnection cycles re-learn from the new sequence headers.
-	avcAnnexbPrefix  []byte // SPS+PPS in Annex-B, prepended to AVC IDR
-	hevcAnnexbPrefix []byte // VPS+SPS+PPS in Annex-B, prepended to HEVC IDR
-	aacCtx           *aac.AscContext
+	// converter holds the per-stream codec configuration state and turns
+	// each `base.RtmpMsg` from lal into zero or more domain.AVPackets.
+	// Shared with the push server (push/rtmp_server.go) — see
+	// rtmp_msg_converter.go for the conversion details.
+	converter *RTMPMsgConverter
 }
 
 // NewRTMPReader constructs a reader for input without opening any
@@ -122,6 +118,7 @@ func (r *RTMPReader) Open(ctx context.Context) error {
 	r.mu.Lock()
 	r.session = session
 	r.pkts = pkts
+	r.converter = NewRTMPMsgConverter()
 	r.closing.Store(false)
 	r.mu.Unlock()
 
@@ -245,166 +242,15 @@ func (r *RTMPReader) Close() error {
 }
 
 // handleRtmpMsg is invoked on lal's read goroutine for every RTMP AV
-// message. Dispatches to per-codec converters that emit zero or more
-// AVPackets onto pkts.
+// message. Delegates the codec-specific work to RTMPMsgConverter and
+// emits the resulting AVPackets onto pkts.
 func (r *RTMPReader) handleRtmpMsg(msg base.RtmpMsg, pkts chan<- domain.AVPacket) {
 	if r.closing.Load() {
 		return
 	}
-	switch msg.Header.MsgTypeId {
-	case base.RtmpTypeIdVideo:
-		r.handleVideoMsg(msg, pkts)
-	case base.RtmpTypeIdAudio:
-		r.handleAudioMsg(msg, pkts)
+	for _, p := range r.converter.Convert(msg) {
+		emitRTMPPacket(pkts, &r.closing, p)
 	}
-}
-
-// handleVideoMsg converts an RTMP video message into Annex-B-shaped
-// AVPackets. Sequence headers update the SPS/PPS/VPS prefix in place
-// and emit nothing; NALU messages are converted from AVCC and prepended
-// with the prefix on IDR.
-func (r *RTMPReader) handleVideoMsg(msg base.RtmpMsg, pkts chan<- domain.AVPacket) {
-	if len(msg.Payload) < 5 {
-		return
-	}
-	codecID := msg.VideoCodecId()
-
-	if msg.IsVideoKeySeqHeader() {
-		r.captureVideoSeqHeader(msg, codecID)
-		return
-	}
-
-	avccData := videoMsgAvccPayload(msg)
-	if len(avccData) == 0 {
-		return
-	}
-
-	var (
-		annexB []byte
-		err    error
-		codec  domain.AVCodec
-		prefix []byte
-	)
-	switch codecID {
-	case base.RtmpCodecIdAvc:
-		codec = domain.AVCodecH264
-		prefix = r.avcAnnexbPrefix
-	case base.RtmpCodecIdHevc:
-		codec = domain.AVCodecH265
-		prefix = r.hevcAnnexbPrefix
-	default:
-		return // unsupported codec — silently drop (Sorenson, VP6, etc.)
-	}
-
-	annexB, err = avc.Avcc2Annexb(avccData)
-	if err != nil || len(annexB) == 0 {
-		return
-	}
-
-	isKey := msg.IsVideoKeyNalu()
-	data := annexB
-	if isKey && len(prefix) > 0 {
-		data = make([]byte, 0, len(prefix)+len(annexB))
-		data = append(data, prefix...)
-		data = append(data, annexB...)
-	}
-
-	dts := uint64(msg.Header.TimestampAbs)
-	pts := dts + uint64(msg.Cts())
-	emitRTMPPacket(pkts, &r.closing, domain.AVPacket{
-		Codec:    codec,
-		Data:     data,
-		PTSms:    pts,
-		DTSms:    dts,
-		KeyFrame: isKey,
-	})
-}
-
-// captureVideoSeqHeader parses the codec configuration record from a
-// video sequence-header message and stores the corresponding Annex-B
-// SPS / PPS (or VPS+SPS+PPS) prefix for later prepend on IDR.
-func (r *RTMPReader) captureVideoSeqHeader(msg base.RtmpMsg, codecID uint8) {
-	// Sequence header payload starts at byte 5 (FrameType+CodecId byte +
-	// AVCPacketType byte + CompositionTime 3 bytes) for non-Enhanced.
-	// For Enhanced HEVC the layout is different — VpsSpsPpsEnhancedSeqHeader2Annexb
-	// understands both shapes.
-	switch codecID {
-	case base.RtmpCodecIdAvc:
-		annexB, err := avc.SpsPpsSeqHeader2Annexb(msg.Payload[5:])
-		if err == nil {
-			r.avcAnnexbPrefix = annexB
-		}
-	case base.RtmpCodecIdHevc:
-		var annexB []byte
-		var err error
-		if msg.IsEnhanced() {
-			annexB, err = hevc.VpsSpsPpsEnhancedSeqHeader2Annexb(msg.Payload)
-		} else {
-			annexB, err = hevc.VpsSpsPpsSeqHeader2Annexb(msg.Payload[5:])
-		}
-		if err == nil {
-			r.hevcAnnexbPrefix = annexB
-		}
-	}
-}
-
-// videoMsgAvccPayload returns the AVCC-formatted NALU bytes from a video
-// message, accounting for the difference between classic and Enhanced
-// RTMP framing. Returns nil when the message is not a NALU carrier.
-func videoMsgAvccPayload(msg base.RtmpMsg) []byte {
-	if msg.IsEnhanced() {
-		idx := msg.GetEnchanedHevcNaluIndex()
-		if idx == 0 || idx >= len(msg.Payload) {
-			return nil
-		}
-		return msg.Payload[idx:]
-	}
-	// Classic: byte 0 (FrameType+CodecId) + byte 1 (PacketType) + bytes
-	// 2-4 (CompositionTime) + AVCC NAL units.
-	if len(msg.Payload) <= 5 {
-		return nil
-	}
-	return msg.Payload[5:]
-}
-
-// handleAudioMsg converts an RTMP audio message into an ADTS-prefixed
-// AAC AVPacket. AAC sequence headers update the AscContext in place and
-// emit nothing; raw frames are wrapped with the ADTS header derived from
-// the stored ASC. Non-AAC audio is silently dropped (legacy RTMP audio
-// codecs aren't surfaced through this pipeline).
-func (r *RTMPReader) handleAudioMsg(msg base.RtmpMsg, pkts chan<- domain.AVPacket) {
-	if len(msg.Payload) < 2 {
-		return
-	}
-	if msg.AudioCodecId() != base.RtmpSoundFormatAac {
-		return
-	}
-	if msg.IsAacSeqHeader() {
-		ctx, err := aac.NewAscContext(msg.Payload[2:])
-		if err == nil {
-			r.aacCtx = ctx
-		}
-		return
-	}
-	if r.aacCtx == nil {
-		return // no codec config seen yet — drop until seq header arrives
-	}
-	rawAAC := msg.Payload[2:]
-	if len(rawAAC) == 0 {
-		return
-	}
-	adtsHeader := r.aacCtx.PackAdtsHeader(len(rawAAC))
-	out := make([]byte, 0, len(adtsHeader)+len(rawAAC))
-	out = append(out, adtsHeader...)
-	out = append(out, rawAAC...)
-
-	dts := uint64(msg.Header.TimestampAbs)
-	emitRTMPPacket(pkts, &r.closing, domain.AVPacket{
-		Codec: domain.AVCodecAAC,
-		Data:  out,
-		PTSms: dts,
-		DTSms: dts,
-	})
 }
 
 // emitRTMPPacket sends p onto pkts unless the reader is closing. Drops
