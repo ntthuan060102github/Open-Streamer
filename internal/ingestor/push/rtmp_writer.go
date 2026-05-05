@@ -185,14 +185,51 @@ func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 		w.avcSeqSent = true
 	}
 
-	avccData, err := avc.Annexb2Avcc(annexB)
-	if err != nil {
-		return fmt.Errorf("rtmp writer: annexb→avcc: %w", err)
+	// Build AVCC payload from slice NALs only — strict players (Flussonic)
+	// reject NALU tags that contain SPS / PPS / AUD because those belong
+	// in the sequence header, not in the per-frame tag. avc.Annexb2Avcc
+	// would copy *every* NAL including the SPS/PPS prefix on IDR; that
+	// produces a tag the upstream parser interprets as malformed and
+	// causes silent reset-by-peer mid-GOP. Mirrors LAL's avpacket2rtmp
+	// remuxer behaviour (pkg/remux/avpacket2rtmp.go FeedAvPacket).
+	avccData, isKey, hasSlice := buildAvccSliceOnly(annexB)
+	if !hasSlice {
+		// No coded slice in this access unit (rare — pure SPS/PPS update
+		// frame between GOPs). Skip; the next frame will carry the slice.
+		return nil
 	}
-	isKey := containsIDRAnnexB(annexB)
 	cts := int32(pts) - int32(dts) //nolint:gosec // RTMP CTS is signed 24-bit; we clamp on encode
 	naluTag := buildFLVAvcTag(isKey, 1, cts, avccData)
 	return w.send(base.RtmpTypeIdVideo, dts, naluTag)
+}
+
+// buildAvccSliceOnly walks the Annex-B access unit and returns the AVCC
+// (4-byte BE length prefix per NAL) payload built from coded slice NALs
+// only. SPS (type 7), PPS (type 8), AUD (type 9), and SEI (type 6) are
+// dropped — those are either redundant with the seq header (SPS/PPS),
+// not meaningful over RTMP (AUD), or noise that strict players reject
+// (SEI in some codec profiles). Also reports whether any IDR slice was
+// present, so the caller can flag the FLV FrameType correctly.
+func buildAvccSliceOnly(annexB []byte) (avccPayload []byte, isKey bool, hasSlice bool) {
+	out := make([]byte, 0, len(annexB))
+	_ = avc.IterateNaluAnnexb(annexB, func(nal []byte) {
+		if len(nal) == 0 {
+			return
+		}
+		switch nal[0] & 0x1F {
+		case 7, 8, 9, 6: // SPS, PPS, AUD, SEI — exclude from NALU tag
+			return
+		case 5: // IDR slice
+			isKey = true
+		}
+		// AVCC: 4-byte BE length, then NAL bytes.
+		out = append(out,
+			byte(len(nal)>>24), byte(len(nal)>>16), byte(len(nal)>>8), byte(len(nal)),
+		)
+		out = append(out, nal...)
+		hasSlice = true
+	})
+	return out, isKey, hasSlice
 }
 
 // writeAAC sends a single AAC access unit (ADTS-prefixed). Emits the AAC
@@ -297,16 +334,4 @@ func extractSpsPpsFromAnnexB(annexB []byte) (sps, pps []byte, ok bool) {
 		}
 	})
 	return sps, pps, sps != nil && pps != nil
-}
-
-// containsIDRAnnexB returns true when annexB carries any NAL of type 5
-// (Coded slice of an IDR picture). Used to set the FLV FrameType correctly.
-func containsIDRAnnexB(annexB []byte) bool {
-	found := false
-	_ = avc.IterateNaluAnnexb(annexB, func(nal []byte) {
-		if len(nal) > 0 && (nal[0]&0x1F) == 5 {
-			found = true
-		}
-	})
-	return found
 }
