@@ -512,20 +512,25 @@ func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
 		sess.baseDTS = dts
 		sess.baseDTSSet = true
 	}
-	// MPEG-TS PTS is already in 90 kHz — same clock as H.264 RTP. Per
-	// RFC 6184 §7.1 the RTP timestamp is the sampling/presentation time
-	// of the frame; it must be IDENTICAL for every RTP packet that
-	// fragments one access unit (e.g. all FU-A pieces) so the receiver
-	// can re-assemble them. Earlier code set DTS on the non-last
-	// packets and PTS on the last — strict decoders (gortsplib pull,
-	// ffmpeg) saw inconsistent timestamps within a single NAL, split
-	// it as if the fragments belonged to different frames, and emitted
-	// "missing picture in access unit" / produced unplayable HLS even
-	// though every byte of every packet was valid.
+	// gomedia's mpeg2 TSDemuxer divides the PES PTS/DTS by 90 before
+	// invoking OnFrame (ts-demuxer.go line 211/213), so the values that
+	// reach this callback are MILLISECONDS — not 90 kHz ticks. H.264
+	// RTP runs at 90 kHz; we have to multiply ms by 90 to land in the
+	// right clock domain.
 	//
-	// We don't track encoder DTS over the wire — the receiver derives
-	// presentation order from PTS alone, and reordering is its job.
-	rtpTS := uint32(pts - sess.baseDTS)
+	// Earlier code used `pts - baseDTS` directly, treating ms as 90 kHz.
+	// The result was an RTP timeline 90× slower than reality: the
+	// receiver decoded the first IDR (timestamps still small) and then
+	// hung once subsequent frames arrived with timestamps barely
+	// advancing — Flussonic's player froze after ~1 s, OpenStreamer's
+	// HLS pull saw the audio stream emit non-monotonic DTS in ffprobe
+	// (because the same scale bug afflicted the audio path).
+	//
+	// Per RFC 6184 §7.1 the RTP timestamp is the presentation time and
+	// must be IDENTICAL for every RTP packet that fragments one access
+	// unit (e.g. all FU-A pieces). We use PTS in 90 kHz; the receiver
+	// derives presentation order from PTS alone and handles reordering.
+	rtpTS := uint32((pts - sess.baseDTS) * 90)
 
 	nalus := annexBToNALUs(frame)
 	if len(nalus) == 0 {
@@ -555,9 +560,20 @@ func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 		sess.baseAudio = dts
 		sess.baseAudioSet = true
 	}
-	// Convert from 90 kHz MPEG-TS clock to AAC RTP clock (sample rate).
-	relDTS := dts - sess.baseAudio
-	rtpTS := uint32(relDTS * uint64(sess.aacCfg.SampleRate) / 90000)
+	// gomedia's TSDemuxer hands us DTS in milliseconds (see comment in
+	// writeVideoRTP). AAC RTP runs at the audio sample rate (48 kHz
+	// here), so the conversion is `ms × sampleRate / 1000`.
+	//
+	// The previous formula divided by 90000 instead of 1000, treating
+	// the input as 90 kHz ticks. That produced packet timestamps 90×
+	// smaller than expected; consecutive RTP packets ended up only
+	// ~91 ticks apart (vs. the correct 1024 per AAC AU), so within a
+	// single ADTS frame containing N AUs the encoder's internal AU
+	// spacing (1024) overshot the next packet's base, and ffmpeg saw
+	// "non-monotonic DTS" — which froze playback after a couple of
+	// frames worth of audio.
+	relMs := dts - sess.baseAudio
+	rtpTS := uint32(relMs * uint64(sess.aacCfg.SampleRate) / 1000)
 
 	var adtsPkts mpeg4audio.ADTSPackets
 	if err := adtsPkts.Unmarshal(frame); err != nil || len(adtsPkts) == 0 {
