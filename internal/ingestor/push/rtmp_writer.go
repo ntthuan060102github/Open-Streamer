@@ -115,10 +115,18 @@ func (w *RTMPFrameWriter) WriteFrame(kind FrameKind, data []byte, pts, dts uint3
 	return nil
 }
 
-// sendMetadata emits the onMetaData AMF0 script tag at timestamp 0.
-// Open Streamer's RTMP play path only supports H.264 + AAC so the codec
-// IDs are hardcoded — strict players (Flussonic) refuse to play without
-// this tag even if every subsequent AV message is well-formed.
+// sendMetadata emits the onMetaData AMF0 script tag at timestamp 0,
+// wrapped in `@setDataFrame`. Open Streamer's RTMP play path only
+// supports H.264 + AAC so the codec IDs are hardcoded.
+//
+// `@setDataFrame` is an RTMP NetStream command that flags the AMF
+// payload as cacheable stream metadata (vs. a one-shot data event).
+// Strict players (Flussonic, JW Player, OBS preview) ignore raw
+// onMetaData tags lacking this prefix — they treat them as opaque
+// data messages, never parse codec/resolution from them, then time
+// out the play session ~7-8s later when their decoder still has no
+// init params. Lenient players (LAL pull, ffplay) tolerate the
+// omission, which is why the issue only surfaced against Flussonic.
 func (w *RTMPFrameWriter) sendMetadata() error {
 	width, height := -1, -1
 	if w.width > 0 && w.height > 0 {
@@ -128,6 +136,10 @@ func (w *RTMPFrameWriter) sendMetadata() error {
 	meta, err := rtmp.BuildMetadata(width, height, int(base.RtmpSoundFormatAac), int(base.RtmpCodecIdAvc))
 	if err != nil {
 		return fmt.Errorf("rtmp writer: build metadata: %w", err)
+	}
+	meta, err = rtmp.MetadataEnsureWithSdf(meta)
+	if err != nil {
+		return fmt.Errorf("rtmp writer: wrap metadata with @setDataFrame: %w", err)
 	}
 	header := base.RtmpHeader{
 		Csid:         rtmp.CsidAmf,
