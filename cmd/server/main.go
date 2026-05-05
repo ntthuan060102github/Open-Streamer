@@ -109,12 +109,20 @@ func run() error {
 		slog.SetDefault(logger.New(*gcfg.Log))
 	}
 
-	// Silence lal's nazalog INFO-level chatter (every RTMP "Acknowledgement"
-	// and lifecycle line) — keep warn/error so real failures still surface.
-	// Without this the journalctl tail is dominated by per-second ack lines
-	// from each push session, drowning out our own structured slog output.
+	// Tie lal's nazalog level to our own log.level so a single config knob
+	// covers both. LAL warns aggressively on harmless protocol quirks
+	// ("read user control message, ignore", "< R Set Peer Bandwidth.
+	// ignore") — those flood `journalctl -f` and drown out slog output
+	// even when an operator opens debug. So the mapping is asymmetric:
+	//
+	//   our trace / debug → LAL Debug   (operator wants full LAL detail)
+	//   our info  (default)→ LAL Error  (silence noise on quiet box)
+	//   our warn / error  → LAL Error   (silence everything bar real LAL errors)
+	//
+	// LAL's own Errorf path covers genuine protocol failures — no real
+	// signal is lost by suppressing warn.
 	_ = nazalog.Init(func(o *nazalog.Option) {
-		o.Level = nazalog.LevelWarn
+		o.Level = lalLogLevel(gcfg.Log)
 	})
 
 	// 5. Wire all services.
@@ -222,6 +230,21 @@ func deref[T any](p *T) T {
 	}
 	var zero T
 	return zero
+}
+
+// lalLogLevel maps our slog level to LAL's nazalog level. See the
+// init-time comment for why warn/error collapse to LAL Error (LAL warns
+// on harmless ignored protocol messages and floods the log otherwise).
+func lalLogLevel(cfg *config.LogConfig) nazalog.Level {
+	if cfg == nil {
+		return nazalog.LevelError
+	}
+	switch cfg.Level {
+	case "trace", "debug":
+		return nazalog.LevelDebug
+	default:
+		return nazalog.LevelError
+	}
 }
 
 // wireServices registers all non-storage services into the DI injector.

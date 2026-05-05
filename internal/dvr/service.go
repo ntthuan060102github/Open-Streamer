@@ -38,6 +38,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 	"github.com/samber/do/v2"
 )
 
@@ -491,7 +492,7 @@ func (s *Service) flushSegment(
 		},
 	})
 
-	slog.Debug("dvr: segment flushed",
+	logger.Trace("dvr: segment flushed",
 		"stream_code", sess.recording.StreamCode,
 		"index", segIdx,
 		"size_bytes", size,

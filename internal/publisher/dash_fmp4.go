@@ -48,6 +48,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // dashVideoTimescale is the standard MPEG timescale for video tracks (90 kHz).
@@ -702,7 +703,7 @@ func (p *dashFMP4Packager) writeVideoSegmentLocked() error {
 		p.segCount.Inc()
 	}
 
-	slog.Debug("publisher: DASH video segment",
+	logger.Trace("publisher: DASH video segment",
 		"stream_code", p.streamID, "segment", name,
 		"frames", len(p.vAnnex), "bytes", buf.Len())
 

@@ -28,6 +28,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // hlsRunOpts carries per-rendition metadata for ABR HLS; nil → single-rendition mode.
@@ -420,7 +421,7 @@ func (p *hlsSegmenter) flushLocked() {
 		p.segCount.Inc()
 	}
 
-	slog.Debug("publisher: HLS segment flushed",
+	logger.Trace("publisher: HLS segment flushed",
 		"stream_code", p.streamID, "segment", name,
 		"dur_s", fmt.Sprintf("%.3f", dur),
 		"bytes", len(data),
