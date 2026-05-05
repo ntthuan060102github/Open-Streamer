@@ -27,6 +27,25 @@ package push
 // Sequence headers must precede NALU / raw audio frames otherwise the
 // receiving player can't initialise its decoder. The writer enforces
 // this by latching `seqSent` flags on first frame.
+//
+// Strict players (Flussonic, JW Player, ffplay -err_detect) also expect:
+//
+//   - An `onMetaData` AMF0 script tag with codec IDs *before* any AV data.
+//     Without it they refuse to play with "unknown stream" — even if all
+//     subsequent video / audio tags are valid. Lenient players (LAL pull,
+//     OBS preview) tolerate the omission, which is why the bug went
+//     unnoticed against open-streamer ↔ open-streamer.
+//   - Sequence headers at timestamp 0, not at the first frame's DTS.
+//     The wire timestamp on the seq header is informational; players
+//     timestamp-sort the GOP and a non-zero seq-header timestamp pushes
+//     it past the first NALU, breaking decoder init.
+//
+// To satisfy them, we always emit:
+//
+//   1. onMetaData (CSID 5, timestamp 0) on first WriteFrame call.
+//   2. AVC seq header (CSID 7, timestamp 0) on first H.264 frame.
+//   3. AAC seq header (CSID 6, timestamp 0) on first AAC frame.
+//   4. NALU / raw audio (CSIDs 7/6) at their actual DTS.
 
 import (
 	"fmt"
@@ -54,11 +73,12 @@ const (
 const adtsHeaderLength = 7
 
 // RTMPFrameWriter sends one access unit at a time to a lal ServerSession,
-// emitting AVC / AAC sequence headers automatically on the first frame
-// of each codec.
+// emitting onMetaData and AVC / AAC sequence headers automatically on
+// the first frame of each codec.
 type RTMPFrameWriter struct {
 	session *rtmp.ServerSession
 
+	metaSent   bool
 	avcSeqSent bool
 	aacSeqSent bool
 }
@@ -74,6 +94,12 @@ func (w *RTMPFrameWriter) WriteFrame(kind FrameKind, data []byte, pts, dts uint3
 	if len(data) == 0 {
 		return nil
 	}
+	if !w.metaSent {
+		if err := w.sendMetadata(); err != nil {
+			return err
+		}
+		w.metaSent = true
+	}
 	switch kind {
 	case FrameKindH264:
 		return w.writeH264(data, pts, dts)
@@ -85,9 +111,29 @@ func (w *RTMPFrameWriter) WriteFrame(kind FrameKind, data []byte, pts, dts uint3
 	return nil
 }
 
+// sendMetadata emits the onMetaData AMF0 script tag at timestamp 0.
+// Open Streamer's RTMP play path only supports H.264 + AAC so the codec
+// IDs are hardcoded — strict players (Flussonic) refuse to play without
+// this tag even if every subsequent AV message is well-formed.
+func (w *RTMPFrameWriter) sendMetadata() error {
+	meta, err := rtmp.BuildMetadata(-1, -1, int(base.RtmpSoundFormatAac), int(base.RtmpCodecIdAvc))
+	if err != nil {
+		return fmt.Errorf("rtmp writer: build metadata: %w", err)
+	}
+	header := base.RtmpHeader{
+		Csid:         rtmp.CsidAmf,
+		MsgTypeId:    base.RtmpTypeIdMetadata,
+		MsgStreamId:  rtmp.Msid1,
+		MsgLen:       uint32(len(meta)),
+		TimestampAbs: 0,
+	}
+	chunks := rtmp.Message2Chunks(meta, &header)
+	return w.session.Write(chunks)
+}
+
 // writeH264 sends a single H.264 access unit (Annex-B with optional
-// SPS/PPS prefix on IDR). Emits the AVC sequence header tag once before
-// the first NALU tag.
+// SPS/PPS prefix on IDR). Emits the AVC sequence header tag once at
+// timestamp 0 before the first NALU tag.
 func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 	if !w.avcSeqSent {
 		sps, pps, ok := extractSpsPpsFromAnnexB(annexB)
@@ -101,7 +147,7 @@ func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 			return fmt.Errorf("rtmp writer: build avc seq header: %w", err)
 		}
 		seqTag := buildFLVAvcTag(true, 0, 0, seqRecord)
-		if err := w.send(base.RtmpTypeIdVideo, dts, seqTag); err != nil {
+		if err := w.send(base.RtmpTypeIdVideo, 0, seqTag); err != nil {
 			return err
 		}
 		w.avcSeqSent = true
@@ -118,7 +164,7 @@ func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 }
 
 // writeAAC sends a single AAC access unit (ADTS-prefixed). Emits the AAC
-// sequence header tag once before the first raw frame tag.
+// sequence header tag once at timestamp 0 before the first raw frame tag.
 func (w *RTMPFrameWriter) writeAAC(adts []byte, dts uint32) error {
 	if len(adts) < adtsHeaderLength {
 		return nil
@@ -129,7 +175,7 @@ func (w *RTMPFrameWriter) writeAAC(adts []byte, dts uint32) error {
 			return fmt.Errorf("rtmp writer: extract asc from adts: %w", err)
 		}
 		seqTag := buildFLVAacTag(0, asc)
-		if err := w.send(base.RtmpTypeIdAudio, dts, seqTag); err != nil {
+		if err := w.send(base.RtmpTypeIdAudio, 0, seqTag); err != nil {
 			return err
 		}
 		w.aacSeqSent = true
