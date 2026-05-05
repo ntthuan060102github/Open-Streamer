@@ -34,8 +34,12 @@ func TestDetect(t *testing.T) {
 		{name: "https m3u8", url: "https://cdn.example.com/live/playlist.m3u8", want: protocol.KindHLS},
 		{name: "http m3u", url: "http://cdn.example.com/live/playlist.m3u", want: protocol.KindHLS},
 		{name: "uppercase M3U8 extension", url: "http://cdn.example.com/LIVE.M3U8", want: protocol.KindHLS},
-		// HTTP raw byte-stream is intentionally not supported (only HLS playlists).
-		{name: "http ts stream (unsupported)", url: "http://cdn.example.com/live.ts", want: protocol.KindUnknown},
+		// HTTP MPEG-TS (low-latency relay): explicit /mpegts endpoint or .ts suffix.
+		{name: "http mpegts endpoint", url: "http://server.lan:8080/streams/ch1/mpegts", want: protocol.KindHTTPTS},
+		{name: "https mpegts endpoint", url: "https://server.lan/streams/ch1/mpegts", want: protocol.KindHTTPTS},
+		{name: "http ts file", url: "http://cdn.example.com/live.ts", want: protocol.KindHTTPTS},
+		{name: "uppercase TS extension", url: "http://cdn.example.com/LIVE.TS", want: protocol.KindHTTPTS},
+		// HTTP without recognised suffix is still unknown.
 		{name: "https stream (unsupported)", url: "https://cdn.example.com/live", want: protocol.KindUnknown},
 		// File
 		{name: "file scheme", url: "file:///recordings/source.ts", want: protocol.KindFile},

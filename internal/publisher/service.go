@@ -73,6 +73,12 @@ type streamState struct {
 	// hlsMaster is set by serveHLSAdaptive so UpdateABRMasterMeta can push in-place
 	// metadata updates to the running master playlist writer.
 	hlsMaster *hlsABRMaster
+
+	// mpegtsEnabled mirrors stream.Protocols.MPEGTS so the on-demand HTTP
+	// MPEG-TS handler can reject requests for streams that opted out without
+	// re-querying the store. Updated atomically with mediaBuf when the stream
+	// config changes (Update path).
+	mpegtsEnabled bool
 }
 
 // Service manages all output workers for active streams.
@@ -267,11 +273,12 @@ func (s *Service) Start(ctx context.Context, stream *domain.Stream) error {
 
 	baseCtx, baseCancel := context.WithCancel(ctx)
 	ss := &streamState{
-		baseCtx:    baseCtx,
-		baseCancel: baseCancel,
-		code:       stream.Code,
-		mediaBuf:   buffer.PlaybackBufferID(stream.Code, stream.Transcoder),
-		protocols:  make(map[string]context.CancelFunc),
+		baseCtx:       baseCtx,
+		baseCancel:    baseCancel,
+		code:          stream.Code,
+		mediaBuf:      buffer.PlaybackBufferID(stream.Code, stream.Transcoder),
+		protocols:     make(map[string]context.CancelFunc),
+		mpegtsEnabled: p.MPEGTS,
 	}
 	s.streams[stream.Code] = ss
 	s.mediaBuffer[stream.Code] = ss.mediaBuf
@@ -437,6 +444,7 @@ func (s *Service) UpdateProtocols(ctx context.Context, old, new *domain.Stream) 
 			ss.mediaBuf = newBuf
 			s.mediaBuffer[new.Code] = newBuf
 		}
+		ss.mpegtsEnabled = new.Protocols.MPEGTS
 	}
 	s.mu.Unlock()
 	if !ok {

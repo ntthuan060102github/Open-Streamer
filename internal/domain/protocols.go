@@ -21,4 +21,16 @@ type OutputProtocols struct {
 
 	// SRT opens an SRT listener port for contribution-quality pull.
 	SRT bool `json:"srt" yaml:"srt"`
+
+	// MPEGTS exposes raw MPEG-TS over chunked HTTP at /<code>/mpegts —
+	// the lowest-latency relay path between Open-Streamer instances (and
+	// any HTTP client that can consume chunked TS, e.g. ffmpeg / VLC).
+	// Latency is bounded only by network RTT and one buffer-hub chunk
+	// (typically 50–200 ms vs 4–10 s for HLS / DASH).
+	//
+	// No goroutine is started per-stream; the endpoint subscribes to the
+	// playback buffer on demand. Disabling the flag turns the endpoint
+	// into a 404 for that stream so operators can opt out per-stream
+	// without changing the global router.
+	MPEGTS bool `json:"mpegts" yaml:"mpegts"`
 }

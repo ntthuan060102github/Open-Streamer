@@ -18,6 +18,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
 	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samber/do/v2"
@@ -41,6 +42,12 @@ type Server struct {
 	// mediaserve mount with a tracking middleware so HLS / DASH segment
 	// fetches are recorded as sessions. nil disables tracking entirely.
 	sessTracker sessions.Tracker
+
+	// pub serves the on-demand /<code>/mpegts endpoint by subscribing to
+	// the playback buffer hub for the requested stream. nil when publisher
+	// is not wired (e.g. minimal API-only test harness) — the route is
+	// then skipped at mount time.
+	pub *publisher.Service
 
 	router *chi.Mux
 	http   *http.Server
@@ -72,6 +79,11 @@ func New(i do.Injector) (*Server, error) {
 	// than a startup error.
 	if t, err := do.Invoke[*sessions.Service](i); err == nil {
 		s.sessTracker = t
+	}
+	// Publisher is optional for the same reason — the MPEG-TS-over-HTTP
+	// endpoint is skipped if it isn't wired.
+	if pub, err := do.Invoke[*publisher.Service](i); err == nil {
+		s.pub = pub
 	}
 	return s, nil
 }
@@ -108,6 +120,14 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	r.Group(func(mr chi.Router) {
 		if s.sessTracker != nil {
 			mr.Use(sessions.HTTPMiddleware(s.sessTracker))
+		}
+		// /<code>/mpegts must be registered BEFORE mediaserve.Mount because
+		// mediaserve attaches a `/<code>/*` wildcard for HLS / DASH file
+		// serving. Chi's trie matches more-specific routes first when
+		// registered in order, so `/<code>/mpegts` wins as long as it is
+		// declared before the wildcard.
+		if s.pub != nil {
+			mr.Get("/{code}/mpegts", s.pub.HandleMPEGTS())
 		}
 		mediaserve.Mount(mr, s.hlsDir, s.dashDir)
 	})

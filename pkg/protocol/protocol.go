@@ -15,6 +15,7 @@ type Kind string
 const (
 	KindUDP     Kind = "udp"     // raw MPEG-TS over UDP (unicast or multicast)
 	KindHLS     Kind = "hls"     // HLS playlist pull over HTTP/HTTPS
+	KindHTTPTS  Kind = "http_ts" // raw MPEG-TS over chunked HTTP (low-latency relay)
 	KindFile    Kind = "file"    // local filesystem path
 	KindRTMP    Kind = "rtmp"    // RTMP / RTMPS (pull or push-listen)
 	KindRTSP    Kind = "rtsp"    // RTSP pull
@@ -63,9 +64,16 @@ func Detect(rawURL string) Kind {
 	case "mixer":
 		return KindMixer
 	case "http", "https":
-		if strings.HasSuffix(strings.ToLower(u.Path), ".m3u8") ||
-			strings.HasSuffix(strings.ToLower(u.Path), ".m3u") {
+		path := strings.ToLower(u.Path)
+		if strings.HasSuffix(path, ".m3u8") || strings.HasSuffix(path, ".m3u") {
 			return KindHLS
+		}
+		// Raw MPEG-TS over HTTP: matches both the explicit `/mpegts` server
+		// endpoint exposed by Open-Streamer and the conventional `.ts` suffix
+		// used by other media servers (Flussonic / nimble / mistserver) that
+		// expose a single chunked TS stream.
+		if strings.HasSuffix(path, "/mpegts") || strings.HasSuffix(path, ".ts") {
+			return KindHTTPTS
 		}
 		return KindUnknown
 	case "":

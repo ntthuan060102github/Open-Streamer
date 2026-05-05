@@ -2512,8 +2512,6 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2529,7 +2527,9 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error"
+                "transcoder.error",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2539,8 +2539,6 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "",
                 "",
@@ -2556,11 +2554,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2576,7 +2574,9 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError"
+                "EventTranscoderError",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {
@@ -2855,6 +2855,10 @@ const docTemplate = `{
                 },
                 "hls": {
                     "description": "HLS enables Apple HTTP Live Streaming (m3u8 + segments over HTTP).\nCompatible with browsers, iOS, Android, Smart TVs.",
+                    "type": "boolean"
+                },
+                "mpegts": {
+                    "description": "MPEGTS exposes raw MPEG-TS over chunked HTTP at /\u003ccode\u003e/mpegts —\nthe lowest-latency relay path between Open-Streamer instances (and\nany HTTP client that can consume chunked TS, e.g. ffmpeg / VLC).\nLatency is bounded only by network RTT and one buffer-hub chunk\n(typically 50–200 ms vs 4–10 s for HLS / DASH).\n\nNo goroutine is started per-stream; the endpoint subscribes to the\nplayback buffer on demand. Disabling the flag turns the endpoint\ninto a 404 for that stream so operators can opt out per-stream\nwithout changing the global router.",
                     "type": "boolean"
                 },
                 "rtmp": {
