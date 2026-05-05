@@ -174,11 +174,18 @@ func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 		if err := w.sendMetadata(); err != nil {
 			return err
 		}
-		seqRecord, err := avc.BuildSeqHeaderFromSpsPps(sps, pps)
+		seqTag, err := avc.BuildSeqHeaderFromSpsPps(sps, pps)
 		if err != nil {
 			return fmt.Errorf("rtmp writer: build avc seq header: %w", err)
 		}
-		seqTag := buildFLVAvcTag(true, 0, 0, seqRecord)
+		// avc.BuildSeqHeaderFromSpsPps already prepends the 5-byte FLV
+		// video tag header (FrameType<<4|CodecId, AVCPacketType=0,
+		// CompositionTime=0). Wrapping it again with buildFLVAvcTag
+		// would double the prefix — strict players (Flussonic, ffmpeg)
+		// then misalign their AVCDecoderConfigurationRecord parser, see
+		// 5 stray bytes inside the record, and fall back to "NAL type
+		// 13 in extradata" warnings before failing every subsequent
+		// NALU split. Send the buffer LAL returned as-is.
 		if err := w.send(base.RtmpTypeIdVideo, 0, seqTag); err != nil {
 			return err
 		}
