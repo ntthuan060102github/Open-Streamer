@@ -78,7 +78,8 @@ const adtsHeaderLength = 7
 type RTMPFrameWriter struct {
 	session *rtmp.ServerSession
 
-	metaSent   bool
+	width      uint32 // parsed from SPS on first IDR; 0 until then
+	height     uint32
 	avcSeqSent bool
 	aacSeqSent bool
 }
@@ -90,20 +91,23 @@ func NewRTMPFrameWriter(session *rtmp.ServerSession) *RTMPFrameWriter {
 
 // WriteFrame sends one access unit. dts/pts are RTMP wire timestamps in
 // milliseconds. Returns an error if the underlying TCP write fails.
+//
+// Audio frames received before the AVC sequence header (and onMetaData)
+// have been sent are dropped: strict players parse onMetaData first to
+// pick the audio decoder, and tags arriving before it are at best
+// ignored, at worst cause re-buffering / resync. The publisher already
+// holds audio until the first video keyframe so this drop is rare.
 func (w *RTMPFrameWriter) WriteFrame(kind FrameKind, data []byte, pts, dts uint32) error {
 	if len(data) == 0 {
 		return nil
-	}
-	if !w.metaSent {
-		if err := w.sendMetadata(); err != nil {
-			return err
-		}
-		w.metaSent = true
 	}
 	switch kind {
 	case FrameKindH264:
 		return w.writeH264(data, pts, dts)
 	case FrameKindAAC:
+		if !w.avcSeqSent {
+			return nil
+		}
 		return w.writeAAC(data, dts)
 	case FrameKindUnknown:
 		return nil
@@ -116,7 +120,12 @@ func (w *RTMPFrameWriter) WriteFrame(kind FrameKind, data []byte, pts, dts uint3
 // IDs are hardcoded — strict players (Flussonic) refuse to play without
 // this tag even if every subsequent AV message is well-formed.
 func (w *RTMPFrameWriter) sendMetadata() error {
-	meta, err := rtmp.BuildMetadata(-1, -1, int(base.RtmpSoundFormatAac), int(base.RtmpCodecIdAvc))
+	width, height := -1, -1
+	if w.width > 0 && w.height > 0 {
+		width = int(w.width)   //nolint:gosec // SPS width fits in int on every platform we target
+		height = int(w.height) //nolint:gosec
+	}
+	meta, err := rtmp.BuildMetadata(width, height, int(base.RtmpSoundFormatAac), int(base.RtmpCodecIdAvc))
 	if err != nil {
 		return fmt.Errorf("rtmp writer: build metadata: %w", err)
 	}
@@ -132,8 +141,9 @@ func (w *RTMPFrameWriter) sendMetadata() error {
 }
 
 // writeH264 sends a single H.264 access unit (Annex-B with optional
-// SPS/PPS prefix on IDR). Emits the AVC sequence header tag once at
-// timestamp 0 before the first NALU tag.
+// SPS/PPS prefix on IDR). On the first frame carrying SPS+PPS, parses
+// width/height from the SPS, emits onMetaData, then the AVC sequence
+// header — both at timestamp 0 before the first NALU tag.
 func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 	if !w.avcSeqSent {
 		sps, pps, ok := extractSpsPpsFromAnnexB(annexB)
@@ -141,6 +151,16 @@ func (w *RTMPFrameWriter) writeH264(annexB []byte, pts, dts uint32) error {
 			// Drop frames until we see one carrying SPS+PPS — the player
 			// can't decode without them anyway.
 			return nil
+		}
+		// Parse SPS for width/height so onMetaData carries them — Flussonic
+		// and other strict players use the metadata resolution to size the
+		// video element before the first frame arrives.
+		var ctx avc.Context
+		if err := avc.ParseSps(sps, &ctx); err == nil {
+			w.width, w.height = ctx.Width, ctx.Height
+		}
+		if err := w.sendMetadata(); err != nil {
+			return err
 		}
 		seqRecord, err := avc.BuildSeqHeaderFromSpsPps(sps, pps)
 		if err != nil {
