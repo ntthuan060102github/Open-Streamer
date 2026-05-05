@@ -48,6 +48,7 @@ func TestResolveAudioEncoder(t *testing.T) {
 		{"", "aac"},
 		{AudioCodecCopy, "aac"},
 		{AudioCodecAAC, "aac"},
+		{AudioCodecMP2, "mp2"},
 		{AudioCodecMP3, "libmp3lame"},
 		{AudioCodecOpus, "libopus"},
 		{AudioCodecAC3, "ac3"},

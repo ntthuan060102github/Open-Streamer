@@ -45,11 +45,19 @@ func ResolveVideoEncoder(codec VideoCodec, hw HWAccel) string {
 // ResolveAudioEncoder maps a user-facing codec to FFmpeg's encoder name.
 // Empty / "copy" → AAC default (since copy is decided separately via
 // AudioTranscodeConfig.Copy).
+//
+// MP2 (mp2a) maps to FFmpeg's built-in `mp2` encoder — MPEG-1 Layer II,
+// always available in standard FFmpeg builds (no external library needed,
+// unlike libtwolame). Valid bitrates 32-384 kbps; FFmpeg silently rounds
+// to the nearest valid Layer II rate. Used for DVB broadcast contribution
+// feeds and legacy IPTV headends that consume Layer II input.
 func ResolveAudioEncoder(codec AudioCodec) string {
 	c := strings.TrimSpace(strings.ToLower(string(codec)))
 	switch c {
 	case "", string(AudioCodecCopy), string(AudioCodecAAC):
 		return "aac"
+	case string(AudioCodecMP2):
+		return "mp2"
 	case string(AudioCodecMP3):
 		return "libmp3lame"
 	case string(AudioCodecOpus):

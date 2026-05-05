@@ -105,9 +105,15 @@ var hwOptionalEncoders = map[domain.HWAccel][]string{
 
 // audioOptionalEncoders are HW-independent — included regardless of the
 // caller's hw filter (audio doesn't have HW variants in this app).
+//
+// `mp2` is FFmpeg's built-in MPEG-1/2 Audio Layer II encoder used when
+// stream config sets audio.codec=mp2a (DVB broadcast contribution feeds,
+// legacy IPTV headends). Always present in standard FFmpeg builds — no
+// external library needed (unlike libtwolame).
 var audioOptionalEncoders = []string{
 	"libopus",
 	"libmp3lame",
+	"mp2",
 	"ac3",
 }
 

@@ -2430,6 +2430,7 @@ const docTemplate = `{
             "type": "string",
             "enum": [
                 "aac",
+                "mp2a",
                 "mp3",
                 "opus",
                 "ac3",
@@ -2439,11 +2440,13 @@ const docTemplate = `{
                 "AudioCodecAAC": "default for HLS/DASH",
                 "AudioCodecAC3": "Dolby Digital — broadcast use",
                 "AudioCodecCopy": "passthrough — no re-encode",
+                "AudioCodecMP2": "MPEG-1/2 Audio Layer II — DVB broadcast contribution feeds",
                 "AudioCodecMP3": "legacy compatibility",
                 "AudioCodecOpus": "best for WebRTC / low-latency"
             },
             "x-enum-descriptions": [
                 "default for HLS/DASH",
+                "MPEG-1/2 Audio Layer II — DVB broadcast contribution feeds",
                 "legacy compatibility",
                 "best for WebRTC / low-latency",
                 "Dolby Digital — broadcast use",
@@ -2451,6 +2454,7 @@ const docTemplate = `{
             ],
             "x-enum-varnames": [
                 "AudioCodecAAC",
+                "AudioCodecMP2",
                 "AudioCodecMP3",
                 "AudioCodecOpus",
                 "AudioCodecAC3",

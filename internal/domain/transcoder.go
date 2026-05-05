@@ -32,6 +32,7 @@ type AudioCodec string
 // AudioCodec values name supported output audio codecs.
 const (
 	AudioCodecAAC  AudioCodec = "aac"  // default for HLS/DASH
+	AudioCodecMP2  AudioCodec = "mp2a" // MPEG-1/2 Audio Layer II — DVB broadcast contribution feeds
 	AudioCodecMP3  AudioCodec = "mp3"  // legacy compatibility
 	AudioCodecOpus AudioCodec = "opus" // best for WebRTC / low-latency
 	AudioCodecAC3  AudioCodec = "ac3"  // Dolby Digital — broadcast use
