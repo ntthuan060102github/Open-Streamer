@@ -63,6 +63,34 @@ type PlayInfo struct {
 	RemoteAddr string
 }
 
+// StreamCallbacks receives per-publish-session events for a single stream.
+// The ingestor.Service registers these via SetStreamCallbacks at the same
+// time it registers the routing slot — closures capture the input priority
+// (and any other manager-side context) so the push server stays agnostic
+// of those concerns. Without these the Stream Manager never sees that an
+// encoder is connected and the stream stays "Exhausted" forever (Path B
+// has no loopback pull worker to surface packets).
+//
+// Any field may be nil. Callbacks fire on lal's read goroutine and must
+// be cheap; defer heavy work.
+type StreamCallbacks struct {
+	// OnConnect fires once when the encoder finishes the publish handshake.
+	OnConnect func()
+	// OnPacket fires for every RTMP AV message — drives the manager's
+	// Active-status / clear-Exhausted logic.
+	OnPacket func()
+	// OnPacketBytes fires for every RTMP AV message with the payload byte
+	// count, for ingest bytes / packets metrics.
+	OnPacketBytes func(n int)
+	// OnMedia fires for every emitted AVPacket — drives the manager's
+	// per-track codec / bitrate / resolution panel.
+	OnMedia func(p *domain.AVPacket)
+	// OnDisconnect fires when the publish session ends (encoder closed,
+	// network error, server shutdown). The manager uses this to mark
+	// the input degraded and trigger failover.
+	OnDisconnect func(err error)
+}
+
 // RTMPServer accepts RTMP push connections from encoders, validates them
 // against the push Registry, and writes decoded AVPackets into the Buffer
 // Hub. External RTMP play clients are served via the optional PlayFunc.
@@ -75,6 +103,13 @@ type RTMPServer struct {
 	subs     map[*rtmp.ServerSession]*subState
 	playFunc PlayFunc
 
+	// streamCallbacks: streamID → per-stream callback set. Populated by
+	// the ingestor.Service at startPushRegistration time so the closures
+	// can capture priority / metric labels without the push server having
+	// to know those concepts.
+	cbMu            sync.Mutex
+	streamCallbacks map[domain.StreamCode]StreamCallbacks
+
 	server *rtmp.Server
 }
 
@@ -86,6 +121,8 @@ type pubState struct {
 	bufferWriteID domain.StreamCode
 	streamID      domain.StreamCode
 	buf           *buffer.Service
+
+	cb StreamCallbacks
 
 	converter   *pull.RTMPMsgConverter
 	firstPacket bool
@@ -114,6 +151,40 @@ func (s *RTMPServer) SetPlayFunc(fn PlayFunc) {
 	s.mu.Lock()
 	s.playFunc = fn
 	s.mu.Unlock()
+}
+
+// SetStreamCallbacks installs the per-session callback set for streamID.
+// The ingestor.Service calls this once it has registered the routing
+// slot (see startPushRegistration). Without callbacks the Stream Manager
+// never sees that an encoder connected and the stream stays Exhausted.
+//
+// Pass an empty StreamCallbacks{} to detach (or call ClearStreamCallbacks).
+// Replaces any previous callbacks for the same stream.
+func (s *RTMPServer) SetStreamCallbacks(streamID domain.StreamCode, cb StreamCallbacks) {
+	s.cbMu.Lock()
+	if s.streamCallbacks == nil {
+		s.streamCallbacks = make(map[domain.StreamCode]StreamCallbacks)
+	}
+	s.streamCallbacks[streamID] = cb
+	s.cbMu.Unlock()
+}
+
+// ClearStreamCallbacks removes the callbacks for streamID. Safe to call
+// for an unregistered stream; subsequent push sessions for streamID will
+// simply have no observer hooks (the buffer-write path is unaffected).
+func (s *RTMPServer) ClearStreamCallbacks(streamID domain.StreamCode) {
+	s.cbMu.Lock()
+	delete(s.streamCallbacks, streamID)
+	s.cbMu.Unlock()
+}
+
+// callbacksFor returns the registered callbacks for streamID, or a zero
+// value if none were installed. Zero StreamCallbacks fields are safe to
+// invoke (each pubState method nil-checks before calling).
+func (s *RTMPServer) callbacksFor(streamID domain.StreamCode) StreamCallbacks {
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	return s.streamCallbacks[streamID]
 }
 
 // Run binds the TCP listener and accepts RTMP connections until ctx is
@@ -185,11 +256,13 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 		return err
 	}
 
+	cb := s.callbacksFor(streamID)
 	state := &pubState{
 		key:           key,
 		bufferWriteID: bufWriteID,
 		streamID:      streamID,
 		buf:           buf,
+		cb:            cb,
 		converter:     pull.NewRTMPMsgConverter(),
 		firstPacket:   true,
 	}
@@ -198,6 +271,10 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 	s.mu.Lock()
 	s.pubs[session] = state
 	s.mu.Unlock()
+
+	if cb.OnConnect != nil {
+		cb.OnConnect()
+	}
 
 	slog.Info("rtmp server: publisher accepted",
 		"key", key, "stream_id", streamID,
@@ -208,7 +285,8 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 
 // OnDelRtmpPubSession is invoked when a publish session ends (encoder
 // disconnect, network error, server shutdown). Releases the registry
-// slot so the next pusher can claim the key.
+// slot so the next pusher can claim the key, and tells the manager the
+// input has gone away so it can fail over.
 func (s *RTMPServer) OnDelRtmpPubSession(session *rtmp.ServerSession) {
 	s.mu.Lock()
 	state, ok := s.pubs[session]
@@ -218,10 +296,18 @@ func (s *RTMPServer) OnDelRtmpPubSession(session *rtmp.ServerSession) {
 		return
 	}
 	s.registry.Release(state.key)
+	if state.cb.OnDisconnect != nil {
+		state.cb.OnDisconnect(errPusherDisconnected)
+	}
 	slog.Info("rtmp server: publisher disconnected",
 		"key", state.key, "stream_id", state.streamID,
 	)
 }
+
+// errPusherDisconnected is the sentinel handed to OnDisconnect. The manager
+// only uses it for logging / event payload — the failover decision is
+// driven by the input priority going degraded.
+var errPusherDisconnected = errors.New("rtmp pusher disconnected")
 
 // OnNewRtmpSubSession is invoked when a play client connects. We delegate
 // to the registered PlayFunc (publisher side). If no PlayFunc is wired,
@@ -278,12 +364,22 @@ func (s *RTMPServer) OnDelRtmpSubSession(session *rtmp.ServerSession) {
 // ─── lal IPubSessionObserver (implemented by *pubState) ────────────────
 
 // OnReadRtmpAvMsg is invoked by lal for every audio/video RtmpMsg the
-// publisher sends. Convert to AVPackets and write to the buffer hub.
+// publisher sends. Convert to AVPackets, write to the buffer hub, and
+// fire ingest observers so the Stream Manager sees liveness and codec
+// metadata for this push input (without these the manager treats the
+// stream as Exhausted forever — there is no loopback worker to surface
+// packets in Path B).
 //
 // The first AV packet after acquisition is marked Discontinuity=true so
 // downstream consumers (HLS / DASH segmenters) flush their accumulated
 // buffer and start fresh. Mirrors the pull-worker firstPacket logic.
 func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
+	if p.cb.OnPacket != nil {
+		p.cb.OnPacket()
+	}
+	if p.cb.OnPacketBytes != nil {
+		p.cb.OnPacketBytes(len(msg.Payload))
+	}
 	for _, av := range p.converter.Convert(msg) {
 		cl := av.Clone()
 		if p.firstPacket {
@@ -293,6 +389,9 @@ func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
 		if err := p.buf.Write(p.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
 			slog.Debug("rtmp server: buffer write failed",
 				"key", p.key, "err", err)
+		}
+		if p.cb.OnMedia != nil {
+			p.cb.OnMedia(cl)
 		}
 	}
 }

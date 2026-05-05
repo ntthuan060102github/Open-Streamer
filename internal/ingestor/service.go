@@ -68,6 +68,10 @@ type Service struct {
 	workers         map[domain.StreamCode]*pullWorkerEntry
 	rtmpSrv         *push.RTMPServer // set during Run if listeners.RTMP.Enabled
 	pendingPlayFunc push.PlayFunc    // stored before Run, wired in once server is created
+	// pendingPushCallbacks holds per-stream callbacks queued before Run
+	// created the RTMP server. Drained and applied in Run; nil once the
+	// server is live (subsequent registrations call rtmpSrv directly).
+	pendingPushCallbacks map[domain.StreamCode]push.StreamCallbacks
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -177,17 +181,82 @@ func (s *Service) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("ingestor: create rtmp server: %w", err)
 		}
+
 		s.mu.Lock()
 		s.rtmpSrv = rtmpSrv
 		if s.pendingPlayFunc != nil {
 			rtmpSrv.SetPlayFunc(s.pendingPlayFunc)
 			s.pendingPlayFunc = nil
 		}
+		// Wire pending push callbacks (deferred from startPushRegistration
+		// when the server didn't exist yet — typical on cold start where
+		// streams are activated before Run binds the listener).
+		for streamID, cb := range s.pendingPushCallbacks {
+			rtmpSrv.SetStreamCallbacks(streamID, cb)
+		}
+		s.pendingPushCallbacks = nil
 		s.mu.Unlock()
 		g.Go(func() error { return rtmpSrv.Run(ctx) })
 	}
 
 	return g.Wait()
+}
+
+// pushStreamCallbacks builds the per-stream callback set the push server
+// fires for one publish session. Closures capture streamID + priority +
+// protocol so the push server itself stays unaware of those concepts —
+// without this set the Stream Manager never sees packets from a push
+// input (Path B has no loopback pull worker) and the stream stays
+// Exhausted forever.
+//
+// All observer pointers are resolved at fire time so SetPacketObserver /
+// SetInputErrorObserver / SetMediaPacketObserver (wired by runtime.Manager
+// after Service is constructed) don't race with the server starting up.
+func (s *Service) pushStreamCallbacks(streamID domain.StreamCode, priority int, proto string) push.StreamCallbacks {
+	return push.StreamCallbacks{
+		OnConnect: func() {
+			//nolint:contextcheck // event publish must outlive any per-session ctx; uses Background by design
+			s.bus.Publish(context.Background(), domain.Event{
+				Type:       domain.EventInputConnected,
+				StreamCode: streamID,
+				Payload:    map[string]any{"input_priority": priority, "protocol": proto},
+			})
+		},
+		OnPacket: func() {
+			s.mu.Lock()
+			fn := s.onPacket
+			s.mu.Unlock()
+			if fn != nil {
+				fn(streamID, priority)
+			}
+		},
+		OnPacketBytes: func(n int) {
+			s.m.IngestorBytesTotal.WithLabelValues(string(streamID), proto).Add(float64(n))
+			s.m.IngestorPacketsTotal.WithLabelValues(string(streamID), proto).Inc()
+		},
+		OnMedia: func(p *domain.AVPacket) {
+			s.mu.Lock()
+			fn := s.onMedia
+			s.mu.Unlock()
+			if fn != nil {
+				fn(streamID, priority, p)
+			}
+		},
+		OnDisconnect: func(err error) {
+			s.mu.Lock()
+			fn := s.onInputError
+			s.mu.Unlock()
+			if fn != nil {
+				fn(streamID, priority, err)
+			}
+			//nolint:contextcheck // event publish must outlive any per-session ctx; uses Background by design
+			s.bus.Publish(context.Background(), domain.Event{
+				Type:       domain.EventInputFailed,
+				StreamCode: streamID,
+				Payload:    map[string]any{"input_priority": priority, "protocol": proto, "error": err.Error()},
+			})
+		},
+	}
 }
 
 // rtmpListenAddr builds the bind address from the listeners config, applying
@@ -215,6 +284,7 @@ func (s *Service) Start(ctx context.Context, streamID domain.StreamCode, input d
 		bufferWriteID = streamID
 	}
 	if protocol.IsPushListen(input.URL) {
+		//nolint:contextcheck // push registration is sync metadata only; per-session ctx lives inside push.RTMPServer.
 		return s.startPushRegistration(streamID, input, bufferWriteID)
 	}
 	return s.startPullWorker(ctx, streamID, input, bufferWriteID)
@@ -253,8 +323,6 @@ func (s *Service) Probe(ctx context.Context, input domain.Input) error {
 // Stop cancels the pull worker or unregisters the push key for streamID.
 func (s *Service) Stop(streamID domain.StreamCode) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if w, ok := s.workers[streamID]; ok {
 		slog.Info("ingestor: stopping pull worker",
 			"stream_code", streamID,
@@ -262,6 +330,12 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 		)
 		w.cancel()
 		delete(s.workers, streamID)
+	}
+	srv := s.rtmpSrv
+	delete(s.pendingPushCallbacks, streamID)
+	s.mu.Unlock()
+	if srv != nil {
+		srv.ClearStreamCallbacks(streamID)
 	}
 }
 
@@ -379,6 +453,26 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 
 	s.registry.Register(key, streamID, s.buf, bufferWriteID)
 
+	// Install per-stream callbacks the push server fires when an encoder
+	// connects. The callbacks capture priority + protocol so the push
+	// server itself never needs those concepts. If Run hasn't created
+	// the server yet, queue them on pendingPushCallbacks for deferred
+	// wiring.
+	cb := s.pushStreamCallbacks(streamID, input.Priority, string(protocol.Detect(input.URL)))
+	s.mu.Lock()
+	srv := s.rtmpSrv
+	if srv == nil {
+		if s.pendingPushCallbacks == nil {
+			s.pendingPushCallbacks = make(map[domain.StreamCode]push.StreamCallbacks)
+		}
+		s.pendingPushCallbacks[streamID] = cb
+	}
+	errObserver := s.onInputError
+	s.mu.Unlock()
+	if srv != nil {
+		srv.SetStreamCallbacks(streamID, cb)
+	}
+
 	slog.Info("ingestor: push slot registered",
 		"stream_code", streamID,
 		"input_priority", input.Priority,
@@ -388,9 +482,6 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 
 	// No pusher is connected yet — notify the manager so it can fall back to
 	// a lower-priority input immediately rather than waiting for the packet timeout.
-	s.mu.Lock()
-	errObserver := s.onInputError
-	s.mu.Unlock()
 	if errObserver != nil {
 		errObserver(streamID, input.Priority, errNoPusherConnected)
 	}
