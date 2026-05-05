@@ -150,7 +150,7 @@ func (s *inputTrackStats) snapshot() []domain.MediaTrackInfo {
 	// one counter — see inputTrackStats type doc).
 	for _, c := range []domain.AVCodec{
 		domain.AVCodecH264, domain.AVCodecH265,
-		domain.AVCodecAAC, domain.AVCodecMP2,
+		domain.AVCodecAAC, domain.AVCodecMP2, domain.AVCodecMP3,
 	} {
 		if t, ok := s.tracks[c]; ok {
 			out = append(out, t.snapshot())

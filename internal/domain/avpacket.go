@@ -22,14 +22,18 @@ const (
 	// File). RTSP / RTMP / Copy / Mixer continue to emit decoded AVPackets.
 	AVCodecRawTSChunk
 
-	// AVCodecMP2 is MPEG-1 / MPEG-2 audio (Layer I, II, or III). The TS
-	// stream-type values 0x03 (MPEG-1 audio) and 0x04 (MPEG-2 audio) both
-	// land here — the wire format is identical at the frame level so the
-	// downstream muxer doesn't need to distinguish. Common in DVB radio
-	// channels relayed over IP multicast (e.g. VOH FM, BBC World Service)
-	// and in legacy IPTV headends; needed so mixer:// sources pulling such
-	// audio are correctly recognised instead of silently dropped.
+	// AVCodecMP2 is MPEG-1 / MPEG-2 Audio Layer I or II. Common in DVB
+	// radio channels (e.g. VOH FM) and SD TV audio. TS stream_type 0x03 /
+	// 0x04 both land here — the container doesn't encode Layer; we look
+	// at the frame header to distinguish Layer III (= MP3, AVCodecMP3).
 	AVCodecMP2
+
+	// AVCodecMP3 is MPEG-1 / MPEG-2 Audio Layer III (the familiar "MP3").
+	// Same TS stream_type as MP2 (0x03 / 0x04); detected by parsing the
+	// MPEG audio frame header so the UI label and downstream codec-aware
+	// consumers (mixer, transcoder configs targeting "mp3") see the right
+	// codec instead of the generic mp2a fallback.
+	AVCodecMP3
 )
 
 // IsVideo reports whether the codec carries a video elementary stream.
@@ -39,7 +43,7 @@ func (c AVCodec) IsVideo() bool {
 
 // IsAudio reports whether the codec carries an audio elementary stream.
 func (c AVCodec) IsAudio() bool {
-	return c == AVCodecAAC || c == AVCodecMP2
+	return c == AVCodecAAC || c == AVCodecMP2 || c == AVCodecMP3
 }
 
 // AVPacket is one decoded video access unit (Annex B H.264/H.265) or one AAC frame (ADTS in Data).

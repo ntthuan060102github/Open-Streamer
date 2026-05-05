@@ -54,11 +54,13 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 			dts = p.PTSms
 		}
 		_ = f.mux.Write(f.apid, p.Data, p.PTSms, dts) //nolint:errcheck
-	case domain.AVCodecMP2:
-		// MPEG-1/2 Audio — use stream_type 0x04 (MPEG-2 audio) as the
-		// canonical container; gomedia's TSMuxer accepts both 0x03 and
-		// 0x04 but 0x04 is the broader-compatibility choice for downstream
-		// players. Frame payload is forwarded verbatim.
+	case domain.AVCodecMP2, domain.AVCodecMP3:
+		// MPEG-1/2 Audio Layer I/II/III — use stream_type 0x04 (MPEG-2
+		// audio) as the canonical container for both. The Layer is
+		// encoded in each frame header itself, not in the PMT, so a
+		// player decoding the resulting TS will pick up Layer III (MP3)
+		// or Layer II (MP2) automatically. gomedia's TSMuxer accepts
+		// both 0x03 and 0x04; 0x04 is the broader-compatibility choice.
 		if !f.hasA {
 			f.apid = f.mux.AddStream(gompeg2.TS_STREAM_AUDIO_MPEG2)
 			f.hasA = true

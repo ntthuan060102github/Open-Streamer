@@ -83,6 +83,28 @@ func TestInputTrackStats_MP2AppearsInSnapshot(t *testing.T) {
 	}
 }
 
+// TestInputTrackStats_MP3AppearsAsDistinctTrack ensures MP3 (Layer III)
+// surfaces in the panel under its own "mp3" label rather than collapsing
+// into the generic "mp2a" bucket. Critical for operators who run Flussonic
+// alongside Open-Streamer and expect identical codec naming.
+func TestInputTrackStats_MP3AppearsAsDistinctTrack(t *testing.T) {
+	st := newInputTrackStats()
+	now := time.Unix(0, 0)
+	st.observe(&domain.AVPacket{Codec: domain.AVCodecMP3, Data: make([]byte, 30_000)}, now)
+	st.observe(&domain.AVPacket{Codec: domain.AVCodecMP3, Data: nil}, now.Add(4*time.Second))
+
+	tracks := st.snapshot()
+	if len(tracks) != 1 {
+		t.Fatalf("expected 1 track, got %d (%+v)", len(tracks), tracks)
+	}
+	if tracks[0].Codec != "mp3" {
+		t.Errorf("expected codec label 'mp3', got %q", tracks[0].Codec)
+	}
+	if tracks[0].Kind != domain.MediaTrackAudio {
+		t.Errorf("MP3 must classify as audio, got %s", tracks[0].Kind)
+	}
+}
+
 // TestInputTrackStats_NilAndUnknown verifies hot-path safety on garbage input.
 func TestInputTrackStats_NilAndUnknown(t *testing.T) {
 	st := newInputTrackStats()

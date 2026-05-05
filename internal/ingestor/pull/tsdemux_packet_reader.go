@@ -339,11 +339,11 @@ func buildAVPacket(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) (d
 	case gompeg2.TS_STREAM_AAC:
 		cdc = domain.AVCodecAAC
 	case gompeg2.TS_STREAM_AUDIO_MPEG1, gompeg2.TS_STREAM_AUDIO_MPEG2:
-		// MPEG-1 / MPEG-2 Audio (Layer I/II/III) — common in DVB radio
-		// channels and SD TV audio. Frame format identical at the wire level
-		// for both stream types so the downstream muxer doesn't need to
-		// distinguish them.
-		cdc = domain.AVCodecMP2
+		// TS container doesn't encode the Layer (I/II/III) — peek at the
+		// frame header to split MP3 (Layer III) from MP1/MP2. Done here so
+		// the UI label and codec-aware consumers see "mp3" instead of the
+		// generic "mp2a" for Layer III sources.
+		cdc = mpegAudioCodecFromFrame(frame)
 	default:
 		return domain.AVPacket{}, false
 	}
@@ -355,6 +355,40 @@ func buildAVPacket(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) (d
 		DTSms:    dts,
 		KeyFrame: keyFrame,
 	}, true
+}
+
+// mpegAudioCodecFromFrame inspects the first MPEG audio frame header in the
+// PES payload to split MP3 (Layer III) from MP1/MP2 (Layer I/II). The TS
+// container's stream_type (0x03/0x04) doesn't encode the Layer, so the frame
+// header is the only place to tell them apart for UI labelling and codec-
+// aware routing (mixer, transcoder copy decision).
+//
+// MPEG audio frame header layout (first 2 bytes, the rest is bitrate /
+// sample-rate / channel info we don't need here):
+//
+//	byte 0: 0xFF                              (sync byte 1, all bits set)
+//	byte 1: 1 1 1 V V L L B
+//	            ^^^ sync continuation = 111
+//	                ^^^ MPEG version (00=v2.5, 01=reserved, 10=v2, 11=v1)
+//	                  ^^^ Layer (00=reserved, 01=Layer III, 10=Layer II, 11=Layer I)
+//	                      ^ protection bit
+//
+// Falls back to AVCodecMP2 when the header is absent or ambiguous so the
+// pipeline degrades into the prior "everything is mp2a" mode rather than
+// silently dropping audio.
+func mpegAudioCodecFromFrame(frame []byte) domain.AVCodec {
+	if len(frame) < 2 {
+		return domain.AVCodecMP2
+	}
+	// Sync: 0xFF followed by a byte whose top 3 bits are 111.
+	if frame[0] != 0xFF || frame[1]&0xE0 != 0xE0 {
+		return domain.AVCodecMP2
+	}
+	const layerIII = 0b01
+	if (frame[1]>>1)&0x03 == layerIII {
+		return domain.AVCodecMP3
+	}
+	return domain.AVCodecMP2
 }
 
 // ReadPackets blocks until at least one AVPacket is available, then drains as many

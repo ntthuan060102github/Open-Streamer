@@ -260,7 +260,9 @@ func (s *tsKeyframeScanner) isIDR(pes []byte) bool {
 		return scanForH264IDR(es)
 	case domain.AVCodecH265:
 		return scanForH265IRAP(es)
-	case domain.AVCodecUnknown, domain.AVCodecAAC, domain.AVCodecMP2, domain.AVCodecRawTSChunk:
+	case domain.AVCodecUnknown, domain.AVCodecAAC,
+		domain.AVCodecMP2, domain.AVCodecMP3,
+		domain.AVCodecRawTSChunk:
 		return false // not a video codec we recognise
 	default:
 		return false
