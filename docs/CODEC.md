@@ -1,0 +1,388 @@
+# Open Streamer — Codec Support Matrix
+
+What codecs can be **ingested** (recognised by the data path), **encoded**
+(produced by the transcoder), **muxed** (re-wrapped into MPEG-TS), and
+**delivered** (HLS / DASH / MPEG-TS / RTMP / SRT / RTSP). For the
+operator-facing stream config knobs see
+[CONFIG.md](./CONFIG.md); for the data-path topology see
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
+---
+
+## 1. Reading the matrix
+
+A codec lands in this server through one of three doors:
+
+- **Ingest path** — recognised at byte level (passthrough always works) AND
+  at AVPacket level (needed for stats panel, mixer extraction).
+- **Encoder path** — `transcoder.video.codec` / `transcoder.audio.codec`
+  resolves to an FFmpeg encoder. Without this, the user setting is silently
+  fallen back to a default (libx264 / aac) — set the right value or use
+  `copy: true` for passthrough.
+- **Re-mux path** — `tsmux.FromAV` knows how to wrap the AVPacket into
+  MPEG-TS for downstream segmenters, push handlers, and the `mixer://`
+  reader.
+
+Three independent capabilities. A codec might be ingest-recognised but
+not encodable (you can stat it, can't transcode TO it), or encodable but
+not ingest-recognised (you can encode TO it, but the stats panel shows
+"unknown" if the source uses it).
+
+---
+
+## 2. Audio codecs
+
+| Codec | Label | Ingest TS | Ingest RTMP | Ingest RTSP | Stats panel | Encode OUTPUT | tsmux re-mux | mixer:// extract | HLS browser |
+|---|---|---|---|---|---|---|---|---|---|
+| AAC | `aac` | ✅ | ✅ | ✅ | ✅ | ✅ `aac` | ✅ | ✅ | ✅ |
+| MPEG-1/2 Audio Layer I/II | `mp2a` | ✅ | ❌ | ❌ | ✅ | ✅ `mp2` | ✅ | ✅ | ❌ (transcode → AAC) |
+| MPEG-1/2 Audio Layer III | `mp3` | ✅ frame parse | ❌ | ❌ | ✅ | ✅ `libmp3lame` | ✅ | ✅ | ✅ |
+| AC-3 (Dolby Digital) | `ac3` | ✅ ATSC + DVB | ❌ | ❌ | ✅ | ✅ `ac3` | ⚠️ skip-with-comment | ❌ (no frame extractor) | ⚠️ Safari/Chrome macOS only |
+| E-AC-3 (Dolby Digital Plus) | `eac3` | ✅ ATSC + DVB | ❌ | ❌ | ✅ | ✅ `eac3` | ⚠️ skip-with-comment | ❌ (no frame extractor) | ⚠️ same as AC-3 |
+| Opus | `opus` | ❌ rare in TS | ❌ | ❌ | ❌ | ✅ `libopus` | ❌ | ❌ | ❌ |
+
+### TS recognition for audio
+
+| Source signal | Detected as |
+|---|---|
+| `stream_type` 0x03 (MPEG-1 audio) | `mp2a` (upgraded to `mp3` if first PES sync detects Layer III) |
+| `stream_type` 0x04 (MPEG-2 audio) | `mp2a` (upgraded to `mp3` likewise) |
+| `stream_type` 0x0F (AAC ADTS) | `aac` |
+| `stream_type` 0x11 (AAC LATM) | `aac` |
+| `stream_type` 0x81 (ATSC AC-3) | `ac3` |
+| `stream_type` 0x87 (ATSC E-AC-3) | `eac3` |
+| `stream_type` 0x06 + descriptor 0x6A (DVB AC-3) | `ac3` |
+| `stream_type` 0x06 + descriptor 0x7A (DVB E-AC-3) | `eac3` |
+
+---
+
+## 3. Video codecs
+
+| Codec | Label | Ingest TS | Ingest RTMP | Ingest RTSP | Stats panel | Resolution detect | Encode OUTPUT | tsmux re-mux | mixer:// extract | HLS browser |
+|---|---|---|---|---|---|---|---|---|---|---|
+| H.264 / AVC | `h264` | ✅ | ✅ | ✅ | ✅ | ✅ SPS parse | ✅ libx264 / NVENC / VAAPI / QSV / VideoToolbox | ✅ | ✅ | ✅ |
+| H.265 / HEVC | `h265` | ✅ | ❌ | ✅ | ✅ | ✅ SPS parse | ✅ libx265 / NVENC / VAAPI / QSV / VideoToolbox | ✅ | ✅ | ⚠️ Safari + modern Chrome |
+| MPEG-2 Video (H.262) | `mp2v` | ✅ stream_type 0x02 | ❌ | ❌ | ✅ | ❌ (no sequence_header parser) | ✅ `mpeg2video` | ⚠️ skip-with-comment | ❌ (no frame extractor) | ❌ |
+| AV1 | `av1` | ✅ DVB descriptor "AV01" | ❌ | ❌ | ✅ | ❌ (no OBU parser) | ✅ `libsvtav1` | ⚠️ skip-with-comment | ❌ (no frame extractor) | ⚠️ recent Chrome / Edge / Firefox |
+| VP9 | `vp9` | ❌ rare in TS | ❌ | ❌ | ❌ | ❌ | ✅ `libvpx-vp9` | ❌ | ❌ | ✅ Chrome / Firefox |
+
+### TS recognition for video
+
+| Source signal | Detected as |
+|---|---|
+| `stream_type` 0x01 (MPEG-1 Video) | `mp2v` (lumped with MPEG-2) |
+| `stream_type` 0x02 (MPEG-2 Video) | `mp2v` |
+| `stream_type` 0x1B (H.264) | `h264` |
+| `stream_type` 0x24 (H.265) | `h265` |
+| `stream_type` 0x06 + registration descriptor format ID `"AV01"` | `av1` |
+
+---
+
+## 4. FFmpeg encoder mappings
+
+`transcoder.audio.codec` and `transcoder.video.codec` resolve to FFmpeg
+encoder names via [`internal/domain/resolvers.go`](../internal/domain/resolvers.go).
+Empty / unknown codec values silently fall back to `libx264` (video) or
+`aac` (audio) — set the right value or use `copy: true` to passthrough.
+
+### Audio
+
+| User config | FFmpeg encoder | External library required |
+|---|---|---|
+| `aac` (default) | `aac` | none (built-in) |
+| `mp2a` | `mp2` | none (built-in) |
+| `mp3` | `libmp3lame` | yes — `--enable-libmp3lame` |
+| `opus` | `libopus` | yes — `--enable-libopus` |
+| `ac3` | `ac3` | none (built-in) |
+| `eac3` | `eac3` | none (built-in) |
+| `copy` | (no encode) | n/a |
+
+### Video
+
+| User config | HW=none | HW=NVENC | HW=VAAPI/QSV/VideoToolbox |
+|---|---|---|---|
+| `h264` / `avc` (default) | `libx264` | `h264_nvenc` | (use explicit encoder name) |
+| `h265` / `hevc` | `libx265` | `hevc_nvenc` | (use explicit encoder name) |
+| `vp9` | `libvpx-vp9` | (no GPU path) | (no GPU path) |
+| `av1` | `libsvtav1` | (no GPU path) | (no GPU path) |
+| `mp2v` / `mpeg2video` | `mpeg2video` | (no GPU path) | (no GPU path) |
+| explicit encoder name (e.g. `h264_qsv`) | preserved | preserved | preserved |
+| `copy` | (no encode) | (no encode) | (no encode) |
+
+External libraries (`libmp3lame`, `libopus`, `libvpx-vp9`, `libsvtav1`,
+`libx264`, `libx265`) require the FFmpeg build to enable them at compile
+time. The probe endpoint (`POST /config/transcoder/probe`) reports which
+encoders are actually present in the binary the operator points to.
+
+---
+
+## 5. Architecture notes
+
+### 5.1 Two recognition paths run in parallel
+
+Raw-TS sources (UDP / HLS / SRT / File) flow bytes through the buffer hub
+unchanged — *no codec recognition is required for the data path itself*.
+The two independent recognisers run in side channels:
+
+1. **gompeg2 demuxer** (in `tsdemux_packet_reader.go`) — produces full
+   AVPackets (with PTS/DTS/keyframe flags) for the codecs it understands:
+   H.264, H.265, AAC, MPEG audio. Used by RTSP/RTMP-style downstreams that
+   need real frames (mixer extraction, transcoder when fed AVPackets).
+
+2. **PMT scanner** (in `stats_pmt_scanner.go`) — parses PSI tables and
+   maps every PMT-listed PID to its codec via stream_type + DVB
+   descriptors. Emits stats AVPackets for *every* recognised PID, including
+   AC-3, E-AC-3, MPEG-2 Video, and AV1 (codecs gompeg2 drops on the
+   floor). Used only for the input "tracks" panel — does not produce
+   frames.
+
+The PMT scanner replaced an earlier gompeg2-based stats path; without it,
+DVB AC-3 / MPEG-2 / AV1 sources showed an empty "tracks" panel in the UI
+even when the data path was healthy.
+
+### 5.2 Why mixer:// can't extract these new codecs
+
+`mixer://video,audio` re-interleaves AVPackets at frame granularity. The
+gompeg2 library does not extract frames for AC-3, E-AC-3, MPEG-2 Video,
+or AV1, so the side path that powers the mixer reader has no source to
+draw from.
+
+Building a custom frame extractor for each codec is a separate piece of
+work: AC-3 needs frame-sync scanning (`0x0B77`), MPEG-2 needs
+sequence-header / picture-header parsing, AV1 needs OBU walking. None of
+these are difficult but each is its own ~150-line module with its own
+test set. The current decision is to add them on demand rather than
+preemptively.
+
+### 5.3 Why tsmux skips these codecs
+
+`tsmux.FromAV` (see [internal/tsmux/fromav.go](../internal/tsmux/fromav.go))
+has explicit `case` arms for codec → TS stream_type. AC-3 / E-AC-3 /
+MPEG-2 Video / AV1 are present in the switch for compile-time
+exhaustiveness but return immediately — there are no AVPackets to mux
+because of §5.2. The cases exist so a future contributor wiring frame
+extraction sees the muxer call site and doesn't chase a silent-skip bug.
+
+### 5.4 Resolution detection
+
+`MediaTrackInfo.Width / Height` is populated by parsing the codec's
+sequence parameters on the first observed keyframe. Currently implemented
+only for H.264 (AVC SPS) and H.265 (HEVC SPS). MPEG-2 Video (sequence
+header) and AV1 (sequence header OBU) would each need ~80–150 lines.
+Audio codecs have no concept of resolution.
+
+---
+
+## 6. Limitations & workarounds
+
+### 6.1 Browser HLS playback
+
+Apple's HLS spec lists AAC, AC-3, EC-3, MP3 as audio codecs and AVC, HEVC
+as video. Browsers implement subsets:
+
+| Browser | Audio | Video |
+|---|---|---|
+| Safari (macOS / iOS) | AAC, AC-3, EC-3, MP3 | H.264, H.265 (HW only) |
+| Chrome (desktop) | AAC, MP3, AC-3 (macOS only) | H.264, H.265 (recent), AV1 |
+| Firefox | AAC, MP3 | H.264, AV1 (recent) |
+| Edge (Chromium) | AAC, MP3, AC-3 (Windows only) | H.264, H.265, AV1 |
+
+For maximum compatibility, transcode anything else to **AAC + H.264** for
+HLS output. MP2 audio in particular is **not** in the HLS spec and most
+browsers won't decode it. Set `transcoder.audio.codec=aac` to convert.
+
+### 6.2 mixer:// codec coverage
+
+Only AAC / MP2 / MP3 audio + H.264 / H.265 video can be extracted by the
+mixer. To use a new-codec audio source as a mixer audio input:
+
+```yaml
+streams:
+  - code: src_ac3
+    inputs:
+      - url: udp://...
+    transcoder:
+      audio: { copy: false, codec: aac, bitrate: 192 }
+      video: { copy: true }   # we only need to re-encode audio
+
+  - code: mixed
+    inputs:
+      - url: mixer://video_stream,src_ac3   # mixer sees AAC, works
+```
+
+### 6.3 RTMP / RTSP codec map
+
+The `gomedia/joyav` RTMP reader currently recognises only H.264 + AAC
+streams; the gortsplib RTSP reader recognises H.264, H.265, AAC.
+Other codecs (Opus, AC-3, MP3) over those transports are dropped at the
+reader. Users needing MP2 / AC-3 / AV1 should ingest via UDP / HLS / SRT /
+File where the TS path recognises them.
+
+### 6.4 Resolution unknown for non-H.26x video
+
+`MediaTrackInfo.Width / Height` will be 0 for MPEG-2 Video and AV1
+sources. The UI should hide the resolution row for tracks where
+`Width × Height == 0` rather than rendering "0x0".
+
+### 6.5 Encoding to specific HW backends
+
+VP9 / AV1 / MPEG-2 Video have no entry in `hwOptionalEncoders` for NVENC /
+VAAPI / QSV / VideoToolbox. They run on the CPU regardless of the global
+`hw` setting. If a HW path is needed (e.g. `h264_nvenc` for AV1's input
+decode) the operator must spell the explicit encoder name in
+`transcoder.video.codec`.
+
+### 6.6 Bitrate accuracy
+
+The PMT scanner reports bitrate at the **TS payload level** (includes PES
+headers and adaptation field). gompeg2 (the older path) reported it at
+the **elementary stream level** (PES headers stripped). For typical IPTV
+streams the difference is ~3–5% — TS-level matches what `ss -lump`,
+`tcpdump`, and Flussonic display.
+
+---
+
+## 7. Configuration examples
+
+### 7.1 Pure relay (lowest CPU, lowest latency)
+
+Source codec doesn't matter — bytes flow through unchanged.
+
+```yaml
+streams:
+  - code: ch1_relay
+    inputs:
+      - url: udp://ens5@239.0.113.1:5001
+    protocols:
+      mpegts: true     # raw-TS HTTP relay endpoint
+```
+
+### 7.2 DVB SD source → modern HLS playback
+
+MPEG-2 Video + MP2 audio source needs full re-encode for browser HLS.
+
+```yaml
+streams:
+  - code: ch1
+    inputs:
+      - url: udp://ens5@239.0.113.1:5001
+    transcoder:
+      mode: multi
+      video:
+        copy: false
+        profiles:
+          - { width: 1280, height: 720, bitrate: 3000, codec: h264, preset: veryfast }
+      audio:
+        copy: false
+        codec: aac
+        bitrate: 128
+      global:
+        hw: nvenc
+    protocols:
+      hls: true
+```
+
+### 7.3 Feed-back to legacy DVB headend
+
+Modern source → encode MPEG-2 + MP2 for transmitter chain.
+
+```yaml
+streams:
+  - code: ch1_legacy
+    inputs:
+      - url: copy://ch1   # any modern stream code
+    transcoder:
+      video:
+        copy: false
+        profiles:
+          - { codec: mp2v, bitrate: 5000, width: 720, height: 576 }
+      audio:
+        copy: false
+        codec: mp2a
+        bitrate: 192
+    protocols:
+      mpegts: true
+    push:
+      - url: srt://transmitter.lan:9000
+        enabled: true
+```
+
+### 7.4 Audio-only radio (MP2)
+
+```yaml
+streams:
+  - code: voh_fm_877
+    inputs:
+      - url: udp://ens5@239.0.113.1:5001
+    transcoder:
+      audio:
+        copy: false
+        codec: aac
+        bitrate: 96
+      video:
+        copy: true   # source has no video
+    protocols:
+      hls: true
+      mpegts: true
+```
+
+### 7.5 Premium HD with AC-3 source
+
+```yaml
+streams:
+  - code: hbo_hd
+    inputs:
+      - url: udp://ens5@239.0.113.7:5001
+    transcoder:
+      video:
+        copy: false
+        profiles:
+          - { width: 1920, height: 1080, bitrate: 5000, codec: h264, preset: veryfast }
+      audio:
+        copy: false
+        codec: aac     # transcode AC-3 → AAC for HLS browser playback
+        bitrate: 192
+        channels: 2    # AC-3 is often 5.1; downmix to stereo for browser
+      global:
+        hw: nvenc
+    protocols:
+      hls: true
+      mpegts: true
+```
+
+---
+
+## 8. Roadmap
+
+Items not yet implemented but tractable:
+
+| Feature | Priority | Effort estimate |
+|---|---|---|
+| Frame extractor for AC-3 / E-AC-3 (enables mixer://) | medium | ~250 lines + tests |
+| Frame extractor for MPEG-2 Video (enables mixer://) | medium | ~200 lines + tests |
+| Frame extractor for AV1 (enables mixer://) | low | ~400 lines + tests (OBU parsing) |
+| MPEG-2 Video resolution parse (sequence_header) | low | ~80 lines |
+| AV1 resolution parse (sequence header OBU) | low | ~150 lines |
+| RTMP reader codec map (Enhanced RTMP for AV1, HEVC, Opus) | low | ~100 lines + joyav fork awareness |
+| RTSP reader codec map (gortsplib already supports more) | low | ~80 lines wiring |
+| Opus / VP9 ingest from TS (DVB descriptor path) | low | ~30 lines each |
+| HW-accelerated MPEG-2 / AV1 encoding | low | depends on FFmpeg build |
+
+Add only when a concrete use case lands. The current set covers DVB IPTV
++ IP camera + modern HLS / DASH / MPEG-TS-relay scenarios fully.
+
+---
+
+## 9. Reference files
+
+| Concern | File |
+|---|---|
+| AVCodec enum + IsVideo / IsAudio | [internal/domain/avpacket.go](../internal/domain/avpacket.go) |
+| Codec → UI label | [internal/domain/media_track.go](../internal/domain/media_track.go) |
+| User-config codec → FFmpeg encoder | [internal/domain/resolvers.go](../internal/domain/resolvers.go) |
+| Output codec constants (config dropdown) | [internal/domain/transcoder.go](../internal/domain/transcoder.go) |
+| TS demux (gompeg2-based, frame-level) | [internal/ingestor/pull/tsdemux_packet_reader.go](../internal/ingestor/pull/tsdemux_packet_reader.go) |
+| PMT scanner (custom, codec-only) | [internal/ingestor/pull/stats_pmt_scanner.go](../internal/ingestor/pull/stats_pmt_scanner.go) |
+| TS muxing (AV → wire) | [internal/tsmux/fromav.go](../internal/tsmux/fromav.go) |
+| FFmpeg capability probe | [internal/transcoder/probe.go](../internal/transcoder/probe.go) |
+| Per-codec runtime track stats | [internal/manager/tracks.go](../internal/manager/tracks.go) |

@@ -19,11 +19,12 @@ type VideoCodec string
 
 // VideoCodec values name supported output video codecs.
 const (
-	VideoCodecH264 VideoCodec = "h264" // AVC — widest device support
-	VideoCodecH265 VideoCodec = "h265" // HEVC — ~50% smaller than H.264
-	VideoCodecAV1  VideoCodec = "av1"  // royalty-free, best compression (high CPU)
-	VideoCodecVP9  VideoCodec = "vp9"  // Google codec, WebRTC-friendly
-	VideoCodecCopy VideoCodec = "copy" // passthrough — no re-encode
+	VideoCodecH264  VideoCodec = "h264" // AVC — widest device support
+	VideoCodecH265  VideoCodec = "h265" // HEVC — ~50% smaller than H.264
+	VideoCodecAV1   VideoCodec = "av1"  // royalty-free, best compression (high CPU)
+	VideoCodecVP9   VideoCodec = "vp9"  // Google codec, WebRTC-friendly
+	VideoCodecMPEG2 VideoCodec = "mp2v" // MPEG-2 Part 2 — DVB legacy contribution feeds, transmitter chains
+	VideoCodecCopy  VideoCodec = "copy" // passthrough — no re-encode
 )
 
 // AudioCodec identifies the audio compression format.
@@ -36,6 +37,7 @@ const (
 	AudioCodecMP3  AudioCodec = "mp3"  // legacy compatibility
 	AudioCodecOpus AudioCodec = "opus" // best for WebRTC / low-latency
 	AudioCodecAC3  AudioCodec = "ac3"  // Dolby Digital — broadcast use
+	AudioCodecEAC3 AudioCodec = "eac3" // Dolby Digital Plus — premium HD/UHD broadcast (5.1+)
 	AudioCodecCopy AudioCodec = "copy" // passthrough — no re-encode
 )
 

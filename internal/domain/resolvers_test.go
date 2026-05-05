@@ -27,6 +27,8 @@ func TestResolveVideoEncoder(t *testing.T) {
 		{"hevc + cpu → libx265", "hevc", HWAccelNone, "libx265"},
 		{"vp9 → libvpx-vp9", "vp9", HWAccelNone, "libvpx-vp9"},
 		{"av1 → libsvtav1", "av1", HWAccelNone, "libsvtav1"},
+		{"mp2v → mpeg2video", "mp2v", HWAccelNone, "mpeg2video"},
+		{"mpeg2video alias", "mpeg2video", HWAccelNone, "mpeg2video"},
 		{"explicit h264_nvenc preserved", "h264_nvenc", HWAccelNone, "h264_nvenc"},
 		{"explicit h264_qsv preserved", "h264_qsv", HWAccelNone, "h264_qsv"},
 		{"unknown garbage → libx264 fallback", "garbage", HWAccelNone, "libx264"},

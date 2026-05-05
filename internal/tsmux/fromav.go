@@ -54,6 +54,16 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 			dts = p.PTSms
 		}
 		_ = f.mux.Write(f.apid, p.Data, p.PTSms, dts) //nolint:errcheck
+	case domain.AVCodecAC3, domain.AVCodecEAC3,
+		domain.AVCodecAV1, domain.AVCodecMPEG2Video:
+		// These codecs are recognised at the stats / config layer but we
+		// don't currently have a frame extractor that produces AVPackets
+		// for them — the existing gompeg2 demuxer drops their PES payload.
+		// Re-mux through this path therefore never triggers in practice
+		// today; the case exists for exhaustiveness so future contributors
+		// adding a custom frame extractor can wire muxing here without
+		// chasing a silent default-skip bug.
+		return
 	case domain.AVCodecMP2, domain.AVCodecMP3:
 		// MPEG-1/2 Audio Layer I/II/III — use stream_type 0x04 (MPEG-2
 		// audio) as the canonical container for both. The Layer is

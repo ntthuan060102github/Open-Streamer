@@ -51,6 +51,14 @@ func CodecLabel(c AVCodec) string {
 		return "mp2a"
 	case AVCodecMP3:
 		return "mp3"
+	case AVCodecAC3:
+		return "ac3"
+	case AVCodecEAC3:
+		return "eac3"
+	case AVCodecAV1:
+		return "av1"
+	case AVCodecMPEG2Video:
+		return "mp2v"
 	default:
 		return ""
 	}

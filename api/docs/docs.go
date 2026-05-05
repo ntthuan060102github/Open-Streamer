@@ -2434,12 +2434,14 @@ const docTemplate = `{
                 "mp3",
                 "opus",
                 "ac3",
+                "eac3",
                 "copy"
             ],
             "x-enum-comments": {
                 "AudioCodecAAC": "default for HLS/DASH",
                 "AudioCodecAC3": "Dolby Digital — broadcast use",
                 "AudioCodecCopy": "passthrough — no re-encode",
+                "AudioCodecEAC3": "Dolby Digital Plus — premium HD/UHD broadcast (5.1+)",
                 "AudioCodecMP2": "MPEG-1/2 Audio Layer II — DVB broadcast contribution feeds",
                 "AudioCodecMP3": "legacy compatibility",
                 "AudioCodecOpus": "best for WebRTC / low-latency"
@@ -2450,6 +2452,7 @@ const docTemplate = `{
                 "legacy compatibility",
                 "best for WebRTC / low-latency",
                 "Dolby Digital — broadcast use",
+                "Dolby Digital Plus — premium HD/UHD broadcast (5.1+)",
                 "passthrough — no re-encode"
             ],
             "x-enum-varnames": [
@@ -2458,6 +2461,7 @@ const docTemplate = `{
                 "AudioCodecMP3",
                 "AudioCodecOpus",
                 "AudioCodecAC3",
+                "AudioCodecEAC3",
                 "AudioCodecCopy"
             ]
         },
@@ -3333,6 +3337,7 @@ const docTemplate = `{
                 "h265",
                 "av1",
                 "vp9",
+                "mp2v",
                 "copy"
             ],
             "x-enum-comments": {
@@ -3340,6 +3345,7 @@ const docTemplate = `{
                 "VideoCodecCopy": "passthrough — no re-encode",
                 "VideoCodecH264": "AVC — widest device support",
                 "VideoCodecH265": "HEVC — ~50% smaller than H.264",
+                "VideoCodecMPEG2": "MPEG-2 Part 2 — DVB legacy contribution feeds, transmitter chains",
                 "VideoCodecVP9": "Google codec, WebRTC-friendly"
             },
             "x-enum-descriptions": [
@@ -3347,6 +3353,7 @@ const docTemplate = `{
                 "HEVC — ~50% smaller than H.264",
                 "royalty-free, best compression (high CPU)",
                 "Google codec, WebRTC-friendly",
+                "MPEG-2 Part 2 — DVB legacy contribution feeds, transmitter chains",
                 "passthrough — no re-encode"
             ],
             "x-enum-varnames": [
@@ -3354,6 +3361,7 @@ const docTemplate = `{
                 "VideoCodecH265",
                 "VideoCodecAV1",
                 "VideoCodecVP9",
+                "VideoCodecMPEG2",
                 "VideoCodecCopy"
             ]
         },

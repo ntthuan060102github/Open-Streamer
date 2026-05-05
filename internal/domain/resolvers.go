@@ -32,6 +32,11 @@ func ResolveVideoEncoder(codec VideoCodec, hw HWAccel) string {
 		return "libvpx-vp9"
 	case "av1":
 		return "libsvtav1"
+	case "mp2v", "mpeg2video":
+		// FFmpeg's built-in MPEG-2 Part 2 encoder — always available, no
+		// external library. Used when feeding a DVB transmitter chain or
+		// legacy headend system that consumes MPEG-2 input.
+		return "mpeg2video"
 	}
 	if strings.Contains(c, "nvenc") || strings.Contains(c, "qsv") || strings.Contains(c, "videotoolbox") {
 		return string(codec)
@@ -64,6 +69,8 @@ func ResolveAudioEncoder(codec AudioCodec) string {
 		return "libopus"
 	case string(AudioCodecAC3):
 		return "ac3"
+	case string(AudioCodecEAC3):
+		return "eac3"
 	}
 	return "aac"
 }

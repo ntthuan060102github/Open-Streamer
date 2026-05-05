@@ -84,6 +84,7 @@ var hwOptionalEncoders = map[domain.HWAccel][]string{
 		"libx265",    // h265 CPU
 		"libvpx-vp9", // vp9
 		"libsvtav1",  // av1
+		"mpeg2video", // MPEG-2 Part 2 — built-in, no external library
 	},
 	domain.HWAccelNVENC: {
 		"h264_nvenc",
@@ -115,6 +116,7 @@ var audioOptionalEncoders = []string{
 	"libmp3lame",
 	"mp2",
 	"ac3",
+	"eac3",
 }
 
 // optionalEncodersForBackends returns the union of optional encoders

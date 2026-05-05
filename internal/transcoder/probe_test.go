@@ -183,8 +183,8 @@ func TestOptionalEncodersForBackends_EmptyReturnsUnion(t *testing.T) {
 	got := optionalEncodersForBackends(nil)
 	for _, want := range []string{
 		"h264_nvenc", "h264_vaapi", "h264_qsv", "h264_videotoolbox",
-		"libx265", "libvpx-vp9", "libsvtav1",
-		"libopus", "libmp3lame", "mp2", "ac3",
+		"libx265", "libvpx-vp9", "libsvtav1", "mpeg2video",
+		"libopus", "libmp3lame", "mp2", "ac3", "eac3",
 	} {
 		assert.Contains(t, got, want, "empty hws must include %s in the union", want)
 	}
@@ -241,7 +241,10 @@ func TestProbe_RealFFmpeg_FilterByBackends(t *testing.T) {
 	// Must include the CPU-pipeline alternatives + audio. `mp2` is a
 	// built-in encoder always shipped with stock FFmpeg builds; it has no
 	// external library dependency so we treat it as guaranteed-present.
-	for _, want := range []string{"libx265", "libvpx-vp9", "libsvtav1", "libopus", "mp2", "ac3"} {
+	for _, want := range []string{
+		"libx265", "libvpx-vp9", "libsvtav1", "mpeg2video",
+		"libopus", "mp2", "ac3", "eac3",
+	} {
 		assert.Contains(t, opt, want, "host=[None] must report %s as optional", want)
 	}
 	// Must NOT include other backends' encoders — that's the whole

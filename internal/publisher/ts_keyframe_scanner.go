@@ -260,10 +260,19 @@ func (s *tsKeyframeScanner) isIDR(pes []byte) bool {
 		return scanForH264IDR(es)
 	case domain.AVCodecH265:
 		return scanForH265IRAP(es)
-	case domain.AVCodecUnknown, domain.AVCodecAAC,
-		domain.AVCodecMP2, domain.AVCodecMP3,
+	case domain.AVCodecUnknown,
+		domain.AVCodecAAC, domain.AVCodecMP2, domain.AVCodecMP3,
+		domain.AVCodecAC3, domain.AVCodecEAC3,
 		domain.AVCodecRawTSChunk:
-		return false // not a video codec we recognise
+		return false // audio or non-frame marker — not an IDR carrier
+	case domain.AVCodecAV1, domain.AVCodecMPEG2Video:
+		// IDR detection for AV1 / MPEG-2 Video would require dedicated
+		// parsers (OBU walking for AV1, GOP-header scan for MPEG-2). The
+		// scanner is currently used by the HLS raw-TS segmenter only for
+		// H.264 / H.265 IDR alignment; AV1 / MPEG-2 sources fall back to
+		// the wall-clock force-flush path which is acceptable until a
+		// specific use case justifies the extra parsers.
+		return false
 	default:
 		return false
 	}

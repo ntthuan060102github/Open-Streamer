@@ -551,12 +551,14 @@ definitions:
     - mp3
     - opus
     - ac3
+    - eac3
     - copy
     type: string
     x-enum-comments:
       AudioCodecAAC: default for HLS/DASH
       AudioCodecAC3: Dolby Digital — broadcast use
       AudioCodecCopy: passthrough — no re-encode
+      AudioCodecEAC3: Dolby Digital Plus — premium HD/UHD broadcast (5.1+)
       AudioCodecMP2: MPEG-1/2 Audio Layer II — DVB broadcast contribution feeds
       AudioCodecMP3: legacy compatibility
       AudioCodecOpus: best for WebRTC / low-latency
@@ -566,6 +568,7 @@ definitions:
     - legacy compatibility
     - best for WebRTC / low-latency
     - Dolby Digital — broadcast use
+    - Dolby Digital Plus — premium HD/UHD broadcast (5.1+)
     - passthrough — no re-encode
     x-enum-varnames:
     - AudioCodecAAC
@@ -573,6 +576,7 @@ definitions:
     - AudioCodecMP3
     - AudioCodecOpus
     - AudioCodecAC3
+    - AudioCodecEAC3
     - AudioCodecCopy
   domain.AudioTranscodeConfig:
     properties:
@@ -1365,6 +1369,7 @@ definitions:
     - h265
     - av1
     - vp9
+    - mp2v
     - copy
     type: string
     x-enum-comments:
@@ -1372,18 +1377,22 @@ definitions:
       VideoCodecCopy: passthrough — no re-encode
       VideoCodecH264: AVC — widest device support
       VideoCodecH265: HEVC — ~50% smaller than H.264
+      VideoCodecMPEG2: MPEG-2 Part 2 — DVB legacy contribution feeds, transmitter
+        chains
       VideoCodecVP9: Google codec, WebRTC-friendly
     x-enum-descriptions:
     - AVC — widest device support
     - HEVC — ~50% smaller than H.264
     - royalty-free, best compression (high CPU)
     - Google codec, WebRTC-friendly
+    - MPEG-2 Part 2 — DVB legacy contribution feeds, transmitter chains
     - passthrough — no re-encode
     x-enum-varnames:
     - VideoCodecH264
     - VideoCodecH265
     - VideoCodecAV1
     - VideoCodecVP9
+    - VideoCodecMPEG2
     - VideoCodecCopy
   domain.VideoProfile:
     properties:
