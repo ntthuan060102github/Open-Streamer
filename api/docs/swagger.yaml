@@ -409,7 +409,7 @@ definitions:
         description: text | json
         type: string
       level:
-        description: debug | info | warn | error
+        description: trace | debug | info | warn | error
         type: string
     type: object
   config.ManagerConfig:
@@ -615,8 +615,6 @@ definitions:
     type: object
   domain.EventType:
     enum:
-    - session.opened
-    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -633,6 +631,8 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
+    - session.opened
+    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -641,8 +641,6 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
-    - ""
-    - ""
     - ""
     - ""
     - ""
@@ -659,9 +657,9 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
-    - EventSessionOpened
-    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -678,6 +676,8 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
+    - EventSessionOpened
+    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:

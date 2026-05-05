@@ -504,9 +504,9 @@ func validateLog(l *config.LogConfig) []fieldError {
 	var errs []fieldError
 	if l.Level != "" {
 		switch strings.ToLower(l.Level) {
-		case "debug", "info", "warn", "error":
+		case "trace", "debug", "info", "warn", "error":
 		default:
-			errs = append(errs, fieldError{Path: "global_config.log.level", Message: "must be debug|info|warn|error"})
+			errs = append(errs, fieldError{Path: "global_config.log.level", Message: "must be trace|debug|info|warn|error"})
 		}
 	}
 	if l.Format != "" {

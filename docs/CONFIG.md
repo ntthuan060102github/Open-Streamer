@@ -242,7 +242,7 @@ constants in `domain` to keep the upload path simple.
 
 ```yaml
 log:
-  level:  "info"     # debug | info | warn | error
+  level:  "info"     # trace | debug | info | warn | error  (trace = debug + per-segment / per-frame hot-path logs)
   format: "text"     # text | json
 ```
 

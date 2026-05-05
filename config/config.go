@@ -228,7 +228,7 @@ type HooksConfig struct {
 
 // LogConfig controls structured logging output.
 type LogConfig struct {
-	Level  string `mapstructure:"level" json:"level" yaml:"level"`    // debug | info | warn | error
+	Level  string `mapstructure:"level" json:"level" yaml:"level"`    // trace | debug | info | warn | error
 	Format string `mapstructure:"format" json:"format" yaml:"format"` // text | json
 }
 
