@@ -70,6 +70,14 @@ func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
 	srv := &gortsplib.Server{
 		RTSPAddress: addr,
 		Handler:     &rtspHandler{svc: s},
+		// gortsplib's default WriteQueueSize is 256 packets — too tight
+		// for HD bitrates. At 1080p ~70 RTP packets/frame × 25fps ≈
+		// 1750 packets/s, 256 ≈ 146 ms of slack; any client jitter >
+		// 146 ms triggers "write queue is full" + "RTP packets lost".
+		// 1024 (~600 ms) absorbs realistic jitter on home/office WAN
+		// without ballooning memory (≈1.5 MB per session). Must be a
+		// power of two — gortsplib rejects other values at Start().
+		WriteQueueSize: 1024,
 	}
 	if err := srv.Start(); err != nil {
 		return fmt.Errorf("publisher rtsp: listen %q: %w", addr, err)
