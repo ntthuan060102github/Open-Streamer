@@ -512,9 +512,20 @@ func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
 		sess.baseDTS = dts
 		sess.baseDTSSet = true
 	}
-	// MPEG-TS DTS is already in 90 kHz — same clock as H.264 RTP.
-	rtpDTS := uint32(dts - sess.baseDTS)
-	rtpPTS := rtpDTS + uint32(pts-dts)
+	// MPEG-TS PTS is already in 90 kHz — same clock as H.264 RTP. Per
+	// RFC 6184 §7.1 the RTP timestamp is the sampling/presentation time
+	// of the frame; it must be IDENTICAL for every RTP packet that
+	// fragments one access unit (e.g. all FU-A pieces) so the receiver
+	// can re-assemble them. Earlier code set DTS on the non-last
+	// packets and PTS on the last — strict decoders (gortsplib pull,
+	// ffmpeg) saw inconsistent timestamps within a single NAL, split
+	// it as if the fragments belonged to different frames, and emitted
+	// "missing picture in access unit" / produced unplayable HLS even
+	// though every byte of every packet was valid.
+	//
+	// We don't track encoder DTS over the wire — the receiver derives
+	// presentation order from PTS alone, and reordering is its job.
+	rtpTS := uint32(pts - sess.baseDTS)
 
 	nalus := annexBToNALUs(frame)
 	if len(nalus) == 0 {
@@ -526,13 +537,8 @@ func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
 		slog.Debug("publisher: RTSP H264 encode error", "stream_code", sess.streamCode, "err", err)
 		return
 	}
-	for i, pkt := range pkts {
-		// Last packet of the access unit carries the display timestamp.
-		if i == len(pkts)-1 {
-			pkt.Timestamp = rtpPTS
-		} else {
-			pkt.Timestamp = rtpDTS
-		}
+	for _, pkt := range pkts {
+		pkt.Timestamp = rtpTS
 		if err := sess.stream.WritePacketRTP(sess.videoMedia, pkt); err != nil {
 			slog.Debug("publisher: RTSP write video RTP", "stream_code", sess.streamCode, "err", err)
 			return
