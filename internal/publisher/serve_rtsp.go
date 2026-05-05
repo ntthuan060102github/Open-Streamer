@@ -578,8 +578,21 @@ func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 		slog.Debug("publisher: RTSP AAC encode error", "stream_code", sess.streamCode, "err", err)
 		return
 	}
+	// Encoder.Encode resets its internal timestamp to 0 on every call and
+	// increments by 1024 (samples per AAC AU) for each subsequent AU in
+	// the batch. So pkts come back with relative timestamps 0, 1024,
+	// 2048, ... — we ADD our base (rtpTS) instead of overwriting, so
+	// the second / third / Nth AU in a multi-AU ADTS frame keeps the
+	// correct +1024 spacing relative to the first.
+	//
+	// The previous behaviour (`pkt.Timestamp = rtpTS`) collapsed every
+	// AU in a batch to the same timestamp; ffmpeg / Flussonic rebuilt
+	// the implicit AU timeline (TS, TS+1024, TS+2048…) and saw
+	// "non-monotonically increasing dts" once a later frame's base TS
+	// fell below an earlier frame's last implied AU time, freezing
+	// playback after ~1s.
 	for _, pkt := range pkts {
-		pkt.Timestamp = rtpTS
+		pkt.Timestamp += rtpTS
 		if err := sess.stream.WritePacketRTP(sess.audioMedia, pkt); err != nil {
 			slog.Debug("publisher: RTSP write audio RTP", "stream_code", sess.streamCode, "err", err)
 			return
