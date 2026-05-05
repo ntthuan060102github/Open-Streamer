@@ -422,9 +422,22 @@ func (sess *rtspSession) initStream() error {
 	var aacFormat *format.MPEG4Audio
 	var audioMedia *description.Media
 	if sess.aacCfg != nil {
+		// SizeLength / IndexLength / IndexDeltaLength / ProfileLevelID are
+		// part of the MPEG4-GENERIC RTP packetisation (RFC 3640) and
+		// surface in SDP as `a=fmtp:... sizelength=13;...`. gortsplib only
+		// emits each field when its value is non-zero, so leaving them at
+		// the zero default produces an SDP without `sizelength`, which
+		// strict clients (gortsplib v4 / v5 pull, ffmpeg) reject with
+		// `invalid SDP: media N is invalid: sizelength is missing`.
+		// 13 / 3 / 3 are the universal AAC-hbr Mode 1 values (matches
+		// FFmpeg's RTP muxer, Wowza, Flussonic).
 		aacFormat = &format.MPEG4Audio{
-			PayloadTyp: 97,
-			Config:     sess.aacCfg,
+			PayloadTyp:       97,
+			Config:           sess.aacCfg,
+			SizeLength:       13,
+			IndexLength:      3,
+			IndexDeltaLength: 3,
+			ProfileLevelID:   1,
 		}
 		audioMedia = &description.Media{
 			Type:    description.MediaTypeAudio,

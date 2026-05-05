@@ -145,6 +145,32 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 	var tsCarry []byte
 	var avMux *tsmux.FromAV
 
+	// SRT carries MPEG-TS by convention as 7×188-byte chunks per UDP
+	// payload (1316 bytes — matches SRT's default packet size minus
+	// header, see SRT-spec / Haivision recommendations). Writing one
+	// 188-byte packet per conn.Write would otherwise produce ~2000
+	// Write calls/sec at 3 Mbps; gosrt's per-write overhead pushes
+	// the receiver's recovery buffer past `latency_ms` and the link
+	// is declared dead — observed as "SRT write error EOF" within
+	// hundreds of ms of session start. Batching here keeps the call
+	// rate to ~250/sec at the same bitrate.
+	const srtBatchPackets = 7
+	const srtBatchSize = srtBatchPackets * 188
+	batch := make([]byte, 0, srtBatchSize)
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		n, err := conn.Write(batch)
+		if err != nil {
+			return err
+		}
+		srtSess.add(int64(n))
+		batch = batch[:0]
+		return nil
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -156,6 +182,7 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 			if pkt.AV != nil && pkt.AV.Discontinuity {
 				avMux = nil
 				tsCarry = nil
+				batch = batch[:0]
 			}
 			var writeErr error
 			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
@@ -166,14 +193,22 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 					if writeErr != nil {
 						return
 					}
-					n, err := conn.Write(aligned)
-					if err != nil {
-						writeErr = err
-						return
+					batch = append(batch, aligned...)
+					if len(batch) >= srtBatchSize {
+						if err := flush(); err != nil {
+							writeErr = err
+						}
 					}
-					srtSess.add(int64(n))
 				})
 			})
+			if writeErr == nil {
+				// Flush whatever's left so the receiver doesn't sit on a
+				// partial batch waiting for the next packet — at low
+				// bitrates the wait can exceed the latency window.
+				if err := flush(); err != nil {
+					writeErr = err
+				}
+			}
 			if writeErr != nil {
 				slog.Debug("publisher: SRT write error", "stream_code", streamCode, "err", writeErr)
 				return
