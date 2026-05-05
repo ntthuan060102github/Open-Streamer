@@ -162,6 +162,54 @@ func TestFeedWirePacketAVAllocatesMuxLazily(t *testing.T) {
 	}
 }
 
+// MP2 audio frames muxed via FromAV must produce TS packets advertising
+// stream_type 0x04 in PMT — that is the canonical MPEG-2 audio stream type
+// players (ffmpeg, VLC, browser via hls.js) expect for MPEG Audio Layer II.
+// Without the AVCodecMP2 case in fromav.go the muxer would silently drop
+// audio for DVB radio sources mixed via mixer://.
+func TestFromAV_MuxesMP2Audio(t *testing.T) {
+	var ts []byte
+	var mux *FromAV
+
+	// Synthetic MP2 frame: just enough bytes for the muxer to wrap into a
+	// PES packet. Real frames start with 0xFF F? sync but the muxer is
+	// codec-agnostic at this layer.
+	mp2Frame := []byte{0xFF, 0xFD, 0x40, 0x04, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD}
+
+	FeedWirePacket(
+		nil,
+		&domain.AVPacket{Codec: domain.AVCodecMP2, Data: mp2Frame, PTSms: 100, DTSms: 100},
+		&mux,
+		func(b []byte) { ts = append(ts, b...) },
+	)
+
+	if mux == nil {
+		t.Fatal("mux should be allocated on first MP2 packet")
+	}
+	if len(ts) == 0 {
+		t.Fatal("expected TS bytes emitted for MP2 packet")
+	}
+	if len(ts)%188 != 0 {
+		t.Fatalf("emitted bytes must be 188-aligned, got %d", len(ts))
+	}
+	if ts[0] != 0x47 {
+		t.Fatalf("first byte must be MPEG-TS sync 0x47, got 0x%02X", ts[0])
+	}
+
+	// Second MP2 frame must reuse the existing audio PID without reallocating
+	// the muxer or re-adding the stream — same property the AAC path has.
+	saved := mux
+	FeedWirePacket(
+		nil,
+		&domain.AVPacket{Codec: domain.AVCodecMP2, Data: mp2Frame, PTSms: 124, DTSms: 124},
+		&mux,
+		func(_ []byte) {},
+	)
+	if mux != saved {
+		t.Error("mux must be reused for subsequent MP2 packets")
+	}
+}
+
 func TestFeedWirePacketNilInputs(t *testing.T) {
 	var mux *FromAV
 	called := false

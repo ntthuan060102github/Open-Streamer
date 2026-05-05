@@ -58,6 +58,31 @@ func TestInputTrackStats_PerCodecBuckets(t *testing.T) {
 	}
 }
 
+// TestInputTrackStats_MP2AppearsInSnapshot ensures MP2 audio (DVB radio /
+// SD-TV audio) is surfaced in the runtime panel — without the explicit
+// AVCodecMP2 entry in snapshot's whitelist, MP2 sources would silently show
+// "No tracks reported" even with the data path fully working.
+func TestInputTrackStats_MP2AppearsInSnapshot(t *testing.T) {
+	st := newInputTrackStats()
+	now := time.Unix(0, 0)
+	st.observe(&domain.AVPacket{Codec: domain.AVCodecMP2, Data: make([]byte, 30_000)}, now)
+	st.observe(&domain.AVPacket{Codec: domain.AVCodecMP2, Data: nil}, now.Add(4*time.Second))
+
+	tracks := st.snapshot()
+	if len(tracks) != 1 {
+		t.Fatalf("expected 1 track (audio MP2), got %d (%+v)", len(tracks), tracks)
+	}
+	if tracks[0].Kind != domain.MediaTrackAudio {
+		t.Errorf("MP2 must classify as audio, got %s", tracks[0].Kind)
+	}
+	if tracks[0].Codec != "mp2a" {
+		t.Errorf("expected codec label 'mp2a' (Flussonic-compatible), got %q", tracks[0].Codec)
+	}
+	if tracks[0].BitrateKbps == 0 {
+		t.Error("MP2 bitrate must be reported, got 0")
+	}
+}
+
 // TestInputTrackStats_NilAndUnknown verifies hot-path safety on garbage input.
 func TestInputTrackStats_NilAndUnknown(t *testing.T) {
 	st := newInputTrackStats()

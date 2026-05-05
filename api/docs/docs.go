@@ -2819,7 +2819,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "codec": {
-                    "description": "\"h264\" | \"h265\" | \"aac\"",
+                    "description": "\"h264\" | \"h265\" | \"aac\" | \"mp2a\"",
                     "type": "string"
                 },
                 "height": {

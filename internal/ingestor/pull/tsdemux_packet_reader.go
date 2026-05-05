@@ -339,8 +339,11 @@ func buildAVPacket(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) (d
 	case gompeg2.TS_STREAM_AAC:
 		cdc = domain.AVCodecAAC
 	case gompeg2.TS_STREAM_AUDIO_MPEG1, gompeg2.TS_STREAM_AUDIO_MPEG2:
-		// unsupported audio codecs — skip
-		return domain.AVPacket{}, false
+		// MPEG-1 / MPEG-2 Audio (Layer I/II/III) — common in DVB radio
+		// channels and SD TV audio. Frame format identical at the wire level
+		// for both stream types so the downstream muxer doesn't need to
+		// distinguish them.
+		cdc = domain.AVCodecMP2
 	default:
 		return domain.AVPacket{}, false
 	}

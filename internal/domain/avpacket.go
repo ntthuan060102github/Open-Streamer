@@ -21,6 +21,15 @@ const (
 	// Used only by sources that ingest pre-muxed MPEG-TS (UDP, HLS, SRT,
 	// File). RTSP / RTMP / Copy / Mixer continue to emit decoded AVPackets.
 	AVCodecRawTSChunk
+
+	// AVCodecMP2 is MPEG-1 / MPEG-2 audio (Layer I, II, or III). The TS
+	// stream-type values 0x03 (MPEG-1 audio) and 0x04 (MPEG-2 audio) both
+	// land here — the wire format is identical at the frame level so the
+	// downstream muxer doesn't need to distinguish. Common in DVB radio
+	// channels relayed over IP multicast (e.g. VOH FM, BBC World Service)
+	// and in legacy IPTV headends; needed so mixer:// sources pulling such
+	// audio are correctly recognised instead of silently dropped.
+	AVCodecMP2
 )
 
 // IsVideo reports whether the codec carries a video elementary stream.
@@ -30,7 +39,7 @@ func (c AVCodec) IsVideo() bool {
 
 // IsAudio reports whether the codec carries an audio elementary stream.
 func (c AVCodec) IsAudio() bool {
-	return c == AVCodecAAC
+	return c == AVCodecAAC || c == AVCodecMP2
 }
 
 // AVPacket is one decoded video access unit (Annex B H.264/H.265) or one AAC frame (ADTS in Data).

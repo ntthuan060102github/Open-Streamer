@@ -23,7 +23,7 @@ const (
 //     stream, or output not running).
 type MediaTrackInfo struct {
 	Kind        MediaTrackKind `json:"kind"`
-	Codec       string         `json:"codec"`            // "h264" | "h265" | "aac"
+	Codec       string         `json:"codec"`            // "h264" | "h265" | "aac" | "mp2a"
 	Width       int            `json:"width,omitempty"`  // video only
 	Height      int            `json:"height,omitempty"` // video only
 	BitrateKbps int            `json:"bitrate_kbps"`
@@ -32,6 +32,11 @@ type MediaTrackInfo struct {
 // CodecLabel returns the canonical lowercase string used in MediaTrackInfo.Codec
 // for an AVCodec — kept here (rather than on the AVCodec type) so the JSON
 // contract lives next to the struct that exposes it.
+//
+// "mp2a" is the FourCC for MPEG-1/2 Audio (Layer I/II/III). Matches the
+// Flussonic UI label convention so operators familiar with that tooling see
+// the same string for the same codec on both servers; the underlying format
+// covers everything that arrives via TS stream_type 0x03 or 0x04.
 //
 //nolint:exhaustive // AVCodecUnknown intentionally falls to the empty-string default.
 func CodecLabel(c AVCodec) string {
@@ -42,6 +47,8 @@ func CodecLabel(c AVCodec) string {
 		return "h265"
 	case AVCodecAAC:
 		return "aac"
+	case AVCodecMP2:
+		return "mp2a"
 	default:
 		return ""
 	}

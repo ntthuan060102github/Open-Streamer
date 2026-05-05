@@ -144,8 +144,14 @@ func (s *inputTrackStats) snapshot() []domain.MediaTrackInfo {
 		return nil
 	}
 	out := make([]domain.MediaTrackInfo, 0, len(s.tracks))
-	// Order: H.264, H.265, AAC. Matches "video first, audio last" UX.
-	for _, c := range []domain.AVCodec{domain.AVCodecH264, domain.AVCodecH265, domain.AVCodecAAC} {
+	// Order: video codecs first, then audio. Matches "video first, audio
+	// last" UX convention. Each codec is emitted at most once even if the
+	// upstream had multiple tracks of the same codec (they collapse into
+	// one counter — see inputTrackStats type doc).
+	for _, c := range []domain.AVCodec{
+		domain.AVCodecH264, domain.AVCodecH265,
+		domain.AVCodecAAC, domain.AVCodecMP2,
+	} {
 		if t, ok := s.tracks[c]; ok {
 			out = append(out, t.snapshot())
 		}
