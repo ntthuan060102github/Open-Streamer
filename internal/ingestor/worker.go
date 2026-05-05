@@ -83,6 +83,14 @@ func runPullWorker(
 // openSource tries r.Open in a backoff loop until it succeeds or ctx is cancelled.
 // On the very first successful open it fires cb.onHandoff exactly once — this is the
 // pre-connect handoff that releases the previous ingestor without a buffer gap.
+//
+// To keep the UI honest while the loop is stuck (typo'd interface, dead host,
+// permission denied), the first failure AND every failure once backoff has
+// reached its ceiling is surfaced to cb.onInputError so the manager marks
+// the input Degraded instead of leaving stale Status=Active. The transient
+// in-between failures are suppressed to avoid event spam during normal
+// network blips.
+//
 // Returns false when ctx is done (caller must return).
 func openSource(
 	ctx context.Context,
@@ -93,33 +101,67 @@ func openSource(
 	delay *time.Duration,
 	handedOff *bool,
 ) bool {
+	openFails := 0
 	for {
 		// r.Open is context-aware; if ctx is already done it returns immediately.
-		if err := r.Open(ctx); err != nil {
-			if ctx.Err() != nil {
-				return false
-			}
-			slog.Error("ingestor: open failed",
-				"stream_code", streamID,
-				"input_priority", input.Priority,
-				"url", input.URL,
-				"err", err,
-			)
-			if !waitBackoff(ctx, *delay) {
-				return false
-			}
-			*delay = minDur(*delay*2, reconnectMaxDelay)
-			continue
+		err := r.Open(ctx)
+		if err == nil {
+			fireHandoffOnce(cb, handedOff)
+			return true
 		}
-		// First successful open — hand off from the old source.
-		if !*handedOff {
-			*handedOff = true
-			if cb.onHandoff != nil {
-				cb.onHandoff()
-			}
+		if ctx.Err() != nil {
+			return false
 		}
-		return true
+		openFails++
+		if !handleOpenFailure(ctx, streamID, input, err, cb, openFails, delay) {
+			return false
+		}
 	}
+}
+
+// fireHandoffOnce invokes cb.onHandoff exactly once across the lifetime of a
+// pull worker — on its first successful Open. Subsequent reconnects do not
+// re-fire it because there is no previous worker left to release.
+func fireHandoffOnce(cb pullWorkerCallbacks, handedOff *bool) {
+	if *handedOff {
+		return
+	}
+	*handedOff = true
+	if cb.onHandoff != nil {
+		cb.onHandoff()
+	}
+}
+
+// handleOpenFailure logs the failure, optionally reports it to the manager,
+// and waits the current backoff. Returns true if the caller should retry,
+// false if ctx was cancelled during backoff.
+func handleOpenFailure(
+	ctx context.Context,
+	streamID domain.StreamCode,
+	input domain.Input,
+	err error,
+	cb pullWorkerCallbacks,
+	attempt int,
+	delay *time.Duration,
+) bool {
+	slog.Error("ingestor: open failed",
+		"stream_code", streamID,
+		"input_priority", input.Priority,
+		"url", input.URL,
+		"err", err,
+		"attempt", attempt,
+	)
+	// Surface to manager on the first attempt so the UI flips to Degraded
+	// immediately, then again once backoff has plateaued so recovery never
+	// goes unreported during long outages.
+	if cb.onInputError != nil && (attempt == 1 || *delay >= reconnectMaxDelay) {
+		cb.onInputError(streamID, input.Priority, err)
+	}
+	if !waitBackoff(ctx, *delay) {
+		return false
+	}
+	*delay = minDur(*delay*2, reconnectMaxDelay)
+	return true
 }
 
 // handleReadError inspects the result of readLoop and decides whether to retry.

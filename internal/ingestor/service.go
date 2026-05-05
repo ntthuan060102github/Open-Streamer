@@ -277,16 +277,39 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 	}
 
 	// Register new worker immediately so Stop() can cancel it at any time.
-	// The previous worker is NOT cancelled here; it is cancelled by onHandoff after the
-	// new source connects successfully, preventing a buffer gap during source transitions.
+	//
+	// Cancel-prev policy splits on whether this restart is a config update
+	// (same priority — operator changed the input URL / params) or a failover
+	// (different priority — manager promoted a backup):
+	//
+	//   - Same priority → cancel previous worker NOW. Its config is stale by
+	//     definition; pre-connect handoff would let it keep pumping data from
+	//     the now-invalid URL into the buffer, hiding the user's edit and
+	//     leaving Status=Active in the UI even when the new URL is unreachable.
+	//   - Different priority → keep handoff. The previous source is still
+	//     valid; cancelling it before the new one connects creates a buffer
+	//     gap that the failover code path is specifically designed to avoid.
 	s.mu.Lock()
-	var prevCancel context.CancelFunc
+	var (
+		prevCancel      context.CancelFunc
+		cancelImmediate bool
+	)
 	if prev, ok := s.workers[streamID]; ok {
 		prevCancel = prev.cancel
+		cancelImmediate = prev.inputPriority == input.Priority
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	s.workers[streamID] = &pullWorkerEntry{inputPriority: input.Priority, cancel: cancel}
 	s.mu.Unlock()
+
+	if cancelImmediate && prevCancel != nil {
+		slog.Info("ingestor: config update detected — cancelling previous worker for same priority",
+			"stream_code", streamID,
+			"input_priority", input.Priority,
+		)
+		prevCancel()
+		prevCancel = nil // already cancelled — don't fire again from onHandoff
+	}
 
 	slog.Info("ingestor: starting pull worker",
 		"stream_code", streamID,
