@@ -70,14 +70,28 @@ func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
 	srv := &gortsplib.Server{
 		RTSPAddress: addr,
 		Handler:     &rtspHandler{svc: s},
-		// gortsplib's default WriteQueueSize is 256 packets — too tight
-		// for HD bitrates. At 1080p ~70 RTP packets/frame × 25fps ≈
-		// 1750 packets/s, 256 ≈ 146 ms of slack; any client jitter >
-		// 146 ms triggers "write queue is full" + "RTP packets lost".
-		// 1024 (~600 ms) absorbs realistic jitter on home/office WAN
-		// without ballooning memory (≈1.5 MB per session). Must be a
-		// power of two — gortsplib rejects other values at Start().
-		WriteQueueSize: 1024,
+		// Per-session RTP write queue, sized for 4K25 / 1080p60 without
+		// operator tuning. gortsplib's library default (256) is far too
+		// tight for HD: at 1080p ~70 packets/frame × 25fps ≈ 1750 pps
+		// the default gives ~146 ms of slack and any client jitter past
+		// that triggers "write queue is full" + "RTP packets lost".
+		//
+		// Sizing math by resolution / bitrate:
+		//
+		//	1080p ≤ 5 Mbps    ~1750 pps → 4096 ≈ 2.3 s slack
+		//	1080p60 ≈ 8 Mbps  ~3500 pps → 4096 ≈ 1.2 s
+		//	4K25  ≈ 25 Mbps   ~2500 pps → 4096 ≈ 1.6 s
+		//	4K60  ≈ 50 Mbps   ~5000 pps → 4096 ≈ 800 ms (still OK)
+		//
+		// Memory is light: gortsplib's queue is a ring of `*rtp.Packet`
+		// (~24 B per slot when empty) — 4096 × 24 ≈ 100 KB per session
+		// idle. Real packet bytes only allocate when a client actually
+		// stalls; capping at 4096 bounds one stalled client to ~6 MB.
+		// 100 concurrent viewers ≈ 10 MB idle / 600 MB worst case —
+		// safe upper bound for production hosts.
+		//
+		// Power of two required (gortsplib rejects others at Start).
+		WriteQueueSize: 4096,
 	}
 	if err := srv.Start(); err != nil {
 		return fmt.Errorf("publisher rtsp: listen %q: %w", addr, err)
