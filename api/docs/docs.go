@@ -2512,6 +2512,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2527,9 +2529,7 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error",
-                "session.opened",
-                "session.closed"
+                "transcoder.error"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2539,6 +2539,8 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -2554,11 +2556,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2574,9 +2576,7 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTranscoderError"
             ]
         },
         "domain.GlobalConfig": {
@@ -2753,6 +2753,10 @@ const docTemplate = `{
                 },
                 "priority": {
                     "description": "Priority determines failover order. Lower value = higher priority.\nThe Stream Manager always prefers the lowest-priority alive input.",
+                    "type": "integer"
+                },
+                "program": {
+                    "description": "Program selects a single MPEG-TS program when the source is a\nmulti-program transport stream (MPTS) — common in DVB headend feeds\nwhere one multicast carries many channels. When \u003e 0, the ingest\npipeline rewrites the PAT to advertise only the chosen program and\ndrops PMT / ES packets belonging to other programs, producing a\nclean SPTS for downstream HLS / DASH / push consumers.\n\nZero (default) disables filtering — the entire stream is forwarded\nunchanged. Currently applies to UDP only; HLS / SRT / File ingest\nare SPTS by convention so the filter is not wired for those (extend\nreader.go if a real MPTS file/SRT use case arises). Ignored for\nRTSP / RTMP, which are single-program by protocol design.",
                     "type": "integer"
                 },
                 "url": {

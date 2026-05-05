@@ -48,6 +48,20 @@ type Input struct {
 	//   "secret_key": "wJal..."   (S3)
 	Params map[string]string `json:"params,omitempty" yaml:"params,omitempty"`
 
+	// Program selects a single MPEG-TS program when the source is a
+	// multi-program transport stream (MPTS) — common in DVB headend feeds
+	// where one multicast carries many channels. When > 0, the ingest
+	// pipeline rewrites the PAT to advertise only the chosen program and
+	// drops PMT / ES packets belonging to other programs, producing a
+	// clean SPTS for downstream HLS / DASH / push consumers.
+	//
+	// Zero (default) disables filtering — the entire stream is forwarded
+	// unchanged. Currently applies to UDP only; HLS / SRT / File ingest
+	// are SPTS by convention so the filter is not wired for those (extend
+	// reader.go if a real MPTS file/SRT use case arises). Ignored for
+	// RTSP / RTMP, which are single-program by protocol design.
+	Program int `json:"program,omitempty" yaml:"program,omitempty"`
+
 	// Net controls reconnect and timeout behaviour.
 	Net InputNetConfig `json:"net,omitempty" yaml:"net,omitempty"`
 

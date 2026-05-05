@@ -92,7 +92,11 @@ func NewPacketReader(
 	case protocol.KindUDP:
 		// Raw-TS passthrough: avoid the demux/remux round-trip that scrambles
 		// PCR/PTS and re-assigns PIDs. See pull/ts_passthrough.go.
-		return pull.NewTSPassthroughPacketReader(pull.NewUDPReader(input)), nil
+		// MPTS program filter applies only to UDP — that is where multi-program
+		// transport streams realistically appear (DVB headend multicast feeds).
+		// HLS / SRT / File sources are single-program by convention; if a
+		// future use case needs the filter for those, wrap them here too.
+		return pull.NewTSPassthroughPacketReader(maybeWrapMPTS(pull.NewUDPReader(input), input)), nil
 	case protocol.KindHLS:
 		// HLS pull also delivers MPEG-TS; same passthrough rationale as UDP.
 		// Note: realtime pacing was previously enabled to throttle the demux
@@ -136,4 +140,19 @@ func NewPacketReader(
 			input.URL,
 		)
 	}
+}
+
+// maybeWrapMPTS wraps a raw-TS chunk source with an MPTS program filter when
+// the input config selects a specific program (input.Program > 0). When
+// Program is zero (default) the source is returned unchanged so single-
+// program TS feeds pay no per-packet PID filter cost.
+//
+// Used for UDP / HLS / SRT / File — the four protocols whose ingest pipeline
+// is raw-TS passthrough. RTSP / RTMP are single-program by protocol design
+// and never reach this helper.
+func maybeWrapMPTS(r pull.TSChunkReader, input domain.Input) pull.TSChunkReader {
+	if input.Program <= 0 {
+		return r
+	}
+	return pull.NewMPTSProgramFilter(r, input.Program)
 }
