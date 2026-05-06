@@ -31,11 +31,12 @@ import (
 
 // hlsABRRep holds metadata about one ladder rung, shared with the master playlist writer.
 type hlsABRRep struct {
-	slug    string
-	bwBps   int
-	width   int
-	height  int
-	hasData bool // at least one segment has been flushed
+	slug     string
+	bwBps    int
+	width    int
+	height   int
+	hasAudio bool // segments contain an audio track — drives the audio entry in CODECS
+	hasData  bool // at least one segment has been flushed
 }
 
 // hlsABRMaster coordinates writing the root master HLS playlist.
@@ -65,13 +66,20 @@ func newHLSABRMaster(rootPath string, streamID domain.StreamCode) *hlsABRMaster 
 // onShardUpdated is called by each rendition segmenter after every segment flush.
 // If SetRepOverride was called for this slug, its values take precedence so the master
 // playlist reflects externally-set metadata (e.g. after a profile bitrate change).
-func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int) {
+//
+// hasAudio drives the audio entry in CODECS — without it, browser HLS players
+// (hls.js + MSE) addSourceBuffer with a video-only codec string and silently
+// drop the audio track even though the .ts segment contains it. Safari's
+// native HLS demuxer is more forgiving but still benefits from an accurate
+// declaration.
+func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int, hasAudio bool) {
 	// Apply external override when present (persists across segment flushes).
 	if v, ok := m.overrides.Load(slug); ok {
 		ov := v.(*hlsABRRep)
 		bwBps = ov.bwBps
 		width = ov.width
 		height = ov.height
+		hasAudio = ov.hasAudio
 	}
 
 	m.mu.Lock()
@@ -86,6 +94,7 @@ func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int) {
 	r.bwBps = bwBps
 	r.width = width
 	r.height = height
+	r.hasAudio = hasAudio
 	r.hasData = true
 
 	if m.debounce != nil {
@@ -98,8 +107,8 @@ func (m *hlsABRMaster) onShardUpdated(slug string, bwBps, width, height int) {
 // triggers a debounced master playlist rewrite. Future onShardUpdated calls for the
 // same slug will continue using these values, keeping the master playlist accurate
 // even before the first new segment arrives from the updated FFmpeg process.
-func (m *hlsABRMaster) SetRepOverride(slug string, bwBps, width, height int) {
-	ov := &hlsABRRep{slug: slug, bwBps: bwBps, width: width, height: height}
+func (m *hlsABRMaster) SetRepOverride(slug string, bwBps, width, height int, hasAudio bool) {
+	ov := &hlsABRRep{slug: slug, bwBps: bwBps, width: width, height: height, hasAudio: hasAudio}
 	m.overrides.Store(slug, ov)
 
 	m.mu.Lock()
@@ -107,6 +116,7 @@ func (m *hlsABRMaster) SetRepOverride(slug string, bwBps, width, height int) {
 		r.bwBps = bwBps
 		r.width = width
 		r.height = height
+		r.hasAudio = hasAudio
 	}
 	if m.debounce != nil {
 		m.debounce.Stop()
@@ -150,7 +160,7 @@ func writeHLSMasterPlaylist(path string, reps []hlsABRRep) error {
 	sb.WriteString("\n")
 
 	for _, r := range reps {
-		codec := hlsCodecString(r.width, r.height)
+		codec := hlsCodecString(r.width, r.height, r.hasAudio)
 		res := ""
 		if r.width > 0 && r.height > 0 {
 			res = fmt.Sprintf(",RESOLUTION=%dx%d", r.width, r.height)
@@ -186,6 +196,13 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream, s
 		s.serveHLS(ctx, mediaBuf)
 		return
 	}
+
+	// Audio presence drives the audio entry in the master playlist's CODECS
+	// attribute. Inferred from the transcoder config: copy keeps the source
+	// audio track, an explicit Codec re-encodes one in. Both produce .ts
+	// segments with audio; without this flag the master declares video only
+	// and hls.js drops audio in the browser.
+	hasAudio := stream.Transcoder.Audio.Copy || stream.Transcoder.Audio.Codec != ""
 
 	streamBase := filepath.Join(hlsDir, string(code))
 	if err := os.MkdirAll(streamBase, 0o755); err != nil {
@@ -243,6 +260,7 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream, s
 				bwBps:       r.BandwidthBps(),
 				width:       r.Width,
 				height:      r.Height,
+				hasAudio:    hasAudio,
 				failoverGen: func() uint64 { return s.hlsFailoverGenSnapshot(code) },
 				segCount:    s.hlsSegCounter(code, r.Slug),
 			}

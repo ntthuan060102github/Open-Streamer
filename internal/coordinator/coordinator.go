@@ -664,6 +664,7 @@ func (c *Coordinator) reloadProfiles(new *domain.Stream, pd *ProfilesDiff) error
 // so the live HLS master playlist can be rewritten without restarting the publisher.
 func abrMetaFromUpdated(stream *domain.Stream, updated []ProfileChange) []publisher.ABRRepMeta {
 	profiles := transcoderProfilesFromDomain(&stream.Transcoder.Video)
+	hasAudio := stream.Transcoder.Audio.Copy || stream.Transcoder.Audio.Codec != ""
 	out := make([]publisher.ABRRepMeta, 0, len(updated))
 	for _, ch := range updated {
 		if ch.Index >= len(profiles) {
@@ -675,10 +676,11 @@ func abrMetaFromUpdated(stream *domain.Stream, updated []ProfileChange) []publis
 			bwBps = ch.New.Bitrate * 1000
 		}
 		out = append(out, publisher.ABRRepMeta{
-			Slug:   buffer.VideoTrackSlug(ch.Index),
-			BwBps:  bwBps,
-			Width:  p.Width,
-			Height: p.Height,
+			Slug:     buffer.VideoTrackSlug(ch.Index),
+			BwBps:    bwBps,
+			Width:    p.Width,
+			Height:   p.Height,
+			HasAudio: hasAudio,
 		})
 	}
 	return out

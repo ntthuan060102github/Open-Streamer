@@ -41,10 +41,11 @@ var (
 // playlist rewrites (e.g. after a profile bitrate/resolution change without an ABR
 // ladder structure change).
 type ABRRepMeta struct {
-	Slug   string
-	BwBps  int
-	Width  int
-	Height int
+	Slug     string
+	BwBps    int
+	Width    int
+	Height   int
+	HasAudio bool
 }
 
 // streamState holds per-stream publisher lifecycle state.
@@ -589,7 +590,7 @@ func (s *Service) UpdateABRMasterMeta(streamCode domain.StreamCode, updates []AB
 		return
 	}
 	for _, u := range updates {
-		m.SetRepOverride(u.Slug, u.BwBps, u.Width, u.Height)
+		m.SetRepOverride(u.Slug, u.BwBps, u.Width, u.Height, u.HasAudio)
 	}
 }
 

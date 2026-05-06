@@ -58,11 +58,12 @@ func TestWindowTailEntries_TruncatesOldest(t *testing.T) {
 
 func TestHLSCodecString(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, "avc1.640028", hlsCodecString(1920, 1080))
-	assert.Equal(t, "avc1.640028", hlsCodecString(3840, 2160))
-	assert.Equal(t, "avc1.4d401f", hlsCodecString(1280, 720))
-	assert.Equal(t, "avc1.42e01e", hlsCodecString(854, 480))
-	assert.Equal(t, "avc1.42e01e", hlsCodecString(0, 0))
+	// Video-only — no "mp4a" suffix.
+	assert.Equal(t, "avc1.640028", hlsCodecString(1920, 1080, false))
+	assert.Equal(t, "avc1.640028", hlsCodecString(3840, 2160, false))
+	assert.Equal(t, "avc1.4d401f", hlsCodecString(1280, 720, false))
+	assert.Equal(t, "avc1.42e01e", hlsCodecString(854, 480, false))
+	assert.Equal(t, "avc1.42e01e", hlsCodecString(0, 0, false))
 }
 
 // ---- hlsSegmenter.writeManifestLocked / flushLocked -------------------------
@@ -207,4 +208,75 @@ func TestRunHLSSegmenter_FlushesOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("segmenter did not exit after context cancel")
 	}
+}
+
+// ---- hlsCodecString ---------------------------------------------------------
+
+// hlsCodecString must include "mp4a.40.2" when the rendition has audio.
+// Without this, hls.js + MSE addSourceBuffer with a video-only codec list
+// and silently drop the audio track.
+func TestHLSCodecStringIncludesAudioWhenPresent(t *testing.T) {
+	t.Parallel()
+	got := hlsCodecString(1280, 720, true)
+	require.Contains(t, got, "avc1.4d401f", "video codec must be present")
+	require.Contains(t, got, "mp4a.40.2", "audio codec must be present when hasAudio=true")
+}
+
+// hlsCodecString must NOT include "mp4a.40.2" when the rendition is video-only
+// — declaring audio that does not exist also breaks playback.
+func TestHLSCodecStringOmitsAudioWhenAbsent(t *testing.T) {
+	t.Parallel()
+	got := hlsCodecString(1280, 720, false)
+	require.Contains(t, got, "avc1.4d401f")
+	require.NotContains(t, got, "mp4a", "audio codec must be absent when hasAudio=false")
+}
+
+// hlsCodecString picks the right H.264 profile/level by resolution.
+func TestHLSCodecStringByResolution(t *testing.T) {
+	t.Parallel()
+	require.Contains(t, hlsCodecString(1920, 1080, false), "avc1.640028", "1080p → High@L4.0")
+	require.Contains(t, hlsCodecString(1280, 720, false), "avc1.4d401f", "720p → Main@L3.1")
+	require.Contains(t, hlsCodecString(640, 360, false), "avc1.42e01e", "<720p → Baseline@L3.0")
+}
+
+// writeHLSMasterPlaylist emits CODECS with audio for renditions where
+// hasAudio=true — regression guard for the bug where transcoded ABR streams
+// declared video only and would not play in browsers.
+func TestWriteHLSMasterPlaylistEmitsAudioCodec(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "index.m3u8")
+
+	reps := []hlsABRRep{
+		{slug: "track_1", bwBps: 3500000, width: 1280, height: 720, hasAudio: true},
+	}
+	require.NoError(t, writeHLSMasterPlaylist(path, reps))
+
+	body, err := os.ReadFile(path)
+	require.NoError(t, err)
+	got := string(body)
+	require.Contains(t, got, "BANDWIDTH=3500000")
+	require.Contains(t, got, "RESOLUTION=1280x720")
+	require.Contains(t, got, "avc1.4d401f")
+	require.Contains(t, got, "mp4a.40.2")
+	require.Contains(t, got, "track_1/index.m3u8")
+}
+
+// writeHLSMasterPlaylist omits audio from CODECS when the rendition is
+// video-only.
+func TestWriteHLSMasterPlaylistOmitsAudioCodecWhenVideoOnly(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "index.m3u8")
+
+	reps := []hlsABRRep{
+		{slug: "track_1", bwBps: 1000000, width: 640, height: 360, hasAudio: false},
+	}
+	require.NoError(t, writeHLSMasterPlaylist(path, reps))
+
+	body, err := os.ReadFile(path)
+	require.NoError(t, err)
+	got := string(body)
+	require.Contains(t, got, "avc1.42e01e")
+	require.NotContains(t, got, "mp4a", "audio codec must not appear when video-only")
 }

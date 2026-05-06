@@ -33,11 +33,16 @@ import (
 
 // hlsRunOpts carries per-rendition metadata for ABR HLS; nil → single-rendition mode.
 type hlsRunOpts struct {
-	abrMaster   *hlsABRMaster
-	abrSlug     string
-	bwBps       int
-	width       int
-	height      int
+	abrMaster *hlsABRMaster
+	abrSlug   string
+	bwBps     int
+	width     int
+	height    int
+	// hasAudio reflects whether this rendition's segments contain an audio
+	// track; surfaces in the master playlist's CODECS attribute. Derived
+	// from the transcoder config at setup time so the master playlist
+	// declares the correct codec list before the first segment lands.
+	hasAudio    bool
 	failoverGen func() uint64
 	// segCount is incremented once per successful segment write. Pre-bound
 	// to {stream_code,format=hls,profile} so the hot path skips the
@@ -127,6 +132,7 @@ func runHLSSegmenter(
 		p.bwBps = opts.bwBps
 		p.width = opts.width
 		p.height = opts.height
+		p.hasAudio = opts.hasAudio
 		p.failoverGen = opts.failoverGen
 		p.segCount = opts.segCount
 	}
@@ -178,6 +184,7 @@ type hlsSegmenter struct {
 	bwBps     int
 	width     int
 	height    int
+	hasAudio  bool // set at construction from hlsRunOpts
 
 	// Pre-bound segment-write counter; nil-safe.
 	segCount prometheus.Counter
@@ -493,7 +500,7 @@ func (p *hlsSegmenter) writeManifestLocked() error {
 
 	if p.abrMaster != nil {
 		// Notify the ABR master so it can refresh the root master playlist.
-		p.abrMaster.onShardUpdated(p.abrSlug, p.bwBps, p.width, p.height)
+		p.abrMaster.onShardUpdated(p.abrSlug, p.bwBps, p.width, p.height, p.hasAudio)
 	}
 
 	if p.manifestPath != "" {
@@ -514,16 +521,27 @@ func windowTailEntries(entries []hlsSegEntry, n int) []hlsSegEntry {
 }
 
 // hlsCodecString returns a CODECS attribute value for EXT-X-STREAM-INF based on
-// the rendition resolution.  These are representative H.264 profiles/levels; the
+// the rendition resolution. These are representative H.264 profiles/levels; the
 // exact string depends on the encoder configuration but this covers common setups.
-func hlsCodecString(width, height int) string {
+//
+// hasAudio appends "mp4a.40.2" (AAC-LC) so the master playlist accurately
+// declares both tracks. Without this, hls.js + MSE addSourceBuffer with a
+// video-only codec list and silently drop audio even though the .ts segments
+// carry it — which is why "plays in the Open-Streamer console but not in the
+// browser" is a recurring symptom on transcoded ABR streams.
+func hlsCodecString(width, height int, hasAudio bool) string {
 	pixels := width * height
+	var video string
 	switch {
 	case pixels >= 1920*1080:
-		return "avc1.640028" // High@L4.0
+		video = "avc1.640028" // High@L4.0
 	case pixels >= 1280*720:
-		return "avc1.4d401f" // Main@L3.1
+		video = "avc1.4d401f" // Main@L3.1
 	default:
-		return "avc1.42e01e" // Baseline@L3.0
+		video = "avc1.42e01e" // Baseline@L3.0
 	}
+	if hasAudio {
+		return video + ",mp4a.40.2"
+	}
+	return video
 }
