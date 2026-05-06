@@ -1,22 +1,11 @@
 package publisher
 
-// sessions_helper_test.go — guards the playSession bytes-credit semantics.
-// The two paths must stay distinct:
-//
-//   - add() / close()           → RTMP, SRT, MPEGTS where the publisher
-//                                 knows the byte count at write time.
-//                                 Bytes flow live to the tracker via
-//                                 Closer.Touch(delta) on each throttle
-//                                 window, with any unflushed remainder
-//                                 credited via Closer.Close at the end.
-//   - closeWithBytes(n)         → RTSP where the underlying library reports
-//                                 the cumulative byte total only at session
-//                                 end (gortsplib SessionStats.OutboundBytes)
-//
-// Mixing the two on the same session would double-count, hence the close*
-// methods are mutually exclusive in usage. The fake closer below records
-// every Touch / Close so the tests can verify both the totals and the
-// per-call splits.
+// sessions_helper_test.go — guards the playSession bytes-credit semantics
+// for connection-bound protocols (RTMP / SRT / MPEGTS / RTSP). All paths
+// flow through add() → touch() (live, throttled flush) → close() (final
+// flush of unswapped remainder). The fake closer below records every
+// Touch / Close so the tests can verify both the cumulative totals and
+// the per-call splits.
 
 import (
 	"sync"
@@ -85,57 +74,26 @@ func TestPlaySessionCloseUsesAccumulatedBytes(t *testing.T) {
 	require.Equal(t, domain.SessionCloseClient, fc.lastReas)
 }
 
-// closeWithBytes is the RTSP path — overrides whatever was in the bytes
-// counter (which RTSP never increments) with the externally-measured total
-// from gortsplib SessionStats. Without this, every RTSP session record
-// would show bytes=0.
-func TestPlaySessionCloseWithBytesUsesExternalCount(t *testing.T) {
-	t.Parallel()
-	fc := &fakeCloser{}
-	p := &playSession{closer: fc}
-
-	// Even if add() was called for some reason, closeWithBytes ignores the
-	// internal counter — the external value is the source of truth.
-	p.add(999)
-	p.closeWithBytes(5_242_880) // 5 MiB
-
-	require.Equal(t, 1, fc.calls)
-	require.Equal(t, int64(5_242_880), fc.lastBytes,
-		"closeWithBytes must use the supplied total, not the internal counter")
-}
-
-// Negative byte totals are silently clamped to 0 — defensive guard against
-// a future caller passing `int64(stats.OutboundBytes)` after a uint64
-// underflow somewhere upstream. Better to record 0 than negative bandwidth.
-func TestPlaySessionCloseWithBytesClampsNegative(t *testing.T) {
-	t.Parallel()
-	fc := &fakeCloser{}
-	p := &playSession{closer: fc}
-
-	p.closeWithBytes(-100)
-
-	require.Equal(t, int64(0), fc.lastBytes)
-}
-
-// Disabled session (tracker not configured) must not call the closer at
-// all — the no-op contract covers both close paths.
-func TestPlaySessionCloseWithBytesNoopWhenDisabled(t *testing.T) {
+// Disabled session (tracker not configured) must not call the closer —
+// the no-op contract covers close().
+func TestPlaySessionCloseNoopWhenDisabled(t *testing.T) {
 	t.Parallel()
 	fc := &fakeCloser{}
 	p := &playSession{closer: fc, disable: true}
 
-	p.closeWithBytes(1024)
+	p.add(1024)
+	p.close()
 
 	require.Equal(t, 0, fc.calls,
-		"disabled session must not invoke closer.Close on either path")
+		"disabled session must not invoke closer.Close")
 }
 
 // Nil closer must be a safe no-op — happens for short-lived sessions that
 // never fully open against the tracker (e.g. RTSP DESCRIBE without PLAY).
-func TestPlaySessionCloseWithBytesNoopWhenCloserNil(t *testing.T) {
+func TestPlaySessionCloseNoopWhenCloserNil(t *testing.T) {
 	t.Parallel()
 	p := &playSession{closer: nil}
-	require.NotPanics(t, func() { p.closeWithBytes(1024) })
+	require.NotPanics(t, func() { p.close() })
 }
 
 // add() must call Touch with the pending byte delta so the API surfaces a

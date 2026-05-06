@@ -387,8 +387,17 @@ func runRTSPPipeline(
 // directly.
 type rtspClient struct {
 	ps           *playSession
-	gortspSess   *gortsplib.ServerSession // captured for nil-safe pollBytes when the close ctx isn't handy
-	lastOutbound atomic.Uint64            // cumulative bytes seen on the previous poll
+	gortspSess   rtspStatsSource // captured for nil-safe pollBytes when the close ctx isn't handy
+	lastOutbound atomic.Uint64   // cumulative bytes seen on the previous poll
+}
+
+// rtspStatsSource is the subset of *gortsplib.ServerSession pollBytes
+// needs. Extracting an interface keeps pollBytes unit-testable without a
+// running RTSP server — production code passes the concrete
+// *gortsplib.ServerSession (which satisfies the interface implicitly),
+// tests pass a small fake that returns scripted byte totals.
+type rtspStatsSource interface {
+	Stats() *gortsplib.SessionStats
 }
 
 // pollBytes reads gortsplib's cumulative outbound counter, computes the
@@ -399,7 +408,7 @@ type rtspClient struct {
 // `ss` is passed in rather than read from rtspClient because the close
 // callback already has it on the context; the touch loop falls back to
 // the captured gortspSess pointer.
-func (c *rtspClient) pollBytes(ss *gortsplib.ServerSession) {
+func (c *rtspClient) pollBytes(ss rtspStatsSource) {
 	if ss == nil {
 		ss = c.gortspSess
 	}
@@ -428,7 +437,7 @@ func (c *rtspClient) pollBytes(ss *gortsplib.ServerSession) {
 func (s *Service) touchRTSPSessions(streamCode domain.StreamCode) {
 	type victim struct {
 		client *rtspClient
-		ss     *gortsplib.ServerSession
+		ss     rtspStatsSource
 	}
 	s.rtspSessionsMu.Lock()
 	victims := make([]victim, 0, len(s.rtspSessions))

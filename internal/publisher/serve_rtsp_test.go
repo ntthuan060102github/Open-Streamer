@@ -2,9 +2,11 @@ package publisher
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/stretchr/testify/require"
 )
@@ -186,4 +188,140 @@ func TestPaceAbortsOnContextCancel(t *testing.T) {
 	elapsed := time.Since(start)
 	require.Less(t, elapsed, 200*time.Millisecond,
 		"context cancellation must abort the pace sleep")
+}
+
+// ─── rtspClient.pollBytes ────────────────────────────────────────────────────
+//
+// pollBytes incrementalises gortsplib's cumulative `Stats().OutboundBytes`
+// counter into per-poll deltas that flow through playSession.add(). Booting
+// an RTSP server inside a unit test is heavyweight, so pollBytes accepts
+// the rtspStatsSource interface — *gortsplib.ServerSession satisfies it
+// in production, fakeRTSPStats satisfies it here.
+
+// fakeRTSPStats is the bare-minimum rtspStatsSource. Tests mutate
+// `outbound` between pollBytes calls to script the cumulative counter the
+// way gortsplib would in production. statsNil lets one case verify the
+// nil-stats branch (gortsplib has been seen to return nil during shutdown
+// races).
+type fakeRTSPStats struct {
+	outbound atomic.Uint64
+	statsNil atomic.Bool
+}
+
+func (f *fakeRTSPStats) SetOutbound(v uint64) { f.outbound.Store(v) }
+
+func (f *fakeRTSPStats) Stats() *gortsplib.SessionStats {
+	if f.statsNil.Load() {
+		return nil
+	}
+	return &gortsplib.SessionStats{OutboundBytes: f.outbound.Load()}
+}
+
+// First poll establishes the baseline and credits the full counter as a
+// delta — there is no prior reading to subtract from. This is the path
+// hit on the very first touch tick after OnPlay.
+func TestRTSPClientPollBytesFirstReadCreditsFullCounter(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	c := &rtspClient{ps: &playSession{closer: fc}}
+	src := &fakeRTSPStats{}
+	src.SetOutbound(2048)
+
+	c.pollBytes(src)
+
+	require.Equal(t, int64(2048), fc.touchedSum,
+		"first poll must credit the entire current OutboundBytes as a delta")
+}
+
+// Subsequent polls credit only the increment since the previous reading.
+// Steady-state path: every 5 s the touch tick polls and only the bytes
+// sent during that window flow into the tracker. The 5 s touch throttle
+// in playSession means rapid back-to-back polls in this test all land in
+// the local atomic — close() flushes whatever wasn't pushed via Touch,
+// so totalCredited (Touch + Close) is the invariant we assert.
+func TestRTSPClientPollBytesIncrementalDelta(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	c := &rtspClient{ps: &playSession{closer: fc}}
+	src := &fakeRTSPStats{}
+
+	src.SetOutbound(1000)
+	c.pollBytes(src)
+	src.SetOutbound(1500)
+	c.pollBytes(src)
+	src.SetOutbound(1700)
+	c.pollBytes(src)
+	c.ps.close()
+
+	require.Equal(t, int64(1700), fc.totalCredited(),
+		"three polls of 1000/1500/1700 must credit deltas summing to 1700 across Touch + Close")
+}
+
+// A poll that finds no growth (idle frame, paused client) must not credit
+// any bytes. add(0) is a no-op; this is a regression guard against future
+// changes that could leak a zero-delta into the tracker.
+func TestRTSPClientPollBytesNoGrowthSkipsAdd(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	c := &rtspClient{ps: &playSession{closer: fc}}
+	src := &fakeRTSPStats{}
+
+	src.SetOutbound(500)
+	c.pollBytes(src) // first poll publishes 500 via Touch
+	require.Equal(t, int64(500), fc.touchedSum)
+
+	c.pollBytes(src) // no growth — same 500
+	c.ps.close()
+
+	require.Equal(t, int64(500), fc.totalCredited(),
+		"a no-growth second poll must not credit any extra bytes")
+}
+
+// Nil stats (gortsplib returning nil during shutdown) must not panic and
+// must not advance the cursor — next poll should still see the genuine
+// counter as a fresh delta.
+func TestRTSPClientPollBytesNilStatsIsNoop(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	c := &rtspClient{ps: &playSession{closer: fc}}
+	src := &fakeRTSPStats{}
+	src.SetOutbound(999)
+	src.statsNil.Store(true)
+
+	require.NotPanics(t, func() { c.pollBytes(src) })
+	require.Equal(t, int64(0), fc.touchedSum,
+		"nil-stats poll must not credit any bytes")
+
+	src.statsNil.Store(false)
+	c.pollBytes(src)
+	c.ps.close()
+	require.Equal(t, int64(999), fc.totalCredited(),
+		"first non-nil read after nil polls must still credit the full counter")
+}
+
+// Nil ss falls back to c.gortspSess — used by the touch loop where the
+// caller has the session pointer cached on the rtspClient struct rather
+// than on the function argument.
+func TestRTSPClientPollBytesFallsBackToCachedSession(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	src := &fakeRTSPStats{}
+	src.SetOutbound(777)
+	c := &rtspClient{ps: &playSession{closer: fc}, gortspSess: src}
+
+	c.pollBytes(nil)
+
+	require.Equal(t, int64(777), fc.touchedSum,
+		"nil ss argument must fall back to the cached gortspSess")
+}
+
+// Both ss and cached gortspSess nil — must not panic, no credit. Edge case
+// for sessions that never reached OnPlay (rtspClient never registered).
+func TestRTSPClientPollBytesBothNilIsNoop(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	c := &rtspClient{ps: &playSession{closer: fc}}
+
+	require.NotPanics(t, func() { c.pollBytes(nil) })
+	require.Equal(t, int64(0), fc.touchedSum)
 }

@@ -279,20 +279,37 @@ func wireServices(i *do.RootScope) {
 	// intentionally do NOT abort boot on a missing DB — refusing to start
 	// just because a GeoIP file moved would be more disruptive than
 	// degrading PlaySession.Country to "" until the operator fixes the path.
-	do.Provide(i, func(inj do.Injector) (sessions.GeoIPResolver, error) {
+	// SwappableGeoIP is provided unconditionally so sessions.Service can
+	// hot-reload the MaxMind database via UpdateConfig without restarting.
+	// The initial backend is loaded here; a config diff on geoip_db_path
+	// will swap to the new file (or back to NullGeoIP when cleared).
+	do.Provide(i, func(inj do.Injector) (*sessions.SwappableGeoIP, error) {
 		cfg := do.MustInvoke[config.SessionsConfig](inj)
+		swap := sessions.NewSwappableGeoIP() // pre-loaded with NullGeoIP
 		path := strings.TrimSpace(cfg.GeoIPDBPath)
 		if path == "" {
-			return nil, fmt.Errorf("geoip: db path not configured")
+			// Empty path is the documented "feature off" state. Logged at
+			// INFO so operators who expected GeoIP enrichment see it in
+			// the startup transcript instead of guessing why Country is
+			// empty for every session.
+			slog.Info("geoip: disabled (sessions.geoip_db_path not configured); PlaySession.Country will be empty")
+			return swap, nil
 		}
 		mm, err := sessions.NewMaxMindGeoIP(path)
 		if err != nil {
-			slog.Warn("geoip: MaxMind reader unavailable, sessions degrade to Country=\"\"",
+			// File-open / parse failure is the classic operator footgun:
+			// path typo, missing volume mount in docker, wrong DB schema
+			// (ASN instead of Country/City). Surface with the path AND
+			// the underlying error so the fix is obvious from logs alone.
+			// Returning swap (still NullGeoIP) lets the rest of the
+			// system boot — operators can fix the path and hot-reload.
+			slog.Warn("geoip: failed to open MaxMind database at startup; PlaySession.Country will be empty until fixed",
 				"path", path, "err", err)
-			return nil, err
+			return swap, nil
 		}
 		slog.Info("geoip: MaxMind reader loaded", "path", path)
-		return mm, nil
+		swap.Set(mm)
+		return swap, nil
 	})
 	do.Provide(i, sessions.New)
 	do.Provide(i, watermarks.New)
