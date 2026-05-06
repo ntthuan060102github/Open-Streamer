@@ -277,7 +277,7 @@ records, viewers reconnect into fresh sessions.
 | Filter / list | Complete | `GET /sessions?proto=…&status=…&limit=…` + per-stream `/streams/{code}/sessions` |
 | Stats counters | Complete | `active`, `opened_total`, `closed_total`, `idle_closed_total`, `kicked_total` exposed in every list response |
 | Event bus emit | Complete | `EventSessionOpened` / `EventSessionClosed` published — hooks can persist analytics or notify ops |
-| GeoIP resolver interface | Schema only | `GeoIPResolver` interface + `NullGeoIP` default; `geoip_db_path` config field reserved. MaxMind / IP2Location reader not wired. |
+| GeoIP resolver (MaxMind .mmdb) | Complete | `GeoIPResolver` interface + `NullGeoIP` default. When `sessions.geoip_db_path` points to a MaxMind .mmdb (GeoLite2-Country / GeoLite2-City / commercial GeoIP2), `cmd/server/main.go` opens it via `sessions.NewMaxMindGeoIP` and registers as the resolver — `PlaySession.Country` then carries the ISO 3166-1 alpha-2 code. Empty path or open failure falls back to NullGeoIP (warn-logged); never blocks boot. Operators can swap in a custom resolver (IP2Location, in-house service) by replacing the DI binding. |
 
 ---
 
@@ -306,9 +306,6 @@ Tracking what is intentionally NOT done. Each row is a deliberate scope decision
 | Priority | Feature | Status | Notes |
 |---|---|---|---|
 | Mid | Thumbnail | Schema only | Periodic JPEG snapshot from main buffer; needs ffmpeg `select=eq(pict_type\\,I)` chain |
-| Mid | GeoIP MaxMind reader | Schema only | Interface + `NullGeoIP` default exist; concrete MaxMind/IP2Location reader not wired. `sessions.geoip_db_path` config field reserved |
-| Mid | Sessions persistence (history beyond active set) | Not started | In-memory only — closed sessions disappear after the event is published. Hooks can persist downstream |
-| Mid | Local-packager error tracking (HLS/DASH) | Not started | Currently slog-only; analogous to push state pattern but per-stream-per-format |
 | Low | HLS / DASH push out | Not started | Only RTMP/RTMPS push exists |
 | Low | RTSP per-session bytes accuracy | Schema only | gortsplib mux is internal; current `bytes=0` for RTSP. Would need a custom `WritePacketRTP` wrapper or fork |
 | Low | RTMP `flashVer` capture | Schema only | gomedia doesn't expose `flashVer` from the connect command publicly; left empty in `PlayInfo.FlashVer` |
@@ -323,6 +320,8 @@ Tracking what is intentionally NOT done. Each row is a deliberate scope decision
 | RTMP ingest server lal migration | Current gomedia-based push server is stable with per-connection `recover()`. Cost-benefit doesn't justify refactor + retest matrix |
 | Per-rendition push selection | Push always sends best rendition. Multi-tier publishing → run separate streams |
 | Full `gomedia` → `lal` swap | TS infrastructure (`gomedia/go-mpeg2`) has no equivalent in lal. Hybrid stack is intentional |
+| Sessions persistence (history beyond active set) | In-memory map is intentional — sessions are an operational view, not an audit log. Operators who need persistent history wire a hook on `session.opened` / `session.closed` and store downstream (their DB, S3, log pipeline). Avoids pulling a SQL/file backend into the server for a use case better served by the existing event bus |
+| Local-packager error tracking (HLS/DASH runtime errors[]) | The success path is already covered by `publisher_segments_total{stream_code, format, profile}` — alert on `rate(...[2m]) == 0` for active streams catches every "segmenter stalled" case without per-error bookkeeping. Per-error-reason breakdown (`disk_full` vs `permission_denied` vs `demux_panic`) and a runtime API `errors[]` view would be useful for ops dashboards but duplicate what `slog` already records — log + Prometheus rate alert handles operational needs. Skip the bookkeeping until a concrete dashboard requirement justifies it |
 
 ---
 

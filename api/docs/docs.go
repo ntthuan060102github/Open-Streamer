@@ -2396,7 +2396,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "geoip_db_path": {
-                    "description": "GeoIPDBPath is reserved for future MaxMind/IP2Location integration.\nCurrently unused — the default GeoIP resolver is a no-op (Country=\"\").\nOperators wanting GeoIP can wire their own resolver via DI.",
+                    "description": "GeoIPDBPath, when non-empty, points to a MaxMind .mmdb file\n(GeoLite2-Country / GeoLite2-City; commercial GeoIP2 also works).\nThe wiring layer opens it once at startup and uses it to fill\nPlaySession.Country with the ISO 3166-1 alpha-2 code. When empty\n(default) or when opening fails, sessions degrade silently to\nCountry=\"\" via NullGeoIP — no impact on session tracking itself.\n\nHot-reloading the file on disk requires a server restart; the\n.mmdb is mmap'd for the lifetime of the process.",
                     "type": "string"
                 },
                 "idle_timeout_sec": {
@@ -2516,8 +2516,6 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2533,7 +2531,9 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error"
+                "transcoder.error",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2543,8 +2543,6 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "",
                 "",
@@ -2560,11 +2558,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2580,7 +2578,9 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError"
+                "EventTranscoderError",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {

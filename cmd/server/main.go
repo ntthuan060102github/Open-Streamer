@@ -272,6 +272,28 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, publisher.New)
 	do.Provide(i, dvr.New)
 	do.Provide(i, hooks.New)
+	// GeoIPResolver factory — registered BEFORE sessions.New so sessions.New
+	// can resolve it via do.Invoke. Returns an error (skipped by samber/do
+	// like any failed provider) when geoip_db_path is empty OR when opening
+	// the .mmdb fails; sessions.New then falls back to NullGeoIP. We
+	// intentionally do NOT abort boot on a missing DB — refusing to start
+	// just because a GeoIP file moved would be more disruptive than
+	// degrading PlaySession.Country to "" until the operator fixes the path.
+	do.Provide(i, func(inj do.Injector) (sessions.GeoIPResolver, error) {
+		cfg := do.MustInvoke[config.SessionsConfig](inj)
+		path := strings.TrimSpace(cfg.GeoIPDBPath)
+		if path == "" {
+			return nil, fmt.Errorf("geoip: db path not configured")
+		}
+		mm, err := sessions.NewMaxMindGeoIP(path)
+		if err != nil {
+			slog.Warn("geoip: MaxMind reader unavailable, sessions degrade to Country=\"\"",
+				"path", path, "err", err)
+			return nil, err
+		}
+		slog.Info("geoip: MaxMind reader loaded", "path", path)
+		return mm, nil
+	})
 	do.Provide(i, sessions.New)
 	do.Provide(i, watermarks.New)
 	do.Provide(i, metrics.New)

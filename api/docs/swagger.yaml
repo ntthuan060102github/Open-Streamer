@@ -515,9 +515,15 @@ definitions:
         type: boolean
       geoip_db_path:
         description: |-
-          GeoIPDBPath is reserved for future MaxMind/IP2Location integration.
-          Currently unused — the default GeoIP resolver is a no-op (Country="").
-          Operators wanting GeoIP can wire their own resolver via DI.
+          GeoIPDBPath, when non-empty, points to a MaxMind .mmdb file
+          (GeoLite2-Country / GeoLite2-City; commercial GeoIP2 also works).
+          The wiring layer opens it once at startup and uses it to fill
+          PlaySession.Country with the ISO 3166-1 alpha-2 code. When empty
+          (default) or when opening fails, sessions degrade silently to
+          Country="" via NullGeoIP — no impact on session tracking itself.
+
+          Hot-reloading the file on disk requires a server restart; the
+          .mmdb is mmap'd for the lifetime of the process.
         type: string
       idle_timeout_sec:
         description: |-
@@ -615,8 +621,6 @@ definitions:
     type: object
   domain.EventType:
     enum:
-    - session.opened
-    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -633,6 +637,8 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
+    - session.opened
+    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -641,8 +647,6 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
-    - ""
-    - ""
     - ""
     - ""
     - ""
@@ -659,9 +663,9 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
-    - EventSessionOpened
-    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -678,6 +682,8 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
+    - EventSessionOpened
+    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:

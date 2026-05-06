@@ -6,11 +6,12 @@ import "net"
 // Implementations must be safe for concurrent use and return "" when the
 // address cannot be resolved (private address, missing DB, lookup error).
 //
-// The default implementation registered by the wiring layer is a no-op
-// (always ""); operators wanting real GeoIP can swap in a MaxMind / IP2Location
-// backed implementation by replacing the DI binding before service start —
-// the sessions package intentionally has no MaxMind dependency to keep the
-// binary lean and license-free.
+// The default registered in DI is NullGeoIP — no lookup, Country always "".
+// When `sessions.geoip_db_path` is set in config, the wiring layer in
+// `cmd/server/main.go` opens the .mmdb via NewMaxMindGeoIP and registers
+// that as the resolver instead. Operators can also swap in any custom
+// implementation (IP2Location, in-house service) by replacing the DI
+// binding before service start.
 type GeoIPResolver interface {
 	Country(ip net.IP) string
 }

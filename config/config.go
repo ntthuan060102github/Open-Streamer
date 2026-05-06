@@ -193,9 +193,15 @@ type SessionsConfig struct {
 	// if it's still seeing activity. 0 disables the cap.
 	MaxLifetimeSec int `mapstructure:"max_lifetime_sec" json:"max_lifetime_sec" yaml:"max_lifetime_sec"`
 
-	// GeoIPDBPath is reserved for future MaxMind/IP2Location integration.
-	// Currently unused — the default GeoIP resolver is a no-op (Country="").
-	// Operators wanting GeoIP can wire their own resolver via DI.
+	// GeoIPDBPath, when non-empty, points to a MaxMind .mmdb file
+	// (GeoLite2-Country / GeoLite2-City; commercial GeoIP2 also works).
+	// The wiring layer opens it once at startup and uses it to fill
+	// PlaySession.Country with the ISO 3166-1 alpha-2 code. When empty
+	// (default) or when opening fails, sessions degrade silently to
+	// Country="" via NullGeoIP — no impact on session tracking itself.
+	//
+	// Hot-reloading the file on disk requires a server restart; the
+	// .mmdb is mmap'd for the lifetime of the process.
 	GeoIPDBPath string `mapstructure:"geoip_db_path" json:"geoip_db_path,omitempty" yaml:"geoip_db_path,omitempty"`
 }
 
