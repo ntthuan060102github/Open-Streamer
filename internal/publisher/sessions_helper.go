@@ -48,11 +48,15 @@ func (p *playSession) add(n int64) {
 	p.touch()
 }
 
-// touch refreshes the session's UpdatedAt via Closer.Touch, throttled so
-// the underlying tracker mutex is not contended on every frame write.
-// Connection-bound protocols (RTMP / SRT / RTSP) MUST call this from
-// their write path — without it the idle reaper closes the session after
-// `sessions.idle_timeout_sec` (default 30s) even when streaming is healthy.
+// touch refreshes the session's UpdatedAt via Closer.Touch and flushes
+// any pending byte delta to the tracker, throttled so the underlying
+// tracker mutex is not contended on every frame write. Connection-bound
+// protocols (RTMP / SRT / RTSP / MPEGTS) MUST call this from their
+// write path — without it (a) the idle reaper closes the session after
+// `sessions.idle_timeout_sec` (default 30s) even when streaming is
+// healthy, and (b) the API would show 0 bytes mid-stream because the
+// per-frame add() only updates this side's atomic counter, not the
+// tracker record.
 //
 // HLS / DASH don't use this path: their session records are refreshed by
 // the HTTP middleware on every segment GET (see sessions.HTTPMiddleware).
@@ -68,16 +72,24 @@ func (p *playSession) touch() {
 	// CompareAndSwap so concurrent writers (RTMP video + audio frames on
 	// adjacent goroutines) elect a single Touch caller per throttle window
 	// — without it both fire and the tracker mutex sees double the load.
+	// The elected caller atomically swaps out the pending byte counter so
+	// concurrent add()s after the swap accumulate into the next window
+	// without being lost or double-credited.
 	if p.lastTouch.CompareAndSwap(last, now) {
-		p.closer.Touch()
+		delta := p.bytes.Swap(0)
+		p.closer.Touch(delta)
 	}
 }
 
+// close finalises the session, crediting any bytes that have not yet been
+// flushed by touch(). Bytes is a Swap(0) so concurrent close + touch races
+// (touch publishes V, close publishes 0; or vice-versa) leave a correct
+// total in the tracker record.
 func (p *playSession) close() {
 	if p.disable || p.closer == nil {
 		return
 	}
-	p.closer.Close(domain.SessionCloseClient, p.bytes.Load())
+	p.closer.Close(domain.SessionCloseClient, p.bytes.Swap(0))
 }
 
 // closeWithBytes credits an externally-measured byte total to the session

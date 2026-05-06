@@ -3,15 +3,20 @@ package publisher
 // sessions_helper_test.go — guards the playSession bytes-credit semantics.
 // The two paths must stay distinct:
 //
-//   - add() / close()           → RTMP, SRT, HLS where the publisher knows
-//                                 the byte count at write time
+//   - add() / close()           → RTMP, SRT, MPEGTS where the publisher
+//                                 knows the byte count at write time.
+//                                 Bytes flow live to the tracker via
+//                                 Closer.Touch(delta) on each throttle
+//                                 window, with any unflushed remainder
+//                                 credited via Closer.Close at the end.
 //   - closeWithBytes(n)         → RTSP where the underlying library reports
 //                                 the cumulative byte total only at session
 //                                 end (gortsplib SessionStats.OutboundBytes)
 //
 // Mixing the two on the same session would double-count, hence the close*
 // methods are mutually exclusive in usage. The fake closer below records
-// the value handed to Close so the test can assert the right path was taken.
+// every Touch / Close so the tests can verify both the totals and the
+// per-call splits.
 
 import (
 	"sync"
@@ -22,13 +27,15 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
-// fakeCloser captures whatever Close is invoked with so the tests can assert
-// (a) Close was called exactly once, (b) the byte total is the value the
-// caller intended to credit. Implements sessions.Closer.
+// fakeCloser captures every Touch / Close invocation so the tests can
+// assert (a) Close ran exactly once, (b) the cumulative bytes credited
+// across Touch + Close match what add() received. Implements
+// sessions.Closer.
 type fakeCloser struct {
 	mu         sync.Mutex
 	calls      int
 	touchCalls int
+	touchedSum int64 // sum of addBytes across every Touch call
 	lastBytes  int64
 	lastReas   domain.SessionCloseReason
 }
@@ -41,12 +48,28 @@ func (c *fakeCloser) Close(reason domain.SessionCloseReason, bytes int64) {
 	c.lastReas = reason
 }
 
-func (c *fakeCloser) Touch() {
+func (c *fakeCloser) Touch(addBytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.touchCalls++
+	c.touchedSum += addBytes
 }
 
+// totalCredited is the bytes-credited sum across both paths — what the
+// tracker record will end up with after the session lifecycle completes.
+// Tests assert against this rather than `lastBytes` because bytes can
+// flow through Touch (live flush) or Close (final flush) depending on
+// throttle timing.
+func (c *fakeCloser) totalCredited() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.touchedSum + c.lastBytes
+}
+
+// add() / close() must credit the full byte sum to the tracker, regardless
+// of whether the bytes flowed through live Touch flushes or the final Close
+// flush. Throttle timing makes the per-call split non-deterministic in
+// production, but the total is invariant.
 func TestPlaySessionCloseUsesAccumulatedBytes(t *testing.T) {
 	t.Parallel()
 	fc := &fakeCloser{}
@@ -57,8 +80,8 @@ func TestPlaySessionCloseUsesAccumulatedBytes(t *testing.T) {
 	p.close()
 
 	require.Equal(t, 1, fc.calls)
-	require.Equal(t, int64(3072), fc.lastBytes,
-		"close() must credit the sum of add() calls")
+	require.Equal(t, int64(3072), fc.totalCredited(),
+		"sum of Touch + Close must equal the total bytes added")
 	require.Equal(t, domain.SessionCloseClient, fc.lastReas)
 }
 
@@ -115,39 +138,52 @@ func TestPlaySessionCloseWithBytesNoopWhenCloserNil(t *testing.T) {
 	require.NotPanics(t, func() { p.closeWithBytes(1024) })
 }
 
-// add() must call Touch on the underlying closer so the idle reaper does
-// not close a healthy long-running RTMP / SRT session as "idle". Without
-// this, sessions disappear from the tracker after `idle_timeout_sec`
-// (default 30s) even while bytes are flowing.
-func TestPlaySessionAddTouchesCloser(t *testing.T) {
+// add() must call Touch with the pending byte delta so the API surfaces a
+// growing counter mid-stream and the idle reaper does not mistake a
+// healthy long-running session for an abandoned one. Without the delta
+// the live record would stay at 0 bytes until close — which is exactly
+// what RTMP / SRT / MPEGTS used to display in the dashboard before this
+// path was wired up.
+func TestPlaySessionAddTouchesCloserAndFlushesBytes(t *testing.T) {
 	t.Parallel()
 	fc := &fakeCloser{}
 	p := &playSession{closer: fc}
 
 	p.add(1024)
 
-	require.Equal(t, int64(1024), p.bytes.Load(), "bytes must accumulate")
 	require.Equal(t, 1, fc.touchCalls, "first add() must touch")
+	require.Equal(t, int64(1024), fc.touchedSum,
+		"touch must publish the pending byte delta to the tracker")
+	require.Equal(t, int64(0), p.bytes.Load(),
+		"flushed bytes must be swapped out so close() doesn't double-count")
 }
 
 // Touch is throttled — calling add() repeatedly within the throttle window
-// must not hammer the tracker mutex. The throttle is what keeps the
-// per-frame hot path (RTMP routinely emits hundreds of frames/sec) from
-// contending the sessions map lock.
+// must not hammer the tracker mutex, but bytes added between flushes must
+// accumulate so the next touch (or close) credits the full total.
 func TestPlaySessionTouchIsThrottled(t *testing.T) {
 	t.Parallel()
 	fc := &fakeCloser{}
 	p := &playSession{closer: fc}
 
-	// 100 add() calls in tight succession — only one should trigger Touch
-	// because the throttle window is 5 s and the calls happen in microseconds.
+	// 100 add() calls in tight succession — only one Touch should fire
+	// (throttle window is 5 s, calls happen in microseconds). The first
+	// add publishes 64 bytes to the tracker; the remaining 99 calls pile
+	// 99*64 bytes into the local atomic, which close() will then flush.
 	for i := 0; i < 100; i++ {
 		p.add(64)
 	}
 
-	require.Equal(t, int64(64*100), p.bytes.Load(), "bytes must accumulate every call")
 	require.Equal(t, 1, fc.touchCalls,
 		"throttle must collapse 100 rapid touches into a single tracker call")
+	require.Equal(t, int64(64), fc.touchedSum,
+		"first touch flushes only the bytes accumulated up to that moment")
+	require.Equal(t, int64(99*64), p.bytes.Load(),
+		"unflushed bytes must remain in the local counter for close() to flush")
+
+	p.close()
+	require.Equal(t, int64(64*100), fc.totalCredited(),
+		"every byte from add() must be credited via Touch + Close")
 }
 
 // Disabled / nil-closer session must not panic when add() is called from
