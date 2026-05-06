@@ -98,9 +98,11 @@ type PlaySession struct {
 	// Secure is true when the underlying transport was TLS / SRTS / RTMPS.
 	Secure bool `json:"secure"`
 
-	// DVR is true when playback originated from the DVR window (timeshift),
-	// false for live edge. Open-Streamer's DVR delivery is not yet routed
-	// through here so this is currently always false; field reserved.
+	// DVR is true when playback originated from the DVR / recording route
+	// (/recordings/{rid}/...), false for live-edge mediaserve hits. Set
+	// by sessions.DVRHTTPMiddleware on the recording sub-router. The flag
+	// also participates in the session fingerprint, so a viewer watching
+	// both live and timeshift gets two distinct session records.
 	DVR bool `json:"dvr"`
 
 	// OpenedAt is the time the first activity for this session was observed.

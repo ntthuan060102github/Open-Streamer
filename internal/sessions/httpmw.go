@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
@@ -48,6 +50,58 @@ func HTTPMiddleware(t Tracker) func(http.Handler) http.Handler {
 				delta = cw.written
 			}
 			t.TrackHTTP(r.Context(), NewHTTPHit(r, code, proto, delta))
+		})
+	}
+}
+
+// DVRHTTPMiddleware returns a net/http middleware for the DVR / timeshift
+// route group (/recordings/{rid}/...). Mirrors HTTPMiddleware behaviour but:
+//
+//   - The stream code is taken from the chi `rid` URL param (which the
+//     recording handler treats as the recording ID == stream code).
+//     Unlike the live mediaserve mount, the recording sub-router runs the
+//     middleware AFTER chi populates the routing context, so chi.URLParam
+//     works here.
+//   - DVR is hardcoded true on every hit, so the session record surfaces
+//     "watching from the archive" in the dashboard. This holds for both
+//     full-recording playback (no query) and timeshift slices (with
+//     ?from=... or ?offset_sec=... — the handler distinguishes them
+//     internally for content selection, but both are still "from disk,
+//     not live edge" from the viewer's perspective).
+//   - Protocol is forced to SessionProtoHLS — recording delivery is HLS
+//     only (.ts segments + .m3u8 playlist); the .mpd / .m4s / .mp4 set
+//     never appears under this route.
+//
+// Hits to non-media files (e.g. /recordings/{rid}/info → JSON metadata)
+// are skipped via the same extension filter.
+func DVRHTTPMiddleware(t Tracker) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			proto := protocolForPath(r.URL.Path)
+			if proto != domain.SessionProtoHLS {
+				// Recording delivery is HLS-only; skip the rest (DASH ext
+				// would never be seen here anyway, but be explicit so a
+				// future operator who serves DASH from /recordings doesn't
+				// silently accumulate live-vs-DVR collisions).
+				next.ServeHTTP(w, r)
+				return
+			}
+			rid := strings.TrimSpace(chi.URLParam(r, "rid"))
+			if rid == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			cw := &countingWriter{ResponseWriter: w}
+			next.ServeHTTP(cw, r)
+
+			var delta int64
+			if cw.status >= 200 && cw.status < 300 {
+				delta = cw.written
+			}
+			hit := NewHTTPHit(r, domain.StreamCode(rid), proto, delta)
+			hit.DVR = true
+			t.TrackHTTP(r.Context(), hit)
 		})
 	}
 }

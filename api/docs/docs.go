@@ -2903,7 +2903,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "dvr": {
-                    "description": "DVR is true when playback originated from the DVR window (timeshift),\nfalse for live edge. Open-Streamer's DVR delivery is not yet routed\nthrough here so this is currently always false; field reserved.",
+                    "description": "DVR is true when playback originated from the DVR / recording route\n(/recordings/{rid}/...), false for live-edge mediaserve hits. Set\nby sessions.DVRHTTPMiddleware on the recording sub-router. The flag\nalso participates in the session fingerprint, so a viewer watching\nboth live and timeshift gets two distinct session records.",
                     "type": "boolean"
                 },
                 "id": {

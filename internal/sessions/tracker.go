@@ -66,6 +66,11 @@ type HTTPHit struct {
 	Token      string // ?token=… value if present
 	Secure     bool
 	BytesDelta int64 // bytes the most recent response wrote to the client
+	// DVR is true when the hit came from a DVR / timeshift route
+	// (/recordings/{rid}/...) rather than the live edge mediaserve mount.
+	// Participates in the session fingerprint so the same client watching
+	// live AND timeshift gets two distinct session records.
+	DVR bool
 }
 
 // ConnHit is the input to OpenConn for connection-bound protocols.
@@ -129,7 +134,9 @@ type Stats struct {
 
 // NewHTTPHit extracts the per-request fields TrackHTTP needs from an
 // http.Request. Centralising this avoids per-protocol drift in how IP / UA /
-// token are sniffed.
+// token are sniffed. DVR defaults to false; the recording / timeshift
+// middleware overrides it to true on the returned struct before forwarding
+// to TrackHTTP.
 func NewHTTPHit(r *http.Request, code domain.StreamCode, proto domain.SessionProto, bytesDelta int64) HTTPHit {
 	q := r.URL.Query()
 	token := strings.TrimSpace(q.Get("token"))
@@ -285,7 +292,7 @@ func (s *service) TrackHTTP(ctx context.Context, h HTTPHit) *domain.PlaySession 
 	if !s.loadCfg().enabled {
 		return nil
 	}
-	id := fingerprintID(h.StreamCode, h.Protocol, h.IP, h.UserAgent, h.Token)
+	id := fingerprintID(h.StreamCode, h.Protocol, h.DVR, h.IP, h.UserAgent, h.Token)
 
 	s.mu.Lock()
 	sess, exists := s.sessions[id]
@@ -339,6 +346,7 @@ func (s *service) openHTTP(id string, h HTTPHit, now time.Time) *domain.PlaySess
 		Country:     s.geo.Country(net.ParseIP(h.IP)),
 		Bytes:       bytes,
 		Secure:      h.Secure,
+		DVR:         h.DVR,
 		OpenedAt:    now,
 		StartedAt:   started,
 		UpdatedAt:   now,

@@ -155,6 +155,11 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	})
 
 	r.Route("/recordings/{rid}", func(r chi.Router) {
+		// DVR session tracking on the /{file} sub-route only — Get / Info
+		// return JSON metadata (handler outputs nothing media-related), so
+		// the middleware would skip them via its extension filter anyway,
+		// but keeping the mount tight avoids running the wrap+chi.URLParam
+		// pair for every /info call.
 		r.Get("/", s.recordingH.Get)
 		r.Get("/info", s.recordingH.Info)
 		// /{file} handles BOTH segments (*.ts) and playlist (*.m3u8).
@@ -162,7 +167,15 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 		// params, the handler builds a dynamic timeshift slice instead of
 		// serving playlist.m3u8 from disk. The legacy /playlist.m3u8 and
 		// /timeshift.m3u8 routes were removed in favour of this dispatch.
-		r.Get("/{file}", s.recordingH.ServeFile)
+		// DVRHTTPMiddleware tags every successful .ts / .m3u8 hit with
+		// DVR=true so the dashboard distinguishes archive viewers from
+		// live-edge viewers.
+		r.Group(func(rr chi.Router) {
+			if s.sessTracker != nil {
+				rr.Use(sessions.DVRHTTPMiddleware(s.sessTracker))
+			}
+			rr.Get("/{file}", s.recordingH.ServeFile)
+		})
 	})
 
 	r.Route("/hooks", func(r chi.Router) {
