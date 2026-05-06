@@ -267,7 +267,7 @@ records, viewers reconnect into fresh sessions.
 | HLS / DASH session tracking | Complete | `mediaserve.Mount` wrapped with `sessions.HTTPMiddleware`; each segment GET extends the session record; bytes counted from the `ResponseWriter` |
 | RTMP session tracking | Complete | `push.PlayFunc` extended with `PlayInfo{RemoteAddr, FlashVer}`; bytes counted by wrapping `writeFrame` |
 | SRT session tracking | Complete | `srtHandleSubscribe` opens a tracker session; bytes accumulated on every successful `conn.Write` |
-| RTSP session tracking | Complete | gortsplib `OnPlay` / `OnSessionClose` hooks; bytes default to 0 (gortsplib mux is internal) |
+| RTSP session tracking | Complete | gortsplib `OnPlay` / `OnSessionClose` hooks. Outbound bytes credited at close from `ServerSession.Stats().OutboundBytes` (gortsplib's per-session counter, covers RTP payload + RTP header + framing the library owns) — published as the session's `bytes` field, same shape as RTMP / SRT |
 | Fingerprint session ID (HLS / DASH) | Complete | `sha256(stream + ip + ua + token)[0..16]` so repeated segment GETs collapse onto one record within the idle window |
 | UUID session ID (RTMP / SRT / RTSP) | Complete | Connection-bound, generated at handshake; closed on TCP teardown |
 | Idle reaper | Complete | Default 30s without activity → close + emit `EventSessionClosed`; tunable via `sessions.idle_timeout_sec` |
@@ -306,8 +306,6 @@ Tracking what is intentionally NOT done. Each row is a deliberate scope decision
 | Priority | Feature | Status | Notes |
 |---|---|---|---|
 | Mid | Thumbnail | Schema only | Periodic JPEG snapshot from main buffer; needs ffmpeg `select=eq(pict_type\\,I)` chain |
-| Low | HLS / DASH push out | Not started | Only RTMP/RTMPS push exists |
-| Low | RTSP per-session bytes accuracy | Schema only | gortsplib mux is internal; current `bytes=0` for RTSP. Would need a custom `WritePacketRTP` wrapper or fork |
 | Low | RTMP `flashVer` capture | Schema only | gomedia doesn't expose `flashVer` from the connect command publicly; left empty in `PlayInfo.FlashVer` |
 | Low | Sessions token-based auth | Not started | Token field reserved on PlaySession; no resolver / signed-URL verifier wired yet |
 | Low | WebRTC publish / play | Not started | Pion-based subsystem; large surface (SDP, ICE, DTLS-SRTP) |
@@ -322,6 +320,7 @@ Tracking what is intentionally NOT done. Each row is a deliberate scope decision
 | Full `gomedia` → `lal` swap | TS infrastructure (`gomedia/go-mpeg2`) has no equivalent in lal. Hybrid stack is intentional |
 | Sessions persistence (history beyond active set) | In-memory map is intentional — sessions are an operational view, not an audit log. Operators who need persistent history wire a hook on `session.opened` / `session.closed` and store downstream (their DB, S3, log pipeline). Avoids pulling a SQL/file backend into the server for a use case better served by the existing event bus |
 | Local-packager error tracking (HLS/DASH runtime errors[]) | The success path is already covered by `publisher_segments_total{stream_code, format, profile}` — alert on `rate(...[2m]) == 0` for active streams catches every "segmenter stalled" case without per-error bookkeeping. Per-error-reason breakdown (`disk_full` vs `permission_denied` vs `demux_panic`) and a runtime API `errors[]` view would be useful for ops dashboards but duplicate what `slog` already records — log + Prometheus rate alert handles operational needs. Skip the bookkeeping until a concrete dashboard requirement justifies it |
+| HLS / DASH push out (HTTP / S3) | Reverse-proxy CDN (Cloudflare / Fastly / Akamai sitting in front of the HLS/DASH serve endpoint) covers the same scale-out goal with a config-only change — the CDN pulls segments on first viewer request and caches them. Object-storage origins (S3 / R2) are handled by sidecar tools like `rclone sync` watching the segment dir. Implementing push out in-process would duplicate ~3-5 days of work (URL scheme parsing, retry/backoff, S3v4 signing, manifest sync, runtime status) for a use case the operator's existing CDN already solves. Reconsider only if a concrete deployment needs same-host transfer-style upload (compliance, multi-region origin replication) |
 
 ---
 

@@ -226,6 +226,13 @@ func (h *rtspHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 
 // OnSessionClose closes the tracker session that mirrored this RTSP one.
 // Idempotent on missing entries (a session that never reached PLAY).
+//
+// Outbound byte total is read from gortsplib's per-session `OutboundBytes`
+// counter — which the library maintains internally across every
+// `WritePacketRTP` (covering RTP payload + RTP header + UDP/TCP framing it
+// owns). Without this read the tracker would record `bytes=0` for every
+// RTSP session because the publisher never sees per-write byte counts on
+// this path (gortsplib serialises packets internally).
 func (h *rtspHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 	h.svc.rtspSessionsMu.Lock()
 	sess, ok := h.svc.rtspSessions[ctx.Session]
@@ -233,9 +240,14 @@ func (h *rtspHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseC
 		delete(h.svc.rtspSessions, ctx.Session)
 	}
 	h.svc.rtspSessionsMu.Unlock()
-	if ok {
-		sess.close()
+	if !ok {
+		return
 	}
+	var bytes int64
+	if stats := ctx.Session.Stats(); stats != nil {
+		bytes = int64(stats.OutboundBytes) //nolint:gosec // OutboundBytes is uint64; realistic session totals are well under int64 max (≈9.2 EiB)
+	}
+	sess.closeWithBytes(bytes)
 }
 
 // lookupStream matches a request path to a registered ServerStream.

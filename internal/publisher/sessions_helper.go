@@ -42,6 +42,24 @@ func (p *playSession) close() {
 	p.closer.Close(domain.SessionCloseClient, p.bytes.Load())
 }
 
+// closeWithBytes credits an externally-measured byte total to the session
+// at close time. Used by the RTSP path because gortsplib serialises RTP
+// packets internally — the publisher never sees per-write byte counts to
+// feed `add()`. Instead the gortsplib `ServerSession.Stats().OutboundBytes`
+// counter (maintained by the library across the session lifetime) is read
+// once on OnSessionClose and routed here. RTMP / SRT continue to use the
+// per-write `add()` path because their underlying libraries return wire
+// byte counts on every successful send.
+func (p *playSession) closeWithBytes(n int64) {
+	if p.disable || p.closer == nil {
+		return
+	}
+	if n < 0 {
+		n = 0
+	}
+	p.closer.Close(domain.SessionCloseClient, n)
+}
+
 // openSRTSession opens a tracker session for one SRT play subscriber. Streamid
 // can carry a `?token=…` for operator-issued auth tokens — extracted via
 // sessions.TokenFromQuery so the session is correctly tagged named_by="token".
