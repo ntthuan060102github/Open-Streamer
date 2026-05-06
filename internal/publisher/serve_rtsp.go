@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5"
@@ -218,7 +219,7 @@ func (h *rtspHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 	sess := openRTSPSession(context.Background(), h.svc.tracker, code, ctx.Conn.NetConn().RemoteAddr(), ua)
 	if sess != nil {
 		h.svc.rtspSessionsMu.Lock()
-		h.svc.rtspSessions[ctx.Session] = sess
+		h.svc.rtspSessions[ctx.Session] = &rtspClient{ps: sess}
 		h.svc.rtspSessionsMu.Unlock()
 	}
 	return &base.Response{StatusCode: base.StatusOK}, nil
@@ -227,15 +228,15 @@ func (h *rtspHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 // OnSessionClose closes the tracker session that mirrored this RTSP one.
 // Idempotent on missing entries (a session that never reached PLAY).
 //
-// Outbound byte total is read from gortsplib's per-session `OutboundBytes`
-// counter — which the library maintains internally across every
-// `WritePacketRTP` (covering RTP payload + RTP header + UDP/TCP framing it
-// owns). Without this read the tracker would record `bytes=0` for every
-// RTSP session because the publisher never sees per-write byte counts on
-// this path (gortsplib serialises packets internally).
+// Reads gortsplib's per-session `OutboundBytes` counter one final time and
+// pushes the delta since the last touch through the standard add()→close()
+// path — that way the cumulative bytes the tracker accumulated via the 5 s
+// touch ticker are completed by whatever was sent in the final partial
+// window. Without this read the tracker would lose the trailing bytes on
+// every RTSP session.
 func (h *rtspHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 	h.svc.rtspSessionsMu.Lock()
-	sess, ok := h.svc.rtspSessions[ctx.Session]
+	rc, ok := h.svc.rtspSessions[ctx.Session]
 	if ok {
 		delete(h.svc.rtspSessions, ctx.Session)
 	}
@@ -243,11 +244,8 @@ func (h *rtspHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseC
 	if !ok {
 		return
 	}
-	var bytes int64
-	if stats := ctx.Session.Stats(); stats != nil {
-		bytes = int64(stats.OutboundBytes) //nolint:gosec // OutboundBytes is uint64; realistic session totals are well under int64 max (≈9.2 EiB)
-	}
-	sess.closeWithBytes(bytes)
+	rc.pollBytes(ctx.Session)
+	rc.ps.close()
 }
 
 // lookupStream matches a request path to a registered ServerStream.
@@ -381,23 +379,69 @@ func runRTSPPipeline(
 	}
 }
 
-// touchRTSPSessions refreshes UpdatedAt on every active per-client RTSP
-// playSession bound to streamCode. Called from runRTSPPipeline on a 5s
-// ticker so the idle reaper does not mistake a healthy long-running RTSP
-// stream for an abandoned one. Per-session throttling lives inside
-// playSession.touch — calling it more often than the throttle window is
-// a cheap CAS-and-skip.
+// rtspClient pairs the publisher-side play-session adapter with the
+// per-RTSP-session byte cursor used to incrementalise gortsplib's
+// cumulative `Stats().OutboundBytes` into per-touch deltas. The cursor
+// lives outside playSession because it is RTSP-specific — RTMP / SRT /
+// MPEGTS already see per-write byte counts and call playSession.add()
+// directly.
+type rtspClient struct {
+	ps           *playSession
+	gortspSess   *gortsplib.ServerSession // captured for nil-safe pollBytes when the close ctx isn't handy
+	lastOutbound atomic.Uint64            // cumulative bytes seen on the previous poll
+}
+
+// pollBytes reads gortsplib's cumulative outbound counter, computes the
+// delta since the last poll, and feeds it through playSession.add() so
+// the tracker's live record can grow mid-stream. Idempotent and safe to
+// call concurrently — atomic.Swap fences the read-and-update.
+//
+// `ss` is passed in rather than read from rtspClient because the close
+// callback already has it on the context; the touch loop falls back to
+// the captured gortspSess pointer.
+func (c *rtspClient) pollBytes(ss *gortsplib.ServerSession) {
+	if ss == nil {
+		ss = c.gortspSess
+	}
+	if ss == nil {
+		return
+	}
+	stats := ss.Stats()
+	if stats == nil {
+		return
+	}
+	curr := stats.OutboundBytes
+	last := c.lastOutbound.Swap(curr)
+	if curr > last {
+		c.ps.add(int64(curr - last)) //nolint:gosec // RTSP session totals are well under int64 max
+	}
+}
+
+// touchRTSPSessions polls outbound bytes for every active per-client
+// RTSP session bound to streamCode and refreshes UpdatedAt. Called from
+// runRTSPPipeline on a 5s ticker so (a) the idle reaper does not
+// mistake a healthy long-running RTSP stream for an abandoned one, and
+// (b) the API surfaces a growing byte counter mid-stream rather than
+// staying at 0 until close. Per-session throttling lives inside
+// playSession.touch — calling it more often than the throttle window
+// is a cheap CAS-and-skip.
 func (s *Service) touchRTSPSessions(streamCode domain.StreamCode) {
+	type victim struct {
+		client *rtspClient
+		ss     *gortsplib.ServerSession
+	}
 	s.rtspSessionsMu.Lock()
-	victims := make([]*playSession, 0, len(s.rtspSessions))
-	for _, ps := range s.rtspSessions {
-		if ps != nil && ps.streamCode == streamCode {
-			victims = append(victims, ps)
+	victims := make([]victim, 0, len(s.rtspSessions))
+	for ss, rc := range s.rtspSessions {
+		if rc != nil && rc.ps.streamCode == streamCode {
+			rc.gortspSess = ss
+			victims = append(victims, victim{client: rc, ss: ss})
 		}
 	}
 	s.rtspSessionsMu.Unlock()
-	for _, ps := range victims {
-		ps.touch()
+	for _, v := range victims {
+		v.client.pollBytes(v.ss)
+		v.client.ps.touch()
 	}
 }
 

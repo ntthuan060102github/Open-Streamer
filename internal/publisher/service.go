@@ -116,11 +116,13 @@ type Service struct {
 	srtActive    map[domain.StreamCode]struct{}
 
 	// rtspSessions maps each gortsplib *ServerSession to its tracker session
-	// adapter. Populated in OnPlay, drained in OnSessionClose. Distinct mutex
-	// because RTSP session callbacks fire from gortsplib's worker goroutines
-	// and must not contend on the broader s.mu used during stream lifecycle.
+	// adapter and the byte-count cursor used to incrementalise gortsplib's
+	// cumulative `OutboundBytes` stat into per-touch deltas. Populated in
+	// OnPlay, drained in OnSessionClose. Distinct mutex because RTSP session
+	// callbacks fire from gortsplib's worker goroutines and must not contend
+	// on the broader s.mu used during stream lifecycle.
 	rtspSessionsMu sync.Mutex
-	rtspSessions   map[*gortsplib.ServerSession]*playSession
+	rtspSessions   map[*gortsplib.ServerSession]*rtspClient
 
 	// pushStates is the per-(stream, url) push destination runtime state used
 	// by RuntimeStatus. Updated by serveRTMPPush at session boundaries.
@@ -172,7 +174,7 @@ func New(i do.Injector) (*Service, error) {
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
 		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
-		rtspSessions:   make(map[*gortsplib.ServerSession]*playSession),
+		rtspSessions:   make(map[*gortsplib.ServerSession]*rtspClient),
 	}
 	svc.listenersPtr.Store(&listeners)
 	bus.Subscribe(domain.EventInputFailover, func(_ context.Context, e domain.Event) error {
@@ -202,7 +204,7 @@ func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus e
 		rtmpActive:     make(map[domain.StreamCode]struct{}),
 		srtActive:      make(map[domain.StreamCode]struct{}),
 		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
-		rtspSessions:   make(map[*gortsplib.ServerSession]*playSession),
+		rtspSessions:   make(map[*gortsplib.ServerSession]*rtspClient),
 	}
 	svc.listenersPtr.Store(&config.ListenersConfig{})
 	return svc
