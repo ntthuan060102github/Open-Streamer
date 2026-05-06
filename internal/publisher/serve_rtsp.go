@@ -341,10 +341,24 @@ func runRTSPPipeline(
 		}
 	}()
 
+	// Periodic touch for the per-client play sessions. gortsplib serialises
+	// outgoing RTP packets internally so the publisher never sees a
+	// per-write hook to feed playSession.add() (which is what RTMP / SRT
+	// use to refresh UpdatedAt). Without this ticker the idle reaper —
+	// which closes any session whose UpdatedAt is older than
+	// `sessions.idle_timeout_sec` (default 30s) — would close every
+	// long-running RTSP session as "idle" even though they are streaming.
+	// 5s cadence stays well inside the 30s window with margin for clock
+	// skew between the reaper and this loop.
+	touchTick := time.NewTicker(5 * time.Second)
+	defer touchTick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-touchTick.C:
+			svc.touchRTSPSessions(streamCode)
 		case pkt, ok := <-sub.Recv():
 			if !ok {
 				return
@@ -364,6 +378,26 @@ func runRTSPPipeline(
 				})
 			}
 		}
+	}
+}
+
+// touchRTSPSessions refreshes UpdatedAt on every active per-client RTSP
+// playSession bound to streamCode. Called from runRTSPPipeline on a 5s
+// ticker so the idle reaper does not mistake a healthy long-running RTSP
+// stream for an abandoned one. Per-session throttling lives inside
+// playSession.touch — calling it more often than the throttle window is
+// a cheap CAS-and-skip.
+func (s *Service) touchRTSPSessions(streamCode domain.StreamCode) {
+	s.rtspSessionsMu.Lock()
+	victims := make([]*playSession, 0, len(s.rtspSessions))
+	for _, ps := range s.rtspSessions {
+		if ps != nil && ps.streamCode == streamCode {
+			victims = append(victims, ps)
+		}
+	}
+	s.rtspSessionsMu.Unlock()
+	for _, ps := range victims {
+		ps.touch()
 	}
 }
 

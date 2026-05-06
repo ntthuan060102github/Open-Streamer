@@ -26,10 +26,11 @@ import (
 // (a) Close was called exactly once, (b) the byte total is the value the
 // caller intended to credit. Implements sessions.Closer.
 type fakeCloser struct {
-	mu        sync.Mutex
-	calls     int
-	lastBytes int64
-	lastReas  domain.SessionCloseReason
+	mu         sync.Mutex
+	calls      int
+	touchCalls int
+	lastBytes  int64
+	lastReas   domain.SessionCloseReason
 }
 
 func (c *fakeCloser) Close(reason domain.SessionCloseReason, bytes int64) {
@@ -38,6 +39,12 @@ func (c *fakeCloser) Close(reason domain.SessionCloseReason, bytes int64) {
 	c.calls++
 	c.lastBytes = bytes
 	c.lastReas = reason
+}
+
+func (c *fakeCloser) Touch() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.touchCalls++
 }
 
 func TestPlaySessionCloseUsesAccumulatedBytes(t *testing.T) {
@@ -106,4 +113,52 @@ func TestPlaySessionCloseWithBytesNoopWhenCloserNil(t *testing.T) {
 	t.Parallel()
 	p := &playSession{closer: nil}
 	require.NotPanics(t, func() { p.closeWithBytes(1024) })
+}
+
+// add() must call Touch on the underlying closer so the idle reaper does
+// not close a healthy long-running RTMP / SRT session as "idle". Without
+// this, sessions disappear from the tracker after `idle_timeout_sec`
+// (default 30s) even while bytes are flowing.
+func TestPlaySessionAddTouchesCloser(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	p := &playSession{closer: fc}
+
+	p.add(1024)
+
+	require.Equal(t, int64(1024), p.bytes.Load(), "bytes must accumulate")
+	require.Equal(t, 1, fc.touchCalls, "first add() must touch")
+}
+
+// Touch is throttled — calling add() repeatedly within the throttle window
+// must not hammer the tracker mutex. The throttle is what keeps the
+// per-frame hot path (RTMP routinely emits hundreds of frames/sec) from
+// contending the sessions map lock.
+func TestPlaySessionTouchIsThrottled(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	p := &playSession{closer: fc}
+
+	// 100 add() calls in tight succession — only one should trigger Touch
+	// because the throttle window is 5 s and the calls happen in microseconds.
+	for i := 0; i < 100; i++ {
+		p.add(64)
+	}
+
+	require.Equal(t, int64(64*100), p.bytes.Load(), "bytes must accumulate every call")
+	require.Equal(t, 1, fc.touchCalls,
+		"throttle must collapse 100 rapid touches into a single tracker call")
+}
+
+// Disabled / nil-closer session must not panic when add() is called from
+// the hot path — the noop guard covers the byte counter AND the touch.
+func TestPlaySessionAddNoopWhenDisabled(t *testing.T) {
+	t.Parallel()
+	fc := &fakeCloser{}
+	p := &playSession{closer: fc, disable: true}
+
+	p.add(1024)
+
+	require.Equal(t, int64(0), p.bytes.Load())
+	require.Equal(t, 0, fc.touchCalls)
 }

@@ -102,10 +102,17 @@ func (s *Service) HandleMPEGTS() http.HandlerFunc {
 
 		flusher, _ := w.(http.Flusher)
 
+		// Open a play session so the API surfaces this viewer like any
+		// other protocol. MPEGTS uses OpenConn (UUID-based, like RTMP/SRT)
+		// because the underlying HTTP request is long-lived — there is no
+		// per-segment refresh path the HLS/DASH middleware could hook into.
+		mpegtsSess := openMPEGTSSession(r.Context(), s.tracker, code, r)
+		defer mpegtsSess.close()
+
 		slog.Info("publisher: mpegts client connected",
 			"stream_code", code, "remote", r.RemoteAddr)
 
-		streamMPEGTSToClient(r.Context(), code, sub, w, flusher)
+		streamMPEGTSToClient(r.Context(), code, sub, w, flusher, mpegtsSess)
 
 		slog.Info("publisher: mpegts client disconnected",
 			"stream_code", code, "remote", r.RemoteAddr)
@@ -130,12 +137,17 @@ func (s *Service) mpegtsTargetFor(code domain.StreamCode) (domain.StreamCode, bo
 // context is cancelled, the buffer is deleted (channel closed), or a write
 // error occurs. Extracted from HandleMPEGTS so the hot loop stays linear
 // and unit-testable against a fake ResponseWriter.
+//
+// sess is credited with each successful write's byte count and refreshed
+// (throttled) so the idle reaper does not close this long-lived HTTP
+// stream as "idle". Pass noopPlaySession() in tests that don't care.
 func streamMPEGTSToClient(
 	ctx context.Context, //nolint:revive // ctx is conventionally first; tools can't see http.Request
 	code domain.StreamCode,
 	sub *bufferSub,
 	w http.ResponseWriter,
 	flusher http.Flusher,
+	sess *playSession,
 ) {
 	// Periodic flusher backstop: at very low bitrates a single chunk may not
 	// reach Go's net/http internal threshold for a while, increasing latency.
@@ -165,13 +177,15 @@ func streamMPEGTSToClient(
 				// into separate per-protocol pipelines).
 				continue
 			}
-			if _, err := w.Write(data); err != nil {
+			n, err := w.Write(data)
+			if err != nil {
 				if !isClientGone(err) {
 					slog.Warn("publisher: mpegts write failed",
 						"stream_code", code, "err", err)
 				}
 				return
 			}
+			sess.add(int64(n))
 		}
 	}
 }

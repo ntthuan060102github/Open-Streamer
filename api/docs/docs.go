@@ -3149,14 +3149,16 @@ const docTemplate = `{
                 "dash",
                 "rtmp",
                 "srt",
-                "rtsp"
+                "rtsp",
+                "mpegts"
             ],
             "x-enum-varnames": [
                 "SessionProtoHLS",
                 "SessionProtoDASH",
                 "SessionProtoRTMP",
                 "SessionProtoSRT",
-                "SessionProtoRTSP"
+                "SessionProtoRTSP",
+                "SessionProtoMPEGTS"
             ]
         },
         "domain.StreamCodeFilter": {

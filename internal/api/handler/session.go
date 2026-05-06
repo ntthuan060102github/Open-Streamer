@@ -145,7 +145,8 @@ func parseSessionFilter(r *http.Request, streamScope domain.StreamCode) (session
 	if proto := q.Get("proto"); proto != "" {
 		switch domain.SessionProto(proto) {
 		case domain.SessionProtoHLS, domain.SessionProtoDASH,
-			domain.SessionProtoRTMP, domain.SessionProtoSRT, domain.SessionProtoRTSP:
+			domain.SessionProtoRTMP, domain.SessionProtoSRT,
+			domain.SessionProtoRTSP, domain.SessionProtoMPEGTS:
 			f.Protocol = domain.SessionProto(proto)
 		default:
 			return f, errInvalidProto

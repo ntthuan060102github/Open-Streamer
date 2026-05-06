@@ -80,8 +80,17 @@ type ConnHit struct {
 // Closer ends a connection-bound session. addBytes is the cumulative bytes
 // sent on the underlying transport; pass 0 if the protocol can't measure.
 // Both forms are idempotent.
+//
+// Touch refreshes the session's UpdatedAt so the idle reaper (which closes
+// any session whose UpdatedAt is older than `idle_timeout_sec`, default 30s)
+// does not mistake an actively-streaming RTMP / SRT / RTSP session for an
+// abandoned one. Connection-bound protocols don't naturally update
+// UpdatedAt the way HLS does (every segment GET refreshes it), so the
+// publisher must call Touch from its data-write hot path. Throttling is
+// the caller's responsibility — see playSession.touch.
 type Closer interface {
 	Close(reason domain.SessionCloseReason, addBytes int64)
+	Touch()
 }
 
 // Filter is the union of selectors accepted by List.
@@ -270,7 +279,7 @@ func (s *service) TrackHTTP(ctx context.Context, h HTTPHit) *domain.PlaySession 
 	if !s.loadCfg().enabled {
 		return nil
 	}
-	id := fingerprintID(h.StreamCode, h.IP, h.UserAgent, h.Token)
+	id := fingerprintID(h.StreamCode, h.Protocol, h.IP, h.UserAgent, h.Token)
 
 	s.mu.Lock()
 	sess, exists := s.sessions[id]
@@ -416,6 +425,25 @@ func (s *service) closeByIDCtx(ctx context.Context, id string, reason domain.Ses
 	}
 	s.observeClosed(&snap, reason)
 	s.publishClosed(ctx, &snap)
+}
+
+// touchByID refreshes the session's UpdatedAt timestamp. Idempotent / no-op
+// for unknown ids and for sessions already closed (their lifecycle is over;
+// re-bumping UpdatedAt would resurrect a record the reaper has dropped).
+//
+// Called from the publisher's hot path via Closer.Touch — throttled there
+// to ~5 s so this lock is not contended on every frame write. Without
+// these touches the reaper closes RTMP / SRT / RTSP sessions after
+// `idle_timeout_sec` (default 30 s) even though they are actively
+// streaming, because connection-bound protocols don't naturally update
+// UpdatedAt the way HLS does (every segment GET refreshes it).
+func (s *service) touchByID(id string) {
+	now := s.now()
+	s.mu.Lock()
+	if sess, ok := s.sessions[id]; ok && sess.ClosedAt == nil {
+		sess.UpdatedAt = now
+	}
+	s.mu.Unlock()
 }
 
 // List implements Tracker.
@@ -593,9 +621,17 @@ func (c *connCloser) Close(reason domain.SessionCloseReason, addBytes int64) {
 	c.once.Do(func() { c.svc.closeByID(c.id, reason, addBytes) })
 }
 
+// Touch refreshes the session's UpdatedAt so the idle reaper does not
+// mistake a long-running connection-bound stream for an abandoned one.
+// Safe to call after Close: touchByID is a no-op for unknown / closed ids.
+func (c *connCloser) Touch() { c.svc.touchByID(c.id) }
+
 // noopCloser is the Closer returned when sessions tracking is disabled. It
 // satisfies the protocol-side defer pattern without touching tracker state.
 type noopCloser struct{}
 
 // Close is the disabled-tracker no-op — discards both reason and bytes.
 func (noopCloser) Close(domain.SessionCloseReason, int64) {}
+
+// Touch is the disabled-tracker no-op — there's no session to refresh.
+func (noopCloser) Touch() {}

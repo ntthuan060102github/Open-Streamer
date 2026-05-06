@@ -50,6 +50,33 @@ func TestTrackHTTPOpensThenAccumulates(t *testing.T) {
 	}
 }
 
+// Same client (stream + ip + ua + token) playing both HLS and DASH must yield
+// two independent sessions — protocol participates in the fingerprint key.
+// Regression guard: previously the second protocol's hits silently merged
+// into the first session and inherited the wrong Protocol label.
+func TestTrackHTTPProtocolIsolation(t *testing.T) {
+	s := newTestService(t)
+	base := HTTPHit{StreamCode: tCode, IP: tIP, UserAgent: tUA, BytesDelta: 100}
+
+	hls := base
+	hls.Protocol = domain.SessionProtoHLS
+	dash := base
+	dash.Protocol = domain.SessionProtoDASH
+
+	a := s.TrackHTTP(context.Background(), hls)
+	b := s.TrackHTTP(context.Background(), dash)
+
+	if a.ID == b.ID {
+		t.Fatalf("HLS and DASH collapsed onto one session id %s", a.ID)
+	}
+	if a.Protocol != domain.SessionProtoHLS || b.Protocol != domain.SessionProtoDASH {
+		t.Fatalf("protocols leaked: a=%s b=%s", a.Protocol, b.Protocol)
+	}
+	if got := s.openedTotal.Load(); got != 2 {
+		t.Errorf("openedTotal = %d, want 2", got)
+	}
+}
+
 func TestTrackHTTPTokenChangesNamedBy(t *testing.T) {
 	s := newTestService(t)
 	got := s.TrackHTTP(context.Background(), HTTPHit{

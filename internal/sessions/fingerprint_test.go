@@ -7,15 +7,17 @@ import (
 )
 
 const (
-	tIP    = "10.0.0.1"
-	tUA    = "Chrome/123"
-	tCode  = domain.StreamCode("foo")
-	tCode2 = domain.StreamCode("bar")
+	tIP     = "10.0.0.1"
+	tUA     = "Chrome/123"
+	tCode   = domain.StreamCode("foo")
+	tCode2  = domain.StreamCode("bar")
+	tProto  = domain.SessionProtoHLS
+	tProto2 = domain.SessionProtoDASH
 )
 
 func TestFingerprintIDStable(t *testing.T) {
-	a := fingerprintID(tCode, tIP, tUA, "")
-	b := fingerprintID(tCode, tIP, tUA, "")
+	a := fingerprintID(tCode, tProto, tIP, tUA, "")
+	b := fingerprintID(tCode, tProto, tIP, tUA, "")
 	if a != b {
 		t.Fatalf("fingerprint not stable: %s vs %s", a, b)
 	}
@@ -25,13 +27,14 @@ func TestFingerprintIDStable(t *testing.T) {
 }
 
 func TestFingerprintIDDifferentiates(t *testing.T) {
-	base := fingerprintID(tCode, tIP, tUA, "")
+	base := fingerprintID(tCode, tProto, tIP, tUA, "")
 
 	for name, fp := range map[string]string{
-		"diff stream": fingerprintID(tCode2, tIP, tUA, ""),
-		"diff ip":     fingerprintID(tCode, "10.0.0.2", tUA, ""),
-		"diff ua":     fingerprintID(tCode, tIP, "ua-other", ""),
-		"diff token":  fingerprintID(tCode, tIP, tUA, "tok"),
+		"diff stream": fingerprintID(tCode2, tProto, tIP, tUA, ""),
+		"diff proto":  fingerprintID(tCode, tProto2, tIP, tUA, ""),
+		"diff ip":     fingerprintID(tCode, tProto, "10.0.0.2", tUA, ""),
+		"diff ua":     fingerprintID(tCode, tProto, tIP, "ua-other", ""),
+		"diff token":  fingerprintID(tCode, tProto, tIP, tUA, "tok"),
 	} {
 		if fp == base {
 			t.Errorf("%s: fingerprint did not change", name)
@@ -42,8 +45,8 @@ func TestFingerprintIDDifferentiates(t *testing.T) {
 func TestFingerprintIDIPCaseInsensitive(t *testing.T) {
 	// IPv6 mixed case should hash to the same bucket — operators expect
 	// 'fe80::1' and 'FE80::1' to count as one viewer.
-	a := fingerprintID(tCode, "fe80::1", tUA, "")
-	b := fingerprintID(tCode, "FE80::1", tUA, "")
+	a := fingerprintID(tCode, tProto, "fe80::1", tUA, "")
+	b := fingerprintID(tCode, tProto, "FE80::1", tUA, "")
 	if a != b {
 		t.Fatalf("ipv6 case-sensitivity leaked: %s vs %s", a, b)
 	}

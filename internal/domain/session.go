@@ -9,11 +9,12 @@ type SessionProto string
 
 // SessionProto values for each playback protocol Open-Streamer serves.
 const (
-	SessionProtoHLS  SessionProto = "hls"
-	SessionProtoDASH SessionProto = "dash"
-	SessionProtoRTMP SessionProto = "rtmp"
-	SessionProtoSRT  SessionProto = "srt"
-	SessionProtoRTSP SessionProto = "rtsp"
+	SessionProtoHLS    SessionProto = "hls"
+	SessionProtoDASH   SessionProto = "dash"
+	SessionProtoRTMP   SessionProto = "rtmp"
+	SessionProtoSRT    SessionProto = "srt"
+	SessionProtoRTSP   SessionProto = "rtsp"
+	SessionProtoMPEGTS SessionProto = "mpegts"
 )
 
 // SessionNamedBy describes how the session's UserName was resolved.
