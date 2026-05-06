@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
@@ -69,7 +70,41 @@ const maxRTSPPendingFrames = 90
 // false-positive rebase, and catches real source resets (which jump by
 // seconds or back to 0). H.264 spec allows DTS reorder up to a few frames
 // for B-pyramid; 250ms ≈ 6 frames at 25fps which is the practical max.
+//
+// Smaller jitter (<250ms back) is handled by the monotonic clamp at the end
+// of computeVideoRTP / computeAudioRTP — it forces the RTP timestamp to
+// strictly increase even if the source DTS jitters within the rebase window.
 const rtspMaxBackJumpMs = 250
+
+// Pacing constants — enforce wallclock-based RTP delivery so the on-wire
+// packet rate matches the source's media-time rate, regardless of how the
+// upstream feeds the buffer hub.
+//
+// Bursty sources (HLS pulls deliver one segment ~every targetduration; NVENC
+// transcoders empty their queue much faster than realtime) push hundreds of
+// AV packets in <1s, then idle for 4-6s. Forwarding that pattern straight to
+// `gortsplib.ServerStream.WritePacketRTP` makes strict RTSP clients (VLC,
+// Flussonic, ffmpeg copy) underrun their jitter buffer between bursts and
+// either freeze, drop frames, or surface "non monotonically increasing dts"
+// because the inter-packet wallclock delta no longer matches the RTP/PTS
+// delta the demuxer expected.
+//
+// Pacing each packet against a (paceBase wallclock, paceMedia DTS) anchor
+// converts those bursts back into a smooth, realtime-paced stream — costs
+// at most one segment-duration of latency on top of whatever the source
+// already adds, in exchange for "every RTSP client just works".
+const (
+	// rtspPaceMaxSleep caps a single pace sleep. PTS jumps far ahead of
+	// wallclock (looped source, very fresh keyframe, encoder restart) trip
+	// this and force a re-anchor instead of stalling forever.
+	rtspPaceMaxSleep = 5 * time.Second
+
+	// rtspPaceMaxLag is how far behind realtime we tolerate before
+	// re-anchoring. If we ever fall this far behind (sustained source
+	// underruns), continuing to chase the old anchor adds latency without
+	// helping playback — restart the timeline at "now".
+	rtspPaceMaxLag = 2 * time.Second
+)
 
 func rtspLiveMountPath(code domain.StreamCode) string {
 	return "live/" + string(code)
@@ -266,6 +301,7 @@ func runRTSPPipeline(
 		svc:        svc,
 		mountPath:  rtspLiveMountPath(streamCode),
 		firstVideo: true,
+		ctx:        ctx,
 	}
 	defer sess.closeStream()
 
@@ -327,6 +363,11 @@ type rtspSession struct {
 	svc        *Service
 	mountPath  string
 
+	// ctx is the per-stream pipeline context. Captured so pacing sleeps can
+	// abort cleanly when the stream stops, instead of holding the read loop
+	// hostage for up to rtspPaceMaxSleep.
+	ctx context.Context //nolint:containedctx // ctx cancellation aborts pace sleeps; passing through every method would just be noise.
+
 	// codec detection
 	sps    []byte
 	pps    []byte
@@ -359,6 +400,14 @@ type rtspSession struct {
 	lastVideoRTP uint32 // 90 kHz — last RTP timestamp emitted on the video track
 	lastAudioRTP uint32 // sampleRate — last RTP timestamp emitted on the audio track
 	firstVideo   bool
+
+	// pacing — anchor (paceBase wallclock, paceMedia DTSms) so each packet
+	// can be held until its target wallclock arrives. Shared between video
+	// and audio so a single timeline drives both tracks; whichever track
+	// ticks first sets the anchor.
+	paceBase  time.Time
+	paceMedia uint64
+	paceSet   bool
 }
 
 type rtspPendingVideo struct {
@@ -386,6 +435,11 @@ func (sess *rtspSession) handleAVPacket(av *domain.AVPacket) {
 		// streaming — its timeline is independent and re-anchored
 		// by computeAudioRTP if dts jumps.
 		sess.firstVideo = true
+		// Wallclock pacer must also re-anchor: source DTS jumped
+		// (loop / restart / failover), so the (paceBase, paceMedia)
+		// mapping no longer reflects realtime. The next paced packet
+		// will set a fresh anchor.
+		sess.paceSet = false
 	}
 	switch av.Codec { //nolint:exhaustive // RTSP only carries H.264 + AAC; other codecs intentionally drop.
 	case domain.AVCodecH264:
@@ -596,6 +650,11 @@ func (sess *rtspSession) initStream() error {
 }
 
 func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
+	// Wallclock pacing: hold this packet until its target wallclock arrives
+	// so bursty upstream delivery (HLS segments, NVENC's faster-than-realtime
+	// output) reaches the wire smoothed back to realtime.
+	sess.pace(dts)
+
 	// gomedia's mpeg2 TSDemuxer divides the PES PTS/DTS by 90 before
 	// invoking OnFrame (ts-demuxer.go line 211/213), so the values that
 	// reach this callback are MILLISECONDS — not 90 kHz ticks. H.264 RTP
@@ -634,6 +693,14 @@ func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
 // the source jumps back, producing an RTP timestamp near 2^32 — which
 // surfaces in ffmpeg as "Non-increasing DTS" / "Frame num gap" and makes
 // downstream players fail to decode any video frame at all.
+//
+// The trailing monotonic clamp is the second line of defence: small jitter
+// (<rtspMaxBackJumpMs back) bypasses the rebase branch but can still drop
+// rtpTS below the previously-emitted value. ffmpeg copy mode catches that
+// as "Application provided invalid, non monotonically increasing dts to
+// muxer" and VLC drops the affected frames. Forcing rtpTS > lastVideoRTP
+// — even by 1 tick — costs nothing for downstream playback and makes the
+// timeline strictly monotonic on the wire.
 func (sess *rtspSession) computeVideoRTP(pts, dts uint64) uint32 {
 	if !sess.baseDTSSet {
 		sess.baseDTS = dts
@@ -649,13 +716,22 @@ func (sess *rtspSession) computeVideoRTP(pts, dts uint64) uint32 {
 		sess.baseDTS = pts - uint64(sess.lastVideoRTP/90) - 1
 	}
 	rel := pts - sess.baseDTS
-	return uint32(rel * 90)
+	rtpTS := uint32(rel * 90)
+	if rtpTS <= sess.lastVideoRTP {
+		rtpTS = sess.lastVideoRTP + 1
+	}
+	return rtpTS
 }
 
 func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 	if sess.audioMedia == nil || sess.audioEnc == nil || sess.aacCfg == nil {
 		return
 	}
+
+	// Wallclock pacing — see writeVideoRTP. Shared anchor across both
+	// tracks so audio and video stay in sync regardless of which one
+	// established the pacer.
+	sess.pace(dts)
 
 	// gomedia's TSDemuxer hands us DTS in milliseconds (see comment in
 	// writeVideoRTP). AAC RTP runs at the audio sample rate (48 kHz
@@ -713,7 +789,9 @@ func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 
 // computeAudioRTP mirrors computeVideoRTP for the audio track, in the AAC
 // sample rate clock (48 kHz here). Rebases on backwards source DTS so a
-// looped / restarted upstream doesn't underflow the RTP timestamp.
+// looped / restarted upstream doesn't underflow the RTP timestamp; the
+// trailing monotonic clamp guards against small in-window jitter the same
+// way computeVideoRTP does — see that function for the rationale.
 func (sess *rtspSession) computeAudioRTP(dts uint64) uint32 {
 	rate := uint64(sess.aacCfg.SampleRate)
 	if !sess.baseAudioSet {
@@ -727,7 +805,73 @@ func (sess *rtspSession) computeAudioRTP(dts uint64) uint32 {
 		sess.baseAudio = dts - uint64(sess.lastAudioRTP)*1000/rate - 1
 	}
 	relMs := dts - sess.baseAudio
-	return uint32(relMs * rate / 1000)
+	rtpTS := uint32(relMs * rate / 1000)
+	if rtpTS <= sess.lastAudioRTP {
+		rtpTS = sess.lastAudioRTP + 1
+	}
+	return rtpTS
+}
+
+// pace blocks until the wallclock target for `dts` arrives, anchoring the
+// (paceBase, paceMedia) mapping on the first call. The result is that the
+// RTP wire-rate matches the source's media-time rate even when the upstream
+// feeds the buffer hub in bursts (HLS chunks, NVENC's fast-than-realtime
+// output, transcoder catch-up after backpressure).
+//
+// Anchor is shared between video and audio so the two tracks stay phase-
+// locked. Re-anchors when:
+//   - paceSet is false (first call, or after a Discontinuity reset),
+//   - the would-be sleep exceeds rtspPaceMaxSleep (source PTS jumped far
+//     ahead — looped feed, fresh keyframe burst, encoder reset),
+//   - we have fallen further than rtspPaceMaxLag behind realtime
+//     (sustained source underrun; chasing the old anchor only adds
+//     latency without smoothing anything).
+//
+// Sleep aborts on sess.ctx cancellation so stream teardown is not held up
+// by an in-flight pace wait.
+func (sess *rtspSession) pace(dts uint64) {
+	if !sess.paceSet {
+		sess.paceBase = time.Now()
+		sess.paceMedia = dts
+		sess.paceSet = true
+		return
+	}
+	// Signed math: source DTS can dip slightly below the anchor (small
+	// reorder / jitter) without triggering a Discontinuity flag. Treat
+	// any negative delta as a re-anchor rather than under-flowing into
+	// a giant positive duration.
+	deltaMs := int64(dts) - int64(sess.paceMedia)
+	if deltaMs < 0 {
+		sess.paceBase = time.Now()
+		sess.paceMedia = dts
+		return
+	}
+	target := sess.paceBase.Add(time.Duration(deltaMs) * time.Millisecond)
+	delay := time.Until(target)
+	if delay > rtspPaceMaxSleep {
+		// PTS jumped far ahead of wallclock — re-anchor instead of
+		// sleeping a long time on a stale mapping.
+		sess.paceBase = time.Now()
+		sess.paceMedia = dts
+		return
+	}
+	if delay < -rtspPaceMaxLag {
+		// We have fallen more than rtspPaceMaxLag behind realtime;
+		// re-anchor at "now" so future packets pace from a fresh
+		// reference instead of perpetually chasing the old one.
+		sess.paceBase = time.Now()
+		sess.paceMedia = dts
+		return
+	}
+	if delay <= 0 {
+		return
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-sess.ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func (sess *rtspSession) closeStream() {
