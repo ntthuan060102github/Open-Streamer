@@ -167,6 +167,18 @@ type dashFMP4Packager struct {
 	videoNextDecode uint64 // 90 kHz
 	audioNextDecode uint64 // audioSR Hz
 
+	// Common-origin DTS used to seed the per-track tfdt offsets so audio
+	// and video share a single timeline reference. Without this, both
+	// nextDecode counters start at 0 regardless of the source's actual
+	// inter-track offset, baking any pre-roll skew (mp4 video DTS=-33ms
+	// for B-frame setup while audio DTS=0; HLS pull where audio starts
+	// 100ms before the first IDR; etc.) permanently into the published
+	// stream as observable A/V drift.
+	originDTSms        uint64 // ms — first DTS seen on any track
+	originDTSmsSet     bool
+	videoFirstDTSmsSet bool // true once videoNextDecode has been seeded
+	audioFirstDTSmsSet bool // true once audioNextDecode has been seeded
+
 	// Sliding-window state for MPD generation.
 	onDiskV    []string // filenames of written video segments
 	onDiskA    []string // filenames of written audio segments
@@ -347,6 +359,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		if len(p.vDTS) > 0 && int64(dts)-int64(p.vDTS[len(p.vDTS)-1]) < -1000 {
 			_ = p.flushSegmentLocked()
 		}
+		p.recordOriginDTSLocked(dts)
 		cp := append([]byte(nil), frame...)
 		p.vAnnex = append(p.vAnnex, cp)
 		p.vDTS = append(p.vDTS, dts)
@@ -357,6 +370,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.videoPS = append(p.videoPS, cp...)
 			pending = p.tryInitVideoLocked()
 		}
+		p.seedVideoNextDecodeLocked()
 		if p.segmentStart.IsZero() && p.videoInit != nil {
 			p.segmentStart = time.Now()
 		}
@@ -369,6 +383,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		if len(p.vDTS) > 0 && int64(dts)-int64(p.vDTS[len(p.vDTS)-1]) < -1000 {
 			_ = p.flushSegmentLocked()
 		}
+		p.recordOriginDTSLocked(dts)
 		cp := append([]byte(nil), frame...)
 		p.vAnnex = append(p.vAnnex, cp)
 		p.vDTS = append(p.vDTS, dts)
@@ -379,6 +394,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.videoPS = append(p.videoPS, cp...)
 			pending = p.tryInitVideoH265Locked()
 		}
+		p.seedVideoNextDecodeLocked()
 		if p.segmentStart.IsZero() && p.videoInit != nil {
 			p.segmentStart = time.Now()
 		}
@@ -393,6 +409,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		if len(p.aPTS) > 0 && int64(pts)-int64(p.aPTS[len(p.aPTS)-1]) < -1000 {
 			_ = p.flushSegmentLocked()
 		}
+		p.recordOriginDTSLocked(dts)
 		// A PES payload may contain multiple concatenated ADTS frames.
 		pos := 0
 		for pos+7 <= len(frame) {
@@ -421,6 +438,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			}
 			p.aRaw = append(p.aRaw, raw)
 			p.aPTS = append(p.aPTS, pts)
+			p.seedAudioNextDecodeLocked(dts)
 			if p.segmentStart.IsZero() && p.videoInit == nil && p.audioInit != nil {
 				p.segmentStart = time.Now()
 			}
@@ -537,10 +555,70 @@ func (p *dashFMP4Packager) prepareAudioInitLocked(hdr *aac.ADTSHeader) (*pending
 	p.audioInit = init
 	p.audioTID = trak.Tkhd.TrackID
 	p.audioSR = sr
-	p.audioNextDecode = 0
 	p.audioCodec = "mp4a.40.2"
+	// audioNextDecode is seeded by seedAudioNextDecodeLocked() on the first
+	// AAC frame after init, using the actual frame DTS rather than a
+	// hardcoded 0 — that's how cross-track tfdt offsets stay correct.
 
 	return &pendingInitWrite{init: init, filename: "init_a.mp4"}, nil
+}
+
+// recordOriginDTSLocked seeds the shared per-stream origin on the first
+// frame of any track. Both per-track tfdt counters are subsequently anchored
+// to this origin so that the published DASH timeline preserves whatever
+// inter-track offset the source had at startup (encoder pre-roll, mp4 edit
+// list, HLS source where audio leads video by a few hundred ms, …).
+//
+// Without an explicit origin, video and audio nextDecode counters both
+// defaulted to 0, which collapsed the source's actual offset into "both
+// tracks start at the same moment" — players then play audio and video
+// out of sync by exactly that lost offset. Caller must hold p.mu.
+func (p *dashFMP4Packager) recordOriginDTSLocked(dts uint64) {
+	if !p.originDTSmsSet {
+		p.originDTSms = dts
+		p.originDTSmsSet = true
+	}
+}
+
+// seedVideoNextDecodeLocked initialises videoNextDecode from the first
+// queued video DTS, expressed as the offset from the shared origin in 90
+// kHz ticks. No-op once seeded, after the video init segment exists, and
+// when there is at least one queued AU to anchor to.
+//
+// Subsequent video segments accumulate from this seed via the existing
+// `p.videoNextDecode += segDur` path, so the offset persists for the full
+// stream lifetime — meaning "audio leads video by 100ms" stays "audio leads
+// video by 100ms" all the way to the player. Caller must hold p.mu.
+func (p *dashFMP4Packager) seedVideoNextDecodeLocked() {
+	if p.videoFirstDTSmsSet || p.videoInit == nil || len(p.vDTS) == 0 {
+		return
+	}
+	p.videoNextDecode = scaleOffset(p.vDTS[0], p.originDTSms, dashVideoTimescale)
+	p.videoFirstDTSmsSet = true
+}
+
+// seedAudioNextDecodeLocked is the audio counterpart of
+// seedVideoNextDecodeLocked, scaling into the audio sample rate. Called
+// once after the audio init exists and the first AAC frame has been
+// queued. Caller must hold p.mu.
+func (p *dashFMP4Packager) seedAudioNextDecodeLocked(firstFrameDTSms uint64) {
+	if p.audioFirstDTSmsSet || p.audioInit == nil || p.audioSR <= 0 {
+		return
+	}
+	p.audioNextDecode = scaleOffset(firstFrameDTSms, p.originDTSms, uint64(p.audioSR))
+	p.audioFirstDTSmsSet = true
+}
+
+// scaleOffset returns (firstDTSms - originDTSms) converted into `timescale`
+// ticks, clamping to 0 when first predates origin. The clamp is conservative
+// — predating origin shouldn't happen given recordOriginDTSLocked fires
+// before any track-specific seed call, but uint64 underflow would silently
+// emit a tfdt near 2^64 and break every player downstream.
+func scaleOffset(firstDTSms, originDTSms, timescale uint64) uint64 {
+	if firstDTSms < originDTSms {
+		return 0
+	}
+	return (firstDTSms - originDTSms) * timescale / 1000
 }
 
 // audioFramesPerSegment returns the expected number of 1024-sample AAC frames per segment.
