@@ -49,6 +49,14 @@ import (
 // video-only (no audio track in SDP).
 const maxRTSPPendingFrames = 90
 
+// rtspMaxBackJumpMs is the threshold below which a backwards source DTS jump
+// is treated as a discontinuity (loop / restart) and the RTP base is reset.
+// 250ms tolerates normal B-frame reordering (≤ a few frame periods) without
+// false-positive rebase, and catches real source resets (which jump by
+// seconds or back to 0). H.264 spec allows DTS reorder up to a few frames
+// for B-pyramid; 250ms ≈ 6 frames at 25fps which is the practical max.
+const rtspMaxBackJumpMs = 250
+
 func rtspLiveMountPath(code domain.StreamCode) string {
 	return "live/" + string(code)
 }
@@ -314,11 +322,21 @@ type rtspSession struct {
 	videoEnc   *rtph264.Encoder
 	audioEnc   *rtpmpeg4audio.Encoder
 
-	// timing (MPEG-TS 90 kHz)
-	baseDTS      uint64
+	// timing — gomedia's TS demuxer hands us PTS / DTS in milliseconds
+	// (it divides PES 90 kHz ticks by 90 before invoking OnFrame). The
+	// `base*` fields anchor the RTP timeline at the first frame; the
+	// `last*RTP` / `last*Src` pair lets us rebase forward when the
+	// upstream source has a discontinuity (loop, restart, encoder reset)
+	// instead of underflowing `src - base` into a huge RTP timestamp
+	// that breaks ffmpeg's H.264 frame_num tracking + DTS monotonicity.
+	baseDTS      uint64 // ms — first video DTS observed
 	baseDTSSet   bool
-	baseAudio    uint64
+	baseAudio    uint64 // ms — first audio DTS observed
 	baseAudioSet bool
+	lastVideoSrc uint64 // ms — last video DTS we processed
+	lastAudioSrc uint64 // ms — last audio DTS we processed
+	lastVideoRTP uint32 // 90 kHz — last RTP timestamp emitted on the video track
+	lastAudioRTP uint32 // sampleRate — last RTP timestamp emitted on the audio track
 	firstVideo   bool
 }
 
@@ -530,29 +548,15 @@ func (sess *rtspSession) initStream() error {
 }
 
 func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
-	if !sess.baseDTSSet {
-		sess.baseDTS = dts
-		sess.baseDTSSet = true
-	}
 	// gomedia's mpeg2 TSDemuxer divides the PES PTS/DTS by 90 before
 	// invoking OnFrame (ts-demuxer.go line 211/213), so the values that
-	// reach this callback are MILLISECONDS — not 90 kHz ticks. H.264
-	// RTP runs at 90 kHz; we have to multiply ms by 90 to land in the
-	// right clock domain.
-	//
-	// Earlier code used `pts - baseDTS` directly, treating ms as 90 kHz.
-	// The result was an RTP timeline 90× slower than reality: the
-	// receiver decoded the first IDR (timestamps still small) and then
-	// hung once subsequent frames arrived with timestamps barely
-	// advancing — Flussonic's player froze after ~1 s, OpenStreamer's
-	// HLS pull saw the audio stream emit non-monotonic DTS in ffprobe
-	// (because the same scale bug afflicted the audio path).
+	// reach this callback are MILLISECONDS — not 90 kHz ticks. H.264 RTP
+	// runs at 90 kHz; we multiply ms by 90 to land in the right clock.
 	//
 	// Per RFC 6184 §7.1 the RTP timestamp is the presentation time and
 	// must be IDENTICAL for every RTP packet that fragments one access
-	// unit (e.g. all FU-A pieces). We use PTS in 90 kHz; the receiver
-	// derives presentation order from PTS alone and handles reordering.
-	rtpTS := uint32((pts - sess.baseDTS) * 90)
+	// unit (e.g. all FU-A pieces) so the receiver can re-assemble them.
+	rtpTS := sess.computeVideoRTP(pts, dts)
 
 	nalus := annexBToNALUs(frame)
 	if len(nalus) == 0 {
@@ -571,6 +575,33 @@ func (sess *rtspSession) writeVideoRTP(frame []byte, pts, dts uint64) {
 			return
 		}
 	}
+	sess.lastVideoRTP = rtpTS
+	sess.lastVideoSrc = dts
+}
+
+// computeVideoRTP maps an upstream (pts, dts) in milliseconds to a 90-kHz
+// RTP timestamp, rebasing on backwards / huge-jump source DTS so the RTP
+// timeline stays monotonic across upstream loops, restarts, or encoder
+// resets. Without rebase, `pts - baseDTS` underflows uint64 the moment
+// the source jumps back, producing an RTP timestamp near 2^32 — which
+// surfaces in ffmpeg as "Non-increasing DTS" / "Frame num gap" and makes
+// downstream players fail to decode any video frame at all.
+func (sess *rtspSession) computeVideoRTP(pts, dts uint64) uint32 {
+	if !sess.baseDTSSet {
+		sess.baseDTS = dts
+		sess.baseDTSSet = true
+		sess.lastVideoSrc = dts
+		return 0
+	}
+	if pts < sess.baseDTS || dts+rtspMaxBackJumpMs < sess.lastVideoSrc {
+		// Source discontinuity (loop / restart / reorder past tolerance).
+		// Anchor the new base such that this frame produces the next RTP
+		// tick after the last one we sent. ffmpeg / gortsplib accept a
+		// 1-tick step; what they reject is going backwards.
+		sess.baseDTS = pts - uint64(sess.lastVideoRTP/90) - 1
+	}
+	rel := pts - sess.baseDTS
+	return uint32(rel * 90)
 }
 
 func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
@@ -578,24 +609,14 @@ func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 		return
 	}
 
-	if !sess.baseAudioSet {
-		sess.baseAudio = dts
-		sess.baseAudioSet = true
-	}
 	// gomedia's TSDemuxer hands us DTS in milliseconds (see comment in
 	// writeVideoRTP). AAC RTP runs at the audio sample rate (48 kHz
-	// here), so the conversion is `ms × sampleRate / 1000`.
-	//
-	// The previous formula divided by 90000 instead of 1000, treating
-	// the input as 90 kHz ticks. That produced packet timestamps 90×
-	// smaller than expected; consecutive RTP packets ended up only
-	// ~91 ticks apart (vs. the correct 1024 per AAC AU), so within a
-	// single ADTS frame containing N AUs the encoder's internal AU
-	// spacing (1024) overshot the next packet's base, and ffmpeg saw
-	// "non-monotonic DTS" — which froze playback after a couple of
-	// frames worth of audio.
-	relMs := dts - sess.baseAudio
-	rtpTS := uint32(relMs * uint64(sess.aacCfg.SampleRate) / 1000)
+	// here), so the conversion is `ms × sampleRate / 1000`. Same
+	// discontinuity-aware rebase as the video path: when the upstream
+	// source loops or resets, dts jumps back and `dts - baseAudio`
+	// would underflow uint64 → huge RTP timestamp → ffmpeg sees DTS
+	// near int64 max and rejects the packet.
+	rtpTS := sess.computeAudioRTP(dts)
 
 	var adtsPkts mpeg4audio.ADTSPackets
 	if err := adtsPkts.Unmarshal(frame); err != nil || len(adtsPkts) == 0 {
@@ -635,7 +656,30 @@ func (sess *rtspSession) writeAudioRTP(frame []byte, dts uint64) {
 			slog.Debug("publisher: RTSP write audio RTP", "stream_code", sess.streamCode, "err", err)
 			return
 		}
+		if pkt.Timestamp > sess.lastAudioRTP {
+			sess.lastAudioRTP = pkt.Timestamp
+		}
 	}
+	sess.lastAudioSrc = dts
+}
+
+// computeAudioRTP mirrors computeVideoRTP for the audio track, in the AAC
+// sample rate clock (48 kHz here). Rebases on backwards source DTS so a
+// looped / restarted upstream doesn't underflow the RTP timestamp.
+func (sess *rtspSession) computeAudioRTP(dts uint64) uint32 {
+	rate := uint64(sess.aacCfg.SampleRate)
+	if !sess.baseAudioSet {
+		sess.baseAudio = dts
+		sess.baseAudioSet = true
+		sess.lastAudioSrc = dts
+		return 0
+	}
+	if dts < sess.baseAudio || dts+rtspMaxBackJumpMs < sess.lastAudioSrc {
+		// Source discontinuity — keep the RTP timeline moving forward.
+		sess.baseAudio = dts - uint64(sess.lastAudioRTP)*1000/rate - 1
+	}
+	relMs := dts - sess.baseAudio
+	return uint32(relMs * rate / 1000)
 }
 
 func (sess *rtspSession) closeStream() {
