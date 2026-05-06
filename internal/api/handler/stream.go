@@ -230,7 +230,13 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wasRunning := exists && h.coordinator.IsRunning(code)
+	// nowEnabled: existing stream toggled disabled→enabled.
+	// freshlyCreated: brand-new stream that should run from the moment it's
+	// saved. Without this branch, POST /streams would persist the record
+	// but never call Start — the stream would stay in StatusStopped until
+	// the reconciler picked it up on the next tick.
 	nowEnabled := exists && cur.Disabled && !body.Disabled
+	freshlyCreated := !exists && !body.Disabled && len(body.Inputs) > 0
 
 	// Save first so the pipeline continues with the old config if persistence fails.
 	if err := h.streamRepo.Save(r.Context(), body); err != nil {
@@ -244,13 +250,13 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	// (HLS/DASH/RTMP/transcoder/manager) is killed instantly. WithoutCancel keeps
 	// request-scoped values (logging tags) but drops the cancel signal.
 	pipelineCtx := context.WithoutCancel(r.Context())
-	if wasRunning {
+	switch {
+	case wasRunning:
 		if err := h.coordinator.Update(pipelineCtx, cur, body); err != nil {
 			serverError(w, r, "UPDATE_FAILED", "update stream pipeline", err)
 			return
 		}
-	} else if nowEnabled {
-		// Stream was disabled → re-enabled: start the pipeline.
+	case nowEnabled, freshlyCreated:
 		if err := h.coordinator.Start(pipelineCtx, body); err != nil {
 			serverError(w, r, "START_FAILED", "start stream pipeline", err)
 			return

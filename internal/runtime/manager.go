@@ -203,6 +203,12 @@ func (m *Manager) applyAll(cfg *domain.GlobalConfig) {
 	coordinator.BootstrapPersistedStreams(
 		m.rootCtx, slog.Default(), m.deps.StreamRepo, m.deps.Coordinator,
 	)
+
+	// Reconciler: re-asserts "every enabled stream is running" on a timer.
+	// Recovers from any path that left a stream stopped against the
+	// operator's intent — bootstrap Start failures (transient source
+	// outages), restart errors, or create-handler edge cases.
+	go m.deps.Coordinator.RunReconciler(m.rootCtx)
 }
 
 // diff compares old and new configs and starts/stops services as needed.

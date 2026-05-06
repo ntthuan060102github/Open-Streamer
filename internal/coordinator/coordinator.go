@@ -804,6 +804,75 @@ func BootstrapPersistedStreams(ctx context.Context, log *slog.Logger, repo store
 	}
 }
 
+// reconcileInterval is the cadence at which the reconciler verifies that
+// every enabled stream is running. 10s is short enough that an operator
+// creating a stream sees it come up "immediately" (worst case ~10s after
+// the API write), and long enough that a healthy fleet pays effectively
+// zero cost — one repo.List + a hashmap probe per stream.
+const reconcileInterval = 10 * time.Second
+
+// RunReconciler enforces the invariant "every stream that is not disabled
+// must be running". It re-lists the persisted streams every reconcileInterval
+// and Start()s any enabled stream the coordinator is not currently running.
+//
+// This is the safety net behind every code path that can leave a stream
+// stopped against the operator's intent — e.g. a bootstrap Start that
+// failed because the upstream HLS source was briefly unreachable, a
+// restart that errored mid-flight, an API edge case where Start was never
+// dispatched (POST /streams creating a brand-new stream and the handler
+// only branched on "was previously disabled"). Without this loop those
+// failures stick: the stream is saved as `disabled: false` but stays in
+// StatusStopped until someone manually hits /restart.
+//
+// Start is idempotent (it short-circuits when the pipeline is already
+// running), and concurrent Update / Stop calls from the API path race
+// safely against the reconciler — Start checks IsRunning under its own
+// lock, and a Stop arriving after our IsRunning probe simply means the
+// next tick will re-Start it (which is the desired behaviour: if the
+// operator wants the stream stopped, they should toggle Disabled).
+//
+// Call once at boot from the runtime Manager; the loop exits when ctx
+// is cancelled (process shutdown).
+func (c *Coordinator) RunReconciler(ctx context.Context) {
+	// One immediate pass so a freshly-created stream that the create
+	// handler missed comes up well before the first ticker tick.
+	c.reconcileOnce(ctx)
+
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.reconcileOnce(ctx)
+		}
+	}
+}
+
+// reconcileOnce is one pass of the reconcile loop, factored out so tests
+// can drive it deterministically without spinning up the ticker.
+func (c *Coordinator) reconcileOnce(ctx context.Context) {
+	streams, err := c.streamRepo.List(ctx, store.StreamFilter{})
+	if err != nil {
+		slog.Warn("coordinator: reconciler list failed", "err", err)
+		return
+	}
+	for _, st := range streams {
+		if st == nil || st.Disabled || len(st.Inputs) == 0 {
+			continue
+		}
+		if c.IsRunning(st.Code) {
+			continue
+		}
+		slog.Info("coordinator: reconciler starting stopped stream", "stream_code", st.Code)
+		if err := c.Start(ctx, st); err != nil {
+			slog.Warn("coordinator: reconciler start failed",
+				"stream_code", st.Code, "err", err)
+		}
+	}
+}
+
 // transcoderConfigWithWatermark returns a shallow clone of stream.Transcoder
 // with the runtime-only Watermark field populated from stream.Watermark.
 //

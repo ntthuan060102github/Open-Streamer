@@ -79,6 +79,22 @@ type MixerReader struct {
 	videoEOF  atomic.Bool
 	audioEOF  atomic.Bool
 
+	// PTS normalisation — each upstream sets its own PTS origin (HLS pull
+	// inherits whatever the source TS file used; mp4 file starts at 0; RTSP
+	// uses the camera clock; etc.). Without rebasing, the combined stream
+	// presents video and audio on incompatible timelines, which the
+	// downstream FFmpeg muxer surfaces as "Packets poorly interleaved,
+	// failed to avoid negative timestamp -7080 in stream 0" and the HLS
+	// segmenter emits segments where declared EXTINF (wallclock-derived)
+	// disagrees with content duration (PTS-derived) by many seconds.
+	// Subtracting the first observed DTS from each source rebases both
+	// onto a shared zero-rooted axis so the muxer can interleave correctly.
+	// State mutation is single-threaded — only ReadPackets writes.
+	videoPTSBase    uint64
+	videoPTSBaseSet bool
+	audioPTSBase    uint64
+	audioPTSBaseSet bool
+
 	closed atomic.Bool
 }
 
