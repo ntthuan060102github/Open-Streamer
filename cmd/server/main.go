@@ -38,7 +38,6 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
 	"github.com/ntt0601zcoder/open-streamer/internal/watermarks"
 	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
-	"github.com/q191201771/naza/pkg/nazalog"
 	"github.com/samber/do/v2"
 )
 
@@ -105,25 +104,15 @@ func run() error {
 	}
 
 	// Init logger from store config.
+	// Apply installs both slog and nazalog (LAL) levels from the same cfg
+	// so hot-reloads stay in lock-step — see logger.Apply for the mapping
+	// rationale. When cfg.Log is nil (defaults), apply the zero LogConfig
+	// which still produces a usable info-level slog and a quiet LAL.
+	logCfg := config.LogConfig{}
 	if gcfg.Log != nil {
-		slog.SetDefault(logger.New(*gcfg.Log))
+		logCfg = *gcfg.Log
 	}
-
-	// Tie lal's nazalog level to our own log.level so a single config knob
-	// covers both. LAL warns aggressively on harmless protocol quirks
-	// ("read user control message, ignore", "< R Set Peer Bandwidth.
-	// ignore") — those flood `journalctl -f` and drown out slog output
-	// even when an operator opens debug. So the mapping is asymmetric:
-	//
-	//   our trace / debug → LAL Debug   (operator wants full LAL detail)
-	//   our info  (default)→ LAL Error  (silence noise on quiet box)
-	//   our warn / error  → LAL Error   (silence everything bar real LAL errors)
-	//
-	// LAL's own Errorf path covers genuine protocol failures — no real
-	// signal is lost by suppressing warn.
-	_ = nazalog.Init(func(o *nazalog.Option) {
-		o.Level = lalLogLevel(gcfg.Log)
-	})
+	logger.Apply(logCfg)
 
 	// 5. Wire all services.
 	wireServices(injector)
@@ -230,21 +219,6 @@ func deref[T any](p *T) T {
 	}
 	var zero T
 	return zero
-}
-
-// lalLogLevel maps our slog level to LAL's nazalog level. See the
-// init-time comment for why warn/error collapse to LAL Error (LAL warns
-// on harmless ignored protocol messages and floods the log otherwise).
-func lalLogLevel(cfg *config.LogConfig) nazalog.Level {
-	if cfg == nil {
-		return nazalog.LevelError
-	}
-	switch cfg.Level {
-	case "trace", "debug":
-		return nazalog.LevelDebug
-	default:
-		return nazalog.LevelError
-	}
 }
 
 // wireServices registers all non-storage services into the DI injector.

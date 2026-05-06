@@ -1,4 +1,5 @@
-// Package logger initialises the application-wide slog.Logger.
+// Package logger initialises the application-wide slog.Logger and the
+// LAL-internal nazalog level so a single config knob covers both.
 // One logger is created at startup and passed via DI.
 // Never call slog.SetDefault in tests — use the injected logger instead.
 package logger
@@ -8,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+
+	"github.com/q191201771/naza/pkg/nazalog"
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 )
@@ -28,6 +31,41 @@ const LevelTrace = slog.Level(-8)
 //nolint:contextcheck // hot-path log helper; ctx threading would cascade through entire call graph for no observability gain.
 func Trace(msg string, args ...any) {
 	slog.Default().Log(context.Background(), LevelTrace, msg, args...)
+}
+
+// Apply installs cfg as the current process-wide logging configuration:
+// it sets slog.SetDefault to a logger built from cfg AND re-initialises
+// LAL's nazalog level via lalLevel(cfg). Calling this on every config
+// change (startup + runtime hot-reload) keeps both logging stacks in
+// lock-step — without the nazalog half, hot-reloading log.level via the
+// /config API only affects slog and lal continues emitting whatever
+// level was set at boot, which is the most common "I lowered my log
+// level but lal's INFO chatter still floods journalctl" footgun.
+func Apply(cfg config.LogConfig) {
+	slog.SetDefault(New(cfg))
+	// Init mutates the underlying global *logger struct in place; both
+	// nazalog package-level functions and any captured GetGlobalLogger
+	// pointers (e.g. lal's pkg/rtmp.Log) see the new level immediately.
+	_ = nazalog.Init(func(o *nazalog.Option) {
+		o.Level = lalLevel(cfg)
+	})
+}
+
+// lalLevel maps our slog level vocabulary to LAL's nazalog level. The
+// mapping is asymmetric: only operator-requested verbose levels (trace
+// or debug) unlock LAL's Debug output. Anything else collapses to LAL's
+// Error level because LAL warns aggressively on harmless protocol
+// quirks ("read user control message, ignore", "< R Acknowledgement.
+// ignore. sequence number=…") and would otherwise drown out the rest
+// of journalctl. LAL's Errorf path covers genuine protocol failures
+// so no real signal is lost by suppressing warn.
+func lalLevel(cfg config.LogConfig) nazalog.Level {
+	switch cfg.Level {
+	case "trace", "debug":
+		return nazalog.LevelDebug
+	default:
+		return nazalog.LevelError
+	}
 }
 
 // New creates a slog.Logger from the given LogConfig.

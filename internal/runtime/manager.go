@@ -302,10 +302,15 @@ func (m *Manager) diff(old, new *domain.GlobalConfig) {
 			return nil
 		})
 
-	// Log — not a long-running service, just swap the global logger.
+	// Log — apply both slog and LAL (nazalog) levels via the shared helper
+	// so a runtime config change actually silences LAL's per-RTMP-session
+	// INFO chatter the way an operator expects. Calling slog.SetDefault
+	// alone (the previous behaviour) left nazalog stuck at whatever level
+	// was set at boot, which is the most common "I lowered log.level but
+	// LAL keeps flooding journalctl" footgun.
 	if configChanged(old.Log, new.Log) {
 		if new.Log != nil {
-			slog.SetDefault(logger.New(*new.Log))
+			logger.Apply(*new.Log)
 			slog.Info("runtime: log config applied", "level", new.Log.Level, "format", new.Log.Format)
 		}
 	}
