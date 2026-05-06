@@ -39,6 +39,8 @@ sequenceDiagram
     loop for each enabled stream
         Coord->>Coord: Start(stream)
     end
+    RTM->>Coord: go RunReconciler(rootCtx)
+    Note over Coord: Every 10s: list streams,<br/>Start any enabled+stopped one
     Note over Main: Block on signal ctx (SIGINT/SIGTERM)
 ```
 
@@ -76,9 +78,16 @@ sequenceDiagram
 10. RuntimeManager.BootstrapWith(gcfg)
     ├── start each configured service (server, ingestor RTMP listener,
     │   publisher RTSP/SRT listeners, hooks)
-    └── coordinator.BootstrapPersistedStreams
-        └── for each stream in store where !disabled && len(inputs) > 0:
-            └── coordinator.Start(stream)
+    ├── coordinator.BootstrapPersistedStreams
+    │   └── for each stream in store where !disabled && len(inputs) > 0:
+    │       └── coordinator.Start(stream)
+    └── go coordinator.RunReconciler(rootCtx)
+        └── every 10s, list persisted streams and Start any
+            non-disabled, has-inputs stream that is not currently
+            running. Self-heals from bootstrap Start failures
+            (transient HLS source outage), restart errors, and the
+            POST /streams edge case where a brand-new stream is
+            saved but never dispatched. Idempotent.
 
 11. Block on signal ctx (SIGINT / SIGTERM)
     └── on shutdown: services tear down in reverse, 10s deadline
@@ -104,13 +113,16 @@ sequenceDiagram
     API->>Repo: Save(body)
     Note over API,Repo: Persisted FIRST<br/>so pipeline keeps old config<br/>if next step fails
 
-    alt new stream
-        API->>Bus: stream.created
-    else existing + was running
+    alt existing + was running
         API->>Coord: Update(ctx, cur, body)
         Coord->>Coord: ComputeDiff → minimal restart
     else existing + disabled→enabled
         API->>Coord: Start(ctx, body)
+    else freshly created + !disabled + has inputs
+        API->>Coord: Start(ctx, body)
+    end
+    opt new stream
+        API->>Bus: stream.created
     end
 
     API-->>Client: 201 Created (or 200 OK)
@@ -143,9 +155,14 @@ sequenceDiagram
     ├── existing + was running → coordinator.Update(ctx, cur, body)
     │                            └── diff engine → minimal restart
     ├── existing + disabled → enabled → coordinator.Start(ctx, body)
-    └── new → bus.Publish(stream.created)
+    └── new + !disabled + has inputs → coordinator.Start(ctx, body)
+        └── If Start is missed here (handler exits before dispatch, or
+            Start returns an error), the reconciler picks the stream
+            up on its next 10s tick — see §1 step 10.
 
-8.  Response 201 (new) or 200 (update) with body
+8.  If !exists, bus.Publish(stream.created)
+
+9.  Response 201 (new) or 200 (update) with body
 ```
 
 ### Coordinator.Update internals (step 6)

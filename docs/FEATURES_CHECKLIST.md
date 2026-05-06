@@ -83,7 +83,7 @@ Legend:
 | Pull — File (`.ts`, `.mp4`, `.flv`) | Complete | Loop mode; paced playback |
 | Pull — S3 | Complete | GetObject stream; S3-compatible via `?endpoint=` |
 | Pull — `copy://<code>` | Complete | In-process subscribe to another stream's published output (raw or per-rendition) |
-| Pull — `mixer://<videoCode>?audio=<audioCode>` | Complete | In-process video+audio mix from two upstream streams |
+| Pull — `mixer://<videoCode>,<audioCode>` | Complete | In-process video+audio mix from two upstream streams (comma-separated codes; optional `?audio_failure=continue` keeps video-only when audio source dies). PTS / DTS rebased per-track to a 0-relative origin so video and audio land on the same axis even when upstreams use unrelated source clocks (mp4 file audio at PTS=0 ↔ HLS pull video at PTS=N) — this is what made `test_mixer` segments declare 6s but contain 13s before the fix |
 | Push — RTMP listen | Complete | Shared `:1935` (default); RTMP relay → loopback pull |
 | Push — SRT listen | Complete | Shared `:9999`; streamid `live/<code>` dispatch |
 | Multi-input registration with priority | Complete | Lower value = higher priority |
@@ -147,6 +147,7 @@ Legend:
 | Start pipeline | Complete | Buffers → manager → publisher → transcoder; raw + rendition buffers per topology |
 | Stop pipeline | Complete | Reverse-order teardown; buffer cleanup |
 | Bootstrap persisted streams on boot | Complete | Skips disabled / zero-input streams |
+| Stream reconciler (self-healing) | Complete | Background goroutine started by `runtime.Manager`; every 10s lists persisted streams and `Start`s any non-disabled stream with at least one input that is not currently running. Handles transient bootstrap failures (HLS source down at boot, recovers later), restart errors, and the create-handler edge case where a brand-new stream was saved but never dispatched. Idempotent — `Coordinator.Start` short-circuits when already running |
 | Hot-reload (`Update`) | Complete | Diff engine: 5 categories — inputs, transcoder topology, profiles, protocols/push, DVR |
 | Per-profile granular reload | Complete | Add/remove/update one profile without touching others |
 | ABR ladder add/remove → `RestartHLSDASH` | Complete | Only HLS+DASH goroutines restart; RTSP/RTMP/SRT viewers preserved |
@@ -166,10 +167,12 @@ Legend:
 |---|---|---|
 | HLS — single rendition | Complete | Native TS segmenter + media playlist |
 | HLS — ABR (master + per-track sub-playlists) | Complete | Auto-active when transcoder ladder present |
+| HLS — master playlist `CODECS` includes audio | Complete | Master `EXT-X-STREAM-INF` declares `avc1.<profile>,mp4a.40.2` whenever the rendition has audio (transcoder `audio.copy=true` OR `audio.codec` set); without the audio entry, hls.js + MSE addSourceBuffer with a video-only codec list and silently drop audio. Detected from stream config at setup time, not from packet inspection |
 | HLS — `#EXT-X-DISCONTINUITY` on failover | Complete | Per-variant generation counter |
 | DASH — single representation (fMP4 + dynamic MPD) | Complete | H.264 / H.265 / AAC; MP3 skipped |
 | DASH — ABR (root MPD + per-track dirs) | Complete | Audio packaged on best track only |
-| RTSP play | Complete | Shared listener (default `:554`); `gortsplib/v5`; `rtsp://host:port/live/<code>` |
+| DASH — cross-track tfdt origin sync | Complete | First DTS observed across either track seeds a shared `originDTSms`; each track's `nextDecode` initialises to the offset between its own first DTS and that origin (in the track's timescale). Without this, both counters defaulted to 0 and any source-side A/V skew (mp4 encoder pre-roll, edit lists, HLS audio-leads-video) was silently collapsed into "both tracks start together" — the bug user-visible as ~400ms drift on `file://*.mp4` sources |
+| RTSP play | Complete | Shared listener; `gortsplib/v5`; `rtsp://host:port/live/<code>`. Output is wallclock-paced before each `WritePacketRTP` so bursty upstream delivery (HLS pulls, NVENC's faster-than-realtime output) reaches the wire smoothed back to realtime. RTP timestamps are monotonic-clamped (`rtpTS > lastRTP` always) so small in-window source DTS jitter no longer surfaces in clients as "non monotonically increasing dts" / dropped frames |
 | RTMP play | Complete | Shared port with ingest (`:1935`); `rtmp://host:port/live/<code>` |
 | SRT play | Complete | Shared listener (`:9999`); `srt://host:port?streamid=live/<code>`; default latency 120ms |
 | RTMP push out | Complete | `q191201771/lal` PushSession; `rtmp://` + `rtmps://`; custom codec adapter for proper PTS/DTS composition_time (B-frame friendly) |

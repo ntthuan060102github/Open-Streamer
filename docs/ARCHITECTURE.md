@@ -149,6 +149,18 @@ categories:
 `Stopped` when not registered. Manager and Transcoder push their flag
 state via callbacks; coordinator never polls them.
 
+**Pipeline reconciler** — `Coordinator.RunReconciler` is a long-running
+goroutine started once at boot by the runtime Manager. Every 10s it
+re-lists every persisted stream and `Start`s any non-disabled stream
+with at least one input that the coordinator is not currently running.
+This is the safety net behind every code path that can leave a stream
+stopped against the operator's intent — bootstrap `Start` failures from
+a transient HLS source outage, restart errors, or the `POST /streams`
+edge case where a brand-new stream is saved but the create handler
+never dispatches `Start`. Idempotent: `Start` short-circuits when the
+pipeline is already running, so concurrent API operations race safely
+against the loop.
+
 ### Buffer Hub (`internal/buffer`)
 
 The single source of truth for stream data. One in-memory ring buffer
@@ -208,7 +220,7 @@ protocol selection via `pull.PacketReader` factory:
 | `file://` | FileReader | stdlib os.File + paced playback |
 | `s3://` | S3Reader | `aws-sdk-go-v2` |
 | `copy://` | CopyReader | in-process buffer subscription |
-| `mixer://` | MixerReader | in-process video+audio mix |
+| `mixer://video,audio` | MixerReader | in-process video+audio mix; rebases each track's PTS / DTS to a 0-relative origin so unrelated upstream clocks land on a shared axis |
 
 **Push ingest** (RTMP listen `:1935`, SRT listen `:9999`) shares a
 single server per protocol. Incoming connection → registry lookup
@@ -369,9 +381,22 @@ Reads from Buffer Hub subscriber, segments into output formats:
 - **DASH** ([dash_fmp4.go](../internal/publisher/dash_fmp4.go)): uses
   `tsBuffer` (buffered pipe) → `mpeg2.TSDemuxer` → fMP4 segments.
   `tsBuffer.Write` never blocks (replaced `io.Pipe` which caused packet
-  loss under transcoding load)
-- **RTMP / SRT / RTSP** ([listen.go](../internal/publisher/listen.go)):
+  loss under transcoding load). Audio and video tfdt counters are
+  seeded from a shared `originDTSms` so source-side A/V skew (mp4
+  encoder pre-roll, edit lists, HLS feeds where audio leads video) is
+  preserved as-is rather than being collapsed into "both tracks start
+  at 0".
+- **RTMP / SRT** ([listen.go](../internal/publisher/listen.go)):
   shared listeners; per-client subscribes to the playback buffer
+- **RTSP** ([serve_rtsp.go](../internal/publisher/serve_rtsp.go)):
+  shared listener (gortsplib v5). The pipeline holds each AV packet
+  until its target wallclock arrives before `WritePacketRTP` so bursty
+  upstream delivery (HLS pulls feeding segments every ~5s, NVENC's
+  faster-than-realtime output) reaches the wire smoothed back to
+  realtime — without this, strict clients (VLC, ffmpeg copy) underrun
+  their jitter buffer between bursts. RTP timestamps are also
+  monotonic-clamped (`rtpTS > lastRTP` always) so small in-window
+  source DTS jitter cannot regress on the wire.
 
 **ABR-aware** segmenters detect when transcoder ladder is active and
 auto-emit:
