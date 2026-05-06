@@ -279,7 +279,7 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if pkt.AV == nil || !pkt.AV.Codec.IsVideo() {
 			return nil, nil
 		}
-		return []domain.AVPacket{*pkt.AV}, nil
+		return []domain.AVPacket{r.normalizeVideoPTS(*pkt.AV)}, nil
 
 	case avp, ok := <-videoABRCh:
 		if !ok {
@@ -288,7 +288,7 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if !avp.Codec.IsVideo() {
 			return nil, nil
 		}
-		return []domain.AVPacket{avp}, nil
+		return []domain.AVPacket{r.normalizeVideoPTS(avp)}, nil
 
 	case pkt, ok := <-audioSubCh:
 		if !ok {
@@ -297,7 +297,7 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if pkt.AV == nil || !pkt.AV.Codec.IsAudio() {
 			return nil, nil
 		}
-		return []domain.AVPacket{*pkt.AV}, nil
+		return []domain.AVPacket{r.normalizeAudioPTS(*pkt.AV)}, nil
 
 	case avp, ok := <-audioABRCh:
 		if !ok {
@@ -306,8 +306,51 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if !avp.Codec.IsAudio() {
 			return nil, nil
 		}
-		return []domain.AVPacket{avp}, nil
+		return []domain.AVPacket{r.normalizeAudioPTS(avp)}, nil
 	}
+}
+
+// normalizeVideoPTS rebases av's PTS / DTS so the video track starts at 0,
+// using the first observed DTS as the origin. Re-anchors on Discontinuity
+// so source resets (HLS loop-around, RTSP reconnect with a fresh clock)
+// never carry stale offsets forward. Returns av by value so callers do not
+// mutate buffer-hub-owned packets.
+//
+// See the (videoPTSBase, audioPTSBase) field comment for why this exists.
+func (r *MixerReader) normalizeVideoPTS(av domain.AVPacket) domain.AVPacket {
+	if !r.videoPTSBaseSet || av.Discontinuity {
+		r.videoPTSBase = av.DTSms
+		r.videoPTSBaseSet = true
+	}
+	av.PTSms = subOrZero(av.PTSms, r.videoPTSBase)
+	av.DTSms = subOrZero(av.DTSms, r.videoPTSBase)
+	return av
+}
+
+// normalizeAudioPTS is the audio counterpart of normalizeVideoPTS, kept as
+// a separate method so the two timelines can re-anchor independently —
+// audio Discontinuity (e.g. failover to a backup audio source) does not
+// invalidate the video anchor and vice versa.
+func (r *MixerReader) normalizeAudioPTS(av domain.AVPacket) domain.AVPacket {
+	if !r.audioPTSBaseSet || av.Discontinuity {
+		r.audioPTSBase = av.DTSms
+		r.audioPTSBaseSet = true
+	}
+	av.PTSms = subOrZero(av.PTSms, r.audioPTSBase)
+	av.DTSms = subOrZero(av.DTSms, r.audioPTSBase)
+	return av
+}
+
+// subOrZero returns a-b for unsigned ms timestamps, clamping to 0 instead
+// of underflowing when b > a. Underflow is unlikely in practice (DTS is
+// monotonic from the demuxer) but does happen on B-frame reorder where
+// PTS dips below the most recent DTS — in that case the "correct" answer
+// is "presentation time at the anchor", which is 0.
+func subOrZero(a, b uint64) uint64 {
+	if a < b {
+		return 0
+	}
+	return a - b
 }
 
 // videoOpen reports whether either video mode has been initialised.
