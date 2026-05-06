@@ -32,3 +32,17 @@ type Info struct {
 func Get() Info {
 	return Info{Version: Version, Commit: Commit, BuiltAt: BuiltAt}
 }
+
+// UserAgent is the canonical product identifier this binary uses on
+// outbound requests (HLS / HTTP-TS / RTSP pulls). Downstream servers
+// surface this string in their play-session dashboards, so a stable
+// "Open-Streamer/<version>" form makes our pulls identifiable in
+// other operators' tooling.
+//
+// Format follows RFC 9110 §10.1.5 product-token convention
+// "<product>/<product-version>". When Version is the placeholder "dev"
+// (unstamped local build) we still emit it — operators want to see
+// that a dev build is calling them rather than guess.
+func UserAgent() string {
+	return "Open-Streamer/" + Version
+}

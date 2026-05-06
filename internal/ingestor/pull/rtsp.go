@@ -43,6 +43,7 @@ import (
 	"github.com/pion/rtp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
 const rtspChanSize = 16384
@@ -94,6 +95,7 @@ func (r *RTSPReader) Open(ctx context.Context) error {
 		Scheme:      u.Scheme,
 		Host:        u.Host,
 		ReadTimeout: connectTimeout,
+		UserAgent:   version.UserAgent(),
 	}
 	if err := c.Start(); err != nil {
 		r.abortOpen(pkts, done)

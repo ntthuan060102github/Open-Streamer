@@ -36,6 +36,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
 const (
@@ -418,6 +419,7 @@ func (r *HLSReader) fetchPlaylistOnce(ctx context.Context, playlistURL string) (
 	if err != nil {
 		return nil, fmt.Errorf("hls: build request: %w", err)
 	}
+	req.Header.Set("User-Agent", version.UserAgent())
 	for k, v := range r.input.Headers {
 		req.Header.Set(k, v)
 	}
@@ -465,6 +467,7 @@ func (r *HLSReader) fetchSegmentOnce(ctx context.Context, segURL string) ([]byte
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", version.UserAgent())
 	for k, v := range r.input.Headers {
 		req.Header.Set(k, v)
 	}

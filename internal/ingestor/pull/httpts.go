@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
 // httpTSReadBufSize is the per-Read scratch buffer. 32 KiB is a sweet spot:
@@ -76,6 +77,7 @@ func (r *HTTPTSReader) Open(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("httpts: build request %q: %w", r.input.URL, err)
 	}
+	req.Header.Set("User-Agent", version.UserAgent())
 	for k, v := range r.input.Headers {
 		req.Header.Set(k, v)
 	}
