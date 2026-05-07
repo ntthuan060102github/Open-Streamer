@@ -258,24 +258,71 @@ func TestTSBufferWriteCapsAcrossSmallChunks(t *testing.T) {
 // source, unsupported codec config) grew videoPS unbounded AND ran
 // bytes.ReplaceAll on the whole buffer per frame — quadratic in memory
 // and CPU, the dominant production OOM path observed in pprof.
+// keyframeAnnexB returns a synthetic Annex-B keyframe payload of approximately
+// `payloadSize` bytes — an IDR NAL (type 5) start code + 0x65 + filler.
+// tsmux.KeyFrameH264 detects NAL type 5 in the byte stream, so only the
+// header bytes need to be exact. Filler is arbitrary, used to inflate the
+// frame to the desired total size without altering the IDR detection.
+func keyframeAnnexB(payloadSize int) []byte {
+	if payloadSize < 5 {
+		payloadSize = 5
+	}
+	out := make([]byte, payloadSize)
+	out[0], out[1], out[2], out[3] = 0x00, 0x00, 0x00, 0x01
+	out[4] = 0x65 // NAL type 5 = IDR slice
+	return out
+}
+
 func TestAppendVideoPSLockedCapsAndSetsGiveUp(t *testing.T) {
 	t.Parallel()
 	p := &dashFMP4Packager{}
 
-	// First frame appends normally.
-	require.True(t, p.appendVideoPSLocked(make([]byte, 1024)),
+	// First IDR frame appends normally.
+	require.True(t, p.appendVideoPSLocked(keyframeAnnexB(1024)),
 		"under cap → caller should run tryInit")
 	require.Equal(t, 1024, len(p.videoPS))
 	require.False(t, p.videoPSGiveUp)
 
-	// Push a frame that crosses the cap.
-	huge := make([]byte, videoPSMaxBytes)
-	require.False(t, p.appendVideoPSLocked(huge),
-		"frame would exceed cap → caller must skip tryInit")
+	// Push an IDR frame that crosses the cap.
+	require.False(t, p.appendVideoPSLocked(keyframeAnnexB(videoPSMaxBytes)),
+		"keyframe would exceed cap → caller must skip tryInit")
 	require.True(t, p.videoPSGiveUp,
 		"give-up flag must be set so subsequent frames are also skipped")
 	require.Nil(t, p.videoPS,
 		"videoPS must be cleared on give-up so its capacity is released")
+}
+
+// P-frames carry no SPS/PPS — appending them to videoPS only burns the cap
+// without contributing to init detection. The keyframe filter MUST skip
+// P-frames silently so a long-GOP source (NVENC default 10 s) doesn't
+// latch videoPSGiveUp before the first IDR arrives.
+//
+// Regression guard for production failure: RTMP-loopback streams (test5)
+// reconnected mid-GOP, accumulated 250+ P-frames at ~150 KB each (~37 MB)
+// before the next IDR, hit the 4 MB cap, and stayed audio-only forever.
+func TestAppendVideoPSLockedSkipsPFrames(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{}
+
+	// Synthetic P-frame: NAL type 1 (non-IDR slice). 200 KB each.
+	pframe := make([]byte, 200*1024)
+	pframe[0], pframe[1], pframe[2], pframe[3] = 0x00, 0x00, 0x00, 0x01
+	pframe[4] = 0x41 // NAL type 1 = P slice (with nal_ref_idc=2)
+
+	// Push 250 P-frames (~50 MB total — way past the 4 MB cap if appended).
+	for range 250 {
+		require.False(t, p.appendVideoPSLocked(pframe),
+			"P-frame must be skipped — no SPS/PPS to extract")
+	}
+	require.False(t, p.videoPSGiveUp,
+		"videoPSGiveUp must NOT latch on P-frames — they were skipped, not appended")
+	require.Empty(t, p.videoPS,
+		"P-frames must not accumulate into videoPS")
+
+	// First IDR after the long P-only run still works.
+	require.True(t, p.appendVideoPSLocked(keyframeAnnexB(1024)),
+		"first IDR after P-only run must still trigger init")
+	require.Equal(t, 1024, len(p.videoPS))
 }
 
 // Once give-up is latched, ALL subsequent calls return false even for
@@ -354,7 +401,11 @@ func TestOnTSFrameBuildsVideoInitFromAVAnnexBKeyframe(t *testing.T) {
 	frame = append(frame, startCode...)
 	frame = append(frame, idr...)
 
-	p := &dashFMP4Packager{}
+	// streamDir MUST be a tempdir — onTSFrame's success path writes the
+	// init segment to disk via encodeInitToFile(streamDir/init_v.mp4).
+	// Without this, an empty streamDir resolves to the working directory
+	// and leaks "init_v.mp4" into internal/publisher/ alongside the test.
+	p := &dashFMP4Packager{streamDir: t.TempDir()}
 	require.Nil(t, p.videoInit, "video init starts unset")
 
 	p.onTSFrame(mpeg2.TS_STREAM_H264, frame, 1000, 1000)

@@ -223,3 +223,110 @@ func TestFeedWirePacketNilInputs(t *testing.T) {
 		t.Fatal("mux must not be allocated for empty AV packet")
 	}
 }
+
+// FindH264ParameterSets must locate SPS (NAL type 7) + PPS (NAL type 8)
+// inside an Annex-B byte stream. Both 4-byte and 3-byte start codes are
+// in production use (the muxer used by gomedia outputs 4-byte; some
+// embedded encoders / RTSP sources emit 3-byte).
+func TestFindH264ParameterSetsBothPresent(t *testing.T) {
+	// Realistic 1080p Main@4.0 SPS + a typical Main-profile PPS.
+	sps := []byte{0x67, 0x4d, 0x40, 0x28, 0xeb, 0x05, 0x07, 0x80, 0x44, 0x00}
+	pps := []byte{0x68, 0xee, 0x3c, 0x80}
+	idr := []byte{0x65, 0x88, 0x80, 0x40, 0x00, 0x00, 0x00}
+
+	startCode := []byte{0, 0, 0, 1}
+	stream := make([]byte, 0, 64)
+	stream = append(stream, startCode...)
+	stream = append(stream, sps...)
+	stream = append(stream, startCode...)
+	stream = append(stream, pps...)
+	stream = append(stream, startCode...)
+	stream = append(stream, idr...)
+
+	gotSPS, gotPPS := FindH264ParameterSets(stream)
+	if gotSPS == nil {
+		t.Fatal("SPS not found")
+	}
+	if gotPPS == nil {
+		t.Fatal("PPS not found")
+	}
+	if gotSPS[0]&0x1F != 7 {
+		t.Errorf("first byte of returned SPS is not nal_unit_type 7: 0x%x", gotSPS[0])
+	}
+	if gotPPS[0]&0x1F != 8 {
+		t.Errorf("first byte of returned PPS is not nal_unit_type 8: 0x%x", gotPPS[0])
+	}
+}
+
+// 3-byte Annex-B start codes (00 00 01) are valid and used by some
+// encoders. The scanner must accept them.
+func TestFindH264ParameterSets3ByteStartCode(t *testing.T) {
+	sps := []byte{0x67, 0x42, 0xc0, 0x1e}
+	pps := []byte{0x68, 0xce, 0x38, 0x80}
+
+	startCode := []byte{0, 0, 1}
+	stream := append([]byte{}, startCode...)
+	stream = append(stream, sps...)
+	stream = append(stream, startCode...)
+	stream = append(stream, pps...)
+
+	gotSPS, gotPPS := FindH264ParameterSets(stream)
+	if gotSPS == nil || gotSPS[0]&0x1F != 7 {
+		t.Errorf("SPS missing/wrong type: %v", gotSPS)
+	}
+	if gotPPS == nil || gotPPS[0]&0x1F != 8 {
+		t.Errorf("PPS missing/wrong type: %v", gotPPS)
+	}
+}
+
+// SPS without a trailing NAL still returns the SPS body up to end of
+// buffer. (PPS missing returns nil for PPS — caller handles.)
+func TestFindH264ParameterSetsSPSOnlyAtEnd(t *testing.T) {
+	sps := []byte{0x67, 0x42, 0xc0, 0x1e, 0xff, 0xee}
+	stream := append([]byte{0, 0, 0, 1}, sps...)
+
+	gotSPS, gotPPS := FindH264ParameterSets(stream)
+	if gotSPS == nil {
+		t.Fatal("SPS not found")
+	}
+	if len(gotSPS) != len(sps) {
+		t.Errorf("SPS body length = %d, want %d", len(gotSPS), len(sps))
+	}
+	if gotPPS != nil {
+		t.Errorf("PPS should be nil when not present, got %v", gotPPS)
+	}
+}
+
+// Bytes containing no NAL units at all return both nil — the caller's
+// "wait until both cached" loop then keeps scanning subsequent chunks.
+func TestFindH264ParameterSetsAbsent(t *testing.T) {
+	junk := []byte{0xde, 0xad, 0xbe, 0xef, 0x47, 0x40, 0x00, 0x00}
+	gotSPS, gotPPS := FindH264ParameterSets(junk)
+	if gotSPS != nil || gotPPS != nil {
+		t.Errorf("non-NAL bytes must not yield SPS/PPS, got SPS=%v PPS=%v", gotSPS, gotPPS)
+	}
+}
+
+// The returned slices must be COPIES of the matched bytes — caller may
+// retain them long-term while the input buffer is reused.
+func TestFindH264ParameterSetsReturnsCopies(t *testing.T) {
+	sps := []byte{0x67, 0x42, 0xc0, 0x1e}
+	pps := []byte{0x68, 0xce, 0x38, 0x80}
+	stream := make([]byte, 0, 4+len(sps)+4+len(pps))
+	stream = append(stream, 0, 0, 0, 1)
+	stream = append(stream, sps...)
+	stream = append(stream, 0, 0, 0, 1)
+	stream = append(stream, pps...)
+
+	gotSPS, gotPPS := FindH264ParameterSets(stream)
+	// Mutate the input — returned slices must be unaffected.
+	for i := range stream {
+		stream[i] = 0xAA
+	}
+	if gotSPS[0] != 0x67 {
+		t.Errorf("SPS was a slice into input; expected copy, got first byte 0x%x", gotSPS[0])
+	}
+	if gotPPS[0] != 0x68 {
+		t.Errorf("PPS was a slice into input; expected copy, got first byte 0x%x", gotPPS[0])
+	}
+}

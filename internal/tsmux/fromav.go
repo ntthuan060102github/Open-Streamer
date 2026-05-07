@@ -109,3 +109,80 @@ func FeedWirePacket(ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]by
 	}
 	(*mux).Write(av, onTS)
 }
+
+// FindH264ParameterSets scans raw bytes for the first NAL units of type 7
+// (SPS) and type 8 (PPS) and returns their bodies (without start codes).
+// Detects both 4-byte (00 00 00 01) and 3-byte (00 00 01) Annex-B start
+// codes. Returns nil for any NAL not present.
+//
+// Use case: the publisher's serve_rtmp pipeline needs SPS/PPS to build
+// the AVCDecoderConfigurationRecord seq header tag, but receives raw TS
+// from the buffer hub (no AV packets). gomedia's TSDemuxer should
+// preserve SPS/PPS in OnFrame access-unit bytes per its source, but
+// some upstream code paths or stream variations have produced frames
+// without parameter sets. Scanning raw TS bytes is a defensive
+// fallback that does NOT depend on the demuxer's frame-splitting
+// behaviour — at the cost of false positives if SPS-shaped bytes
+// appear inside payload data (rare in practice for short scans).
+//
+// This is a best-effort scan: NAL units split across TS-packet
+// boundaries (with adaptation-field stuffing) may be missed. For SPS
+// (~30 bytes for typical 1080p H264) this is unlikely since the whole
+// NAL fits within a single 184-byte TS payload. PPS is even smaller.
+//
+// Caller should retain the returned slices (do not reference into the
+// input — we copy out so subsequent buffer reuse cannot corrupt the
+// cached parameter sets).
+func FindH264ParameterSets(raw []byte) (sps, pps []byte) {
+	sps = findNALWithType(raw, 7)
+	pps = findNALWithType(raw, 8)
+	return sps, pps
+}
+
+// findNALWithType returns the first NAL with the given nal_unit_type
+// (low 5 bits of the NAL header byte) in `raw`, or nil when not found.
+// Matches both 4-byte (00 00 00 01) and 3-byte (00 00 01) Annex-B start
+// codes and on `(headerByte & 0x1F) == nalType`, so any nal_ref_idc
+// (high bits) accepts — production streams use 0x67 (nal_ref_idc=3,
+// type=7) for SPS but in principle 0x07 (nal_ref_idc=0) is also valid.
+func findNALWithType(raw []byte, nalType byte) []byte {
+	for i := 0; i+4 < len(raw); i++ {
+		if raw[i] != 0x00 {
+			continue
+		}
+		// 4-byte start code: 00 00 00 01
+		if i+4 < len(raw) && raw[i+1] == 0x00 && raw[i+2] == 0x00 && raw[i+3] == 0x01 {
+			if raw[i+4]&0x1F == nalType {
+				return extractNALBody(raw, i+4)
+			}
+		}
+		// 3-byte start code: 00 00 01
+		if i+3 < len(raw) && raw[i+1] == 0x00 && raw[i+2] == 0x01 {
+			if raw[i+3]&0x1F == nalType {
+				return extractNALBody(raw, i+3)
+			}
+		}
+	}
+	return nil
+}
+
+// extractNALBody returns the bytes of a single NAL starting at startIdx
+// (which points to the NAL header byte itself) up to the next start code
+// or end of raw. Caller must ensure startIdx is within bounds.
+func extractNALBody(raw []byte, startIdx int) []byte {
+	if startIdx >= len(raw) {
+		return nil
+	}
+	// Search forward for the next start code; the NAL ends just before it.
+	end := len(raw)
+	for i := startIdx + 1; i+2 < len(raw); i++ {
+		if raw[i] == 0x00 && raw[i+1] == 0x00 && (raw[i+2] == 0x01 ||
+			(i+3 < len(raw) && raw[i+2] == 0x00 && raw[i+3] == 0x01)) {
+			end = i
+			break
+		}
+	}
+	out := make([]byte, end-startIdx)
+	copy(out, raw[startIdx:end])
+	return out
+}

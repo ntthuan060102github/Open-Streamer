@@ -89,6 +89,46 @@ func NewRTMPFrameWriter(session *rtmp.ServerSession) *RTMPFrameWriter {
 	return &RTMPFrameWriter{session: session}
 }
 
+// PreloadAvcSeqHeader builds + sends the AVC sequence header tag using the
+// supplied SPS/PPS NAL bytes (Annex-B form, no start codes), bypassing the
+// usual "wait for first frame containing SPS+PPS" path in writeH264.
+//
+// Use case: the publisher's H264 frame source can't deliver SPS/PPS in
+// the access unit (e.g. gomedia's TSDemuxer strips parameter-set NAL
+// units before invoking OnFrame, so the writer never sees them in the
+// per-frame Annex-B). Without this preload, writeH264 drops every frame
+// silently waiting for SPS that never arrives, and downstream RTMP
+// clients (e.g. test5's lal puller) never receive the seq header tag,
+// leaving their AVCDecoderConfigurationRecord cache empty — every
+// subsequent IDR they propagate downstream lacks SPS/PPS too.
+//
+// Caller must extract SPS+PPS from elsewhere (e.g. raw TS PES scan in
+// the publisher's producer goroutine) and invoke this BEFORE the first
+// WriteFrame so onMetaData and seq header tags land at timestamp 0.
+//
+// Idempotent: subsequent calls are no-ops once avcSeqSent is true.
+func (w *RTMPFrameWriter) PreloadAvcSeqHeader(sps, pps []byte) error {
+	if w.avcSeqSent || len(sps) == 0 || len(pps) == 0 {
+		return nil
+	}
+	var ctx avc.Context
+	if err := avc.ParseSps(sps, &ctx); err == nil {
+		w.width, w.height = ctx.Width, ctx.Height
+	}
+	if err := w.sendMetadata(); err != nil {
+		return err
+	}
+	seqTag, err := avc.BuildSeqHeaderFromSpsPps(sps, pps)
+	if err != nil {
+		return fmt.Errorf("rtmp writer: build avc seq header (preload): %w", err)
+	}
+	if err := w.send(base.RtmpTypeIdVideo, 0, seqTag); err != nil {
+		return err
+	}
+	w.avcSeqSent = true
+	return nil
+}
+
 // WriteFrame sends one access unit. dts/pts are RTMP wire timestamps in
 // milliseconds. Returns an error if the underlying TCP write fails.
 //

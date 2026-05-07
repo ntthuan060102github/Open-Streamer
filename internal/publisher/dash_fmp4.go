@@ -540,17 +540,40 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 	}
 }
 
-// appendVideoPSLocked appends an Annex-B frame's bytes to videoPS for
+// isKeyFrameAnnexB reports whether the Annex-B frame contains an IDR /
+// IRAP slice. Picks the codec-specific scanner based on the packager's
+// HEVC flag — set in onTSFrame the first time an H265 stream type is
+// observed, false for the H264 default.
+func isKeyFrameAnnexB(frame []byte, isHEVC bool) bool {
+	if isHEVC {
+		return tsmux.KeyFrameH265(frame)
+	}
+	return tsmux.KeyFrameH264(frame)
+}
+
+// appendVideoPSLocked appends an Annex-B keyframe's bytes to videoPS for
 // SPS/PPS extraction, capped at videoPSMaxBytes. Returns true when the
-// caller should run tryInitVideo*Locked, false when the cap is reached
-// or already exceeded — in that case we set videoPSGiveUp so subsequent
-// frames skip both the append AND the tryInit call entirely (tryInit's
-// quadratic bytes.ReplaceAll on a multi-MiB buffer is the worst part of
-// the leak; avoiding it past the cap is the actual mitigation).
+// caller should run tryInitVideo*Locked.
+//
+// P-frames are skipped (return false, no append) because they never
+// contain SPS/PPS — only IDR access units do. Without this filter, a
+// long-GOP source (e.g. NVENC's 10-second default) would fill videoPS
+// with megabytes of P-frame slices BEFORE the first IDR arrived, hit
+// the cap, and latch videoPSGiveUp permanently. Production observed
+// this with RTMP-loopback streams: 250 P-frames × ~150 KB = ~37 MB
+// well past the 4 MB cap, give-up triggered before the first IDR's
+// SPS|PPS prefix could be seen, and the stream stayed audio-only.
 //
 // Caller must hold p.mu.
 func (p *dashFMP4Packager) appendVideoPSLocked(frame []byte) bool {
 	if p.videoPSGiveUp {
+		return false
+	}
+	if !isKeyFrameAnnexB(frame, p.isHEVC) {
+		// P-frame — has no SPS/PPS, contributes nothing to init detection.
+		// Skip silently to keep videoPS bounded by ONE GOP's worth of
+		// keyframes (typical: 1-2 IDRs) rather than every frame in the
+		// stream until init is built.
 		return false
 	}
 	if len(p.videoPS)+len(frame) > videoPSMaxBytes {

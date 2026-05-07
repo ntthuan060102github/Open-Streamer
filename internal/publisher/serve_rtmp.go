@@ -70,8 +70,11 @@ func (s *Service) HandleRTMPPlay(
 	writeFrame := func(kind push.FrameKind, data []byte, pts, dts uint32) error {
 		return writer.WriteFrame(kind, data, pts, dts)
 	}
+	preloadSeq := func(sps, pps []byte) error {
+		return writer.PreloadAvcSeqHeader(sps, pps)
+	}
 
-	runRTMPPlayPipeline(ctx, code, sub, rtmpSess, writeFrame)
+	runRTMPPlayPipeline(ctx, code, sub, rtmpSess, writeFrame, preloadSeq)
 	return nil
 }
 
@@ -80,12 +83,24 @@ func (s *Service) HandleRTMPPlay(
 // runRTMPPlayPipeline feeds TS from sub into a TSDemuxer and writes H.264/AAC
 // frames via writeFrame until ctx is cancelled or sub closes. The sess argument
 // is credited with each frame's payload bytes for the play-sessions API.
+//
+// preloadSeq is invoked once per pipeline run when the producer goroutine first
+// observes a complete SPS+PPS pair in the raw TS bytes. The downstream RTMP
+// frame writer uses this to send the AVC sequence header tag without waiting
+// for SPS+PPS to appear in a per-frame Annex-B payload — necessary because
+// gomedia's TSDemuxer can deliver access-unit bytes that don't include
+// parameter-set NAL units, leaving the writer's "wait for SPS in frame"
+// path stuck and pulling clients (test5) without a parsed
+// AVCDecoderConfigurationRecord, so their own IDR keyframes never carry
+// SPS/PPS downstream. nil is acceptable for tests that don't exercise the
+// preload path.
 func runRTMPPlayPipeline(
 	ctx context.Context,
 	streamCode domain.StreamCode,
 	sub *buffer.Subscriber,
 	sess *playSession,
 	writeFrame func(kind push.FrameKind, data []byte, pts, dts uint32) error,
+	preloadSeq func(sps, pps []byte) error,
 ) {
 	tb := newTSBuffer(streamCode)
 
@@ -93,6 +108,13 @@ func runRTMPPlayPipeline(
 		defer tb.Close()
 		var tsCarry []byte
 		var avMux *tsmux.FromAV
+		// SPS/PPS scanner state. We keep scanning every TS chunk until both
+		// are found, then stop and call preloadSeq once. The writer is
+		// idempotent past the first preload, so a stray re-trigger (which
+		// can't happen here because of the cachedSeqSent flag) would be
+		// harmless anyway.
+		var cachedSPS, cachedPPS []byte
+		cachedSeqSent := false
 
 		for {
 			select {
@@ -107,6 +129,32 @@ func runRTMPPlayPipeline(
 					tsCarry = nil
 				}
 				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+					// Scan b for SPS/PPS until both cached, then preload
+					// the writer once. Defensive against gomedia's
+					// TSDemuxer occasionally delivering access units
+					// without parameter-set NAL units (observed in
+					// production for RTMP-loopback streams: the writer's
+					// extract-from-frame path then drops every frame
+					// silently, no seq header tag is sent, and pulling
+					// clients can't decode video).
+					if !cachedSeqSent {
+						if cachedSPS == nil || cachedPPS == nil {
+							sps, pps := tsmux.FindH264ParameterSets(b)
+							if sps != nil && cachedSPS == nil {
+								cachedSPS = sps
+							}
+							if pps != nil && cachedPPS == nil {
+								cachedPPS = pps
+							}
+						}
+						if cachedSPS != nil && cachedPPS != nil && preloadSeq != nil {
+							if err := preloadSeq(cachedSPS, cachedPPS); err != nil {
+								slog.Warn("publisher: RTMP preload seq header failed",
+									"stream_code", streamCode, "err", err)
+							}
+							cachedSeqSent = true
+						}
+					}
 					tsCarry = append(tsCarry, b...)
 					for len(tsCarry) >= 188 {
 						if tsCarry[0] != 0x47 {
