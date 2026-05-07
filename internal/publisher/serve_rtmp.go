@@ -87,7 +87,7 @@ func runRTMPPlayPipeline(
 	sess *playSession,
 	writeFrame func(kind push.FrameKind, data []byte, pts, dts uint32) error,
 ) {
-	tb := newTSBuffer()
+	tb := newTSBuffer(streamCode)
 
 	go func() {
 		defer tb.Close()

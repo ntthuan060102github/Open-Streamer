@@ -139,6 +139,14 @@ type dashFMP4Packager struct {
 	vPTS    []uint64 // ms
 	videoPS []byte   // aggregate SPS+PPS bytes for init detection (cleared after init)
 
+	// videoPSGiveUp is set when the accumulated SPS/PPS buffer exceeded
+	// videoPSMaxBytes without a successful init — at that point we stop
+	// appending new frames into videoPS so the buffer doesn't keep
+	// growing forever on a source that never emits a parseable parameter
+	// set. The DASH stream stays video-init-less in that case (audio-only
+	// playback if audio is present) which is far better than OOM.
+	videoPSGiveUp bool
+
 	// Audio frame queue — raw AAC (ADTS header stripped).
 	aRaw [][]byte
 	aPTS []uint64 // ms
@@ -206,7 +214,7 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 	// This replaces io.Pipe (unbuffered) which caused the producer goroutine to
 	// block on Write while the demuxer held p.mu in onTSFrame, preventing the
 	// producer from reading new packets; the buffer hub then dropped them.
-	tb := newTSBuffer()
+	tb := newTSBuffer(p.streamID)
 
 	// Producer: buffer → FeedWirePacket → aligned TS → tb.
 	go func() {
@@ -365,9 +373,9 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		p.vDTS = append(p.vDTS, dts)
 		p.vPTS = append(p.vPTS, pts)
 
-		// Accumulate SPS/PPS until the init segment is written.
-		if p.videoInit == nil {
-			p.videoPS = append(p.videoPS, cp...)
+		// Accumulate SPS/PPS until the init segment is written. Capped by
+		// videoPSMaxBytes — see appendVideoPSLocked for the rationale.
+		if p.videoInit == nil && p.appendVideoPSLocked(cp) {
 			pending = p.tryInitVideoLocked()
 		}
 		p.seedVideoNextDecodeLocked()
@@ -391,8 +399,9 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 
 		if p.videoInit == nil {
 			p.isHEVC = true
-			p.videoPS = append(p.videoPS, cp...)
-			pending = p.tryInitVideoH265Locked()
+			if p.appendVideoPSLocked(cp) {
+				pending = p.tryInitVideoH265Locked()
+			}
 		}
 		p.seedVideoNextDecodeLocked()
 		if p.segmentStart.IsZero() && p.videoInit != nil {
@@ -469,6 +478,33 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 		}
 	}
+}
+
+// appendVideoPSLocked appends an Annex-B frame's bytes to videoPS for
+// SPS/PPS extraction, capped at videoPSMaxBytes. Returns true when the
+// caller should run tryInitVideo*Locked, false when the cap is reached
+// or already exceeded — in that case we set videoPSGiveUp so subsequent
+// frames skip both the append AND the tryInit call entirely (tryInit's
+// quadratic bytes.ReplaceAll on a multi-MiB buffer is the worst part of
+// the leak; avoiding it past the cap is the actual mitigation).
+//
+// Caller must hold p.mu.
+func (p *dashFMP4Packager) appendVideoPSLocked(frame []byte) bool {
+	if p.videoPSGiveUp {
+		return false
+	}
+	if len(p.videoPS)+len(frame) > videoPSMaxBytes {
+		slog.Error("publisher: DASH videoPS exceeded cap without finding SPS/PPS — giving up video init for this stream",
+			"stream_code", p.streamID,
+			"videoPS_size", len(p.videoPS),
+			"cap_bytes", videoPSMaxBytes,
+		)
+		p.videoPS = nil
+		p.videoPSGiveUp = true
+		return false
+	}
+	p.videoPS = append(p.videoPS, frame...)
+	return true
 }
 
 // tryInitVideoLocked scans videoPS for SPS/PPS and, when found, prepares init_v.mp4.
@@ -1039,34 +1075,93 @@ func encodeInitToFile(path string, init *mp4.InitSegment) error {
 	return writeFileAtomic(path, buf.Bytes())
 }
 
-// tsBuffer is a goroutine-safe, unbounded byte buffer implementing io.Reader and
-// io.Writer. Unlike io.Pipe, Write never blocks; Read blocks only when the buffer
-// is empty, and returns io.EOF once the buffer is closed and drained.
+// videoPSMaxBytes caps the SPS/PPS accumulation buffer used by
+// tryInitVideoLocked. A normal H.264/H.265 parameter set is < 1 KiB; we
+// allow 4 MiB which is ~16 seconds of 25 fps video frames mistakenly
+// accumulated before the source's first parseable SPS. Past that we
+// log ERROR and stop appending — the prior code grew videoPS unbounded
+// and called bytes.ReplaceAll on the whole buffer per frame, which is
+// quadratic in memory and CPU when init never completes (observed in
+// production: 170 MB held by bytes.Replace from this path).
+const videoPSMaxBytes = 4 << 20
+
+// tsBufferMaxBytes caps the in-flight backlog tsBuffer holds before dropping
+// the oldest data. Sized at 16 MiB which is ~1 second of the highest-bitrate
+// rendition we publish (4500 kbps video + 128 kbps audio) plus generous
+// headroom for keyframe spikes. A normal demuxer drains within a few
+// milliseconds, so any backlog approaching this cap means the consumer is
+// seriously stalled — at that point dropping is preferable to OOM since
+// the demuxer can resync from the next PAT/PMT once the cap is cleared.
+const tsBufferMaxBytes = 16 << 20
+
+// tsBuffer is a goroutine-safe, bounded byte buffer implementing io.Reader and
+// io.Writer. Unlike io.Pipe, Write never blocks; instead, when the buffered
+// backlog would exceed tsBufferMaxBytes it discards the entire backlog and
+// logs a warning. Read blocks only when the buffer is empty, and returns
+// io.EOF once the buffer is closed and drained.
 //
 // This is used to decouple the packet-producer goroutine from the TS demuxer
 // goroutine. With io.Pipe, a slow demuxer (holding p.mu in onTSFrame) would
 // block the producer's Write, preventing it from reading new packets; the buffer
 // hub then drops them with the "slow consumer" path, starving the segment queue.
+//
+// Drop policy: when an incoming Write would push the backlog past the cap,
+// we drop the ENTIRE buffered backlog (not just the oldest N bytes). MPEG-TS
+// is self-synchronising — the demuxer recovers cleanly from the next PAT/PMT
+// in the new data — so dropping at a packet boundary is unnecessary. Dropping
+// the whole backlog also bounds the worst-case held memory to ~tsBufferMaxBytes
+// no matter how persistent the consumer stall is.
 type tsBuffer struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-	buf  []byte
-	done bool
+	mu          sync.Mutex
+	cond        *sync.Cond
+	buf         []byte
+	done        bool
+	streamID    domain.StreamCode // for log context on drop; "" in tests
+	dropCount   int64             // cumulative drop events (not bytes) — for metrics later if needed
+	droppedSize int64             // cumulative bytes dropped on overflow
 }
 
-func newTSBuffer() *tsBuffer {
-	b := &tsBuffer{}
+// newTSBuffer creates a tsBuffer tagged with streamID for log context on
+// overflow drops. Pass empty string from tests / call sites where the
+// stream code is not meaningful.
+func newTSBuffer(streamID domain.StreamCode) *tsBuffer {
+	b := &tsBuffer{streamID: streamID}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
 
-// Write appends p to the internal buffer and wakes any blocked Read. Never blocks.
+// Write appends p to the internal buffer and wakes any blocked Read. Never
+// blocks. When the existing backlog plus p would exceed tsBufferMaxBytes the
+// existing backlog is discarded before appending p — the demuxer resyncs from
+// the new data's next PAT/PMT. Returns len(p), nil even on the drop path so
+// callers don't see partial writes (the producer goroutine has nothing useful
+// to do with a "buffer full" error here; the drop is the recovery action).
 func (b *tsBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	if b.done {
 		b.mu.Unlock()
 		return 0, io.ErrClosedPipe
 	}
+	if len(b.buf)+len(p) > tsBufferMaxBytes && len(b.buf) > 0 {
+		dropped := len(b.buf)
+		b.buf = nil
+		b.dropCount++
+		b.droppedSize += int64(dropped)
+		// Log inside the lock so the drop accounting and the log line can't
+		// race against a concurrent drop. The lock is held briefly anyway.
+		slog.Warn("publisher: tsBuffer overflow, dropped backlog (demuxer will resync from next PAT/PMT)",
+			"stream_code", string(b.streamID),
+			"dropped_bytes", dropped,
+			"incoming_bytes", len(p),
+			"cap_bytes", tsBufferMaxBytes,
+			"drop_count", b.dropCount,
+			"dropped_total_bytes", b.droppedSize,
+		)
+	}
+	// If incoming alone exceeds the cap (pathological producer chunk), still
+	// accept it so the demuxer at least sees ONE recent packet to resync from.
+	// This is unbounded only for that single chunk — append doesn't grow
+	// across calls because of the drop above.
 	b.buf = append(b.buf, p...)
 	b.cond.Signal()
 	b.mu.Unlock()
@@ -1075,6 +1170,15 @@ func (b *tsBuffer) Write(p []byte) (int, error) {
 
 // Read fills p from the internal buffer, blocking until data is available or
 // the buffer is closed.
+//
+// When the slice is fully drained we reset b.buf to nil so the underlying
+// array becomes GC-eligible. Without this, `b.buf = b.buf[n:]` only advances
+// the slice header — the array allocated by Write retains its peak capacity
+// for the lifetime of the buffer. With a slow-consumer burst that pushed the
+// array to e.g. 100 MiB, that 100 MiB stays pinned across all subsequent
+// drain/refill cycles. Multiplied across one tsBuffer per DASH stream, this
+// is the dominant heap leak observed in pprof when multiple DASH publishers
+// run concurrently (peak burst size never reclaimed).
 func (b *tsBuffer) Read(p []byte) (int, error) {
 	b.mu.Lock()
 	for len(b.buf) == 0 && !b.done {
@@ -1086,6 +1190,12 @@ func (b *tsBuffer) Read(p []byte) (int, error) {
 	}
 	n := copy(p, b.buf)
 	b.buf = b.buf[n:]
+	if len(b.buf) == 0 {
+		// Drop the underlying array reference so GC reclaims the peak
+		// capacity. Subsequent Write triggers a fresh allocation sized
+		// to the actual incoming chunk, not the historical high-water mark.
+		b.buf = nil
+	}
 	b.mu.Unlock()
 	return n, nil
 }

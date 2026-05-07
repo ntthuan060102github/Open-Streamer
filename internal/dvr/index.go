@@ -125,6 +125,18 @@ func parsePlaylist(segDir string) ([]segmentMeta, error) {
 				size:          size,
 				discontinuity: pendingDisc,
 			})
+			// Advance pendingWall by this segment's duration so subsequent
+			// segments without their own EXT-X-PROGRAM-DATE-TIME inherit a
+			// correctly accumulating wall-clock — writePlaylist only emits
+			// PDT once per discontinuity group, not per segment, so without
+			// this advance every segment in a group ends up with the same
+			// wallTime as the first one. That collapse is what made the
+			// timeshift handler return NO_SEGMENTS_IN_RANGE for any `from`
+			// past the first segment's end (every segEnd = first.wallTime
+			// + first.duration, never reaching the requested startTime).
+			if !pendingWall.IsZero() {
+				pendingWall = pendingWall.Add(pendingDur)
+			}
 			pendingDisc = false
 			hasDur = false
 			_ = needDateTime

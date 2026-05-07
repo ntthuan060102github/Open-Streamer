@@ -147,3 +147,138 @@ func TestSeedersPreserveAudioVideoOffset(t *testing.T) {
 	require.Equal(t, uint64(9000), p.videoNextDecode,
 		"video starts 100ms past origin → 9000 ticks at 90 kHz")
 }
+
+// ─── tsBuffer leak guards ────────────────────────────────────────────────────
+//
+// Three production-observed leaks in the DASH packager paths:
+//   - tsBuffer.Read advanced the slice header but kept the peak-capacity
+//     underlying array alive, so a one-time burst pinned RAM forever.
+//   - tsBuffer.Write was unbounded — slow demuxer → backlog grew without
+//     limit until OOM.
+//   - dashFMP4Packager.videoPS grew on every video frame until init
+//     completed, AND tryInitVideoLocked called bytes.ReplaceAll on the
+//     whole buffer per frame → quadratic memory + CPU when the source
+//     never emitted parseable SPS/PPS.
+//
+// These tests pin the fix behaviour so future refactors don't regress.
+
+// Read on a fully-drained buffer must release the underlying array, not
+// just advance the slice header. Without this, a one-off Write of N MiB
+// retains N MiB across the buffer's lifetime.
+func TestTSBufferReadReleasesUnderlyingArrayWhenDrained(t *testing.T) {
+	t.Parallel()
+	b := newTSBuffer("")
+
+	big := make([]byte, 4<<20) // 4 MiB
+	_, err := b.Write(big)
+	require.NoError(t, err)
+	require.Equal(t, 4<<20, cap(b.buf), "underlying array should hold the burst")
+
+	out := make([]byte, 4<<20)
+	n, err := b.Read(out)
+	require.NoError(t, err)
+	require.Equal(t, 4<<20, n)
+	require.Nil(t, b.buf,
+		"after fully draining, buf must be reset to nil so the 4 MiB array is GC-eligible — slicing alone keeps the array pinned")
+}
+
+// Write past the cap must drop the existing backlog (not just truncate it
+// to the cap) and append the fresh data. The demuxer recovers from the
+// next PAT/PMT in the new bytes — partial backlog + fresh data would
+// confuse it more than a clean reset.
+func TestTSBufferWriteDropsBacklogOnOverflow(t *testing.T) {
+	t.Parallel()
+	b := newTSBuffer("test-stream")
+
+	// Fill to just under the cap.
+	first := make([]byte, tsBufferMaxBytes-1024)
+	_, err := b.Write(first)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), b.dropCount, "no overflow yet")
+
+	// 2 KiB extra would push past the cap → triggers drop.
+	overflow := make([]byte, 2048)
+	n, err := b.Write(overflow)
+	require.NoError(t, err)
+	require.Equal(t, 2048, n, "Write must report success even on the drop path")
+	require.Equal(t, int64(1), b.dropCount, "exactly one drop event")
+	require.Equal(t, int64(tsBufferMaxBytes-1024), b.droppedSize,
+		"droppedSize must reflect the discarded backlog")
+	require.Equal(t, 2048, len(b.buf),
+		"after drop, buf holds only the fresh chunk (the demuxer needs SOMETHING to resync from)")
+}
+
+// Multiple drops accumulate counters so operators can see chronic
+// overflow in metrics, not just the most recent event.
+func TestTSBufferWriteAccumulatesDropCounters(t *testing.T) {
+	t.Parallel()
+	b := newTSBuffer("")
+
+	chunk := make([]byte, tsBufferMaxBytes)
+	// First write fills exactly to cap.
+	_, _ = b.Write(chunk)
+	// Each subsequent write triggers a drop.
+	_, _ = b.Write(chunk)
+	_, _ = b.Write(chunk)
+
+	require.Equal(t, int64(2), b.dropCount, "two overflow events")
+	require.Equal(t, int64(2*tsBufferMaxBytes), b.droppedSize,
+		"each drop discards a full cap's worth")
+}
+
+// Cap is enforced regardless of whether the producer writes one big chunk
+// or many small chunks — the cap is on backlog size, not per-call.
+func TestTSBufferWriteCapsAcrossSmallChunks(t *testing.T) {
+	t.Parallel()
+	b := newTSBuffer("")
+
+	chunk := make([]byte, 1<<20) // 1 MiB chunks
+	for range 16 {
+		_, _ = b.Write(chunk)
+	}
+	require.Equal(t, 16<<20, len(b.buf), "exactly at cap")
+	require.Equal(t, int64(0), b.dropCount, "no drops yet — exactly at cap")
+
+	_, _ = b.Write(chunk) // one more MiB → drop
+	require.Equal(t, int64(1), b.dropCount)
+}
+
+// videoPS append must stop growing past the cap and set the give-up flag.
+// Without this, a stream that never emits a parseable SPS/PPS (malformed
+// source, unsupported codec config) grew videoPS unbounded AND ran
+// bytes.ReplaceAll on the whole buffer per frame — quadratic in memory
+// and CPU, the dominant production OOM path observed in pprof.
+func TestAppendVideoPSLockedCapsAndSetsGiveUp(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{}
+
+	// First frame appends normally.
+	require.True(t, p.appendVideoPSLocked(make([]byte, 1024)),
+		"under cap → caller should run tryInit")
+	require.Equal(t, 1024, len(p.videoPS))
+	require.False(t, p.videoPSGiveUp)
+
+	// Push a frame that crosses the cap.
+	huge := make([]byte, videoPSMaxBytes)
+	require.False(t, p.appendVideoPSLocked(huge),
+		"frame would exceed cap → caller must skip tryInit")
+	require.True(t, p.videoPSGiveUp,
+		"give-up flag must be set so subsequent frames are also skipped")
+	require.Nil(t, p.videoPS,
+		"videoPS must be cleared on give-up so its capacity is released")
+}
+
+// Once give-up is latched, ALL subsequent calls return false even for
+// tiny frames — no recovery path. This is intentional: a stream that
+// failed to deliver SPS/PPS in the first 4 MiB of video frames is
+// pathological enough that retrying forever wastes CPU on bytes.Replace.
+func TestAppendVideoPSLockedStaysLatchedAfterGiveUp(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{videoPSGiveUp: true}
+
+	for range 10 {
+		require.False(t, p.appendVideoPSLocked([]byte{0x00, 0x00, 0x00, 0x01}),
+			"give-up is sticky")
+	}
+	require.Nil(t, p.videoPS, "no append happens after give-up")
+}

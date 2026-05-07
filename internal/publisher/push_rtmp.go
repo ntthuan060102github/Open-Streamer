@@ -141,7 +141,7 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 	// asynchronously into our connErr so the demuxer loop unwinds promptly.
 	go p.watchSessionExit()
 
-	tb := newTSBuffer()
+	tb := newTSBuffer(p.streamID)
 	p.tsBuf = tb
 	go p.feedLoop(ctx, sub, tb)
 

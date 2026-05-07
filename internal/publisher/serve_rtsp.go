@@ -326,7 +326,7 @@ func runRTSPPipeline(
 		if demuxBuf != nil {
 			return
 		}
-		demuxBuf = newTSBuffer()
+		demuxBuf = newTSBuffer(streamCode)
 		demuxDone = make(chan error, 1)
 		demux := mpeg2.NewTSDemuxer()
 		demux.OnFrame = sess.onTSFrame
