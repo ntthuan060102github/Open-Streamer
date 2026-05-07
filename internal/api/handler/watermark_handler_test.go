@@ -122,9 +122,9 @@ func newWatermarkHandlerForTest(t *testing.T) (*WatermarkHandler, *stubWatermark
 	return &WatermarkHandler{svc: svc, bus: bus}, svc, bus
 }
 
-func wmReq(t *testing.T, method, path string, body []byte, params map[string]string) *http.Request {
+func wmReq(t *testing.T, method, path string, params map[string]string) *http.Request {
 	t.Helper()
-	r := httptest.NewRequestWithContext(t.Context(), method, path, bytes.NewReader(body))
+	r := httptest.NewRequestWithContext(t.Context(), method, path, http.NoBody)
 	rctx := chi.NewRouteContext()
 	for k, v := range params {
 		rctx.URLParams.Add(k, v)
@@ -154,7 +154,7 @@ func TestWatermarkHandler_Get_Found(t *testing.T) {
 	svc.assets["abc"] = &domain.WatermarkAsset{ID: "abc", Name: "logo"}
 
 	w := httptest.NewRecorder()
-	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/abc", nil, map[string]string{"id": "abc"}))
+	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/abc", map[string]string{"id": "abc"}))
 	require.Equal(t, http.StatusOK, w.Code)
 }
 
@@ -162,7 +162,7 @@ func TestWatermarkHandler_Get_InvalidID(t *testing.T) {
 	t.Parallel()
 	h, _, _ := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/!!!", nil, map[string]string{"id": "!!!"}))
+	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/!!!", map[string]string{"id": "!!!"}))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -170,7 +170,7 @@ func TestWatermarkHandler_Get_NotFound(t *testing.T) {
 	t.Parallel()
 	h, _, _ := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/missing", nil, map[string]string{"id": "missing"}))
+	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/missing", map[string]string{"id": "missing"}))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
@@ -179,7 +179,7 @@ func TestWatermarkHandler_Get_BackendError(t *testing.T) {
 	h, svc, _ := newWatermarkHandlerForTest(t)
 	svc.getErr = errors.New("disk gone")
 	w := httptest.NewRecorder()
-	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/abc", nil, map[string]string{"id": "abc"}))
+	h.Get(w, wmReq(t, http.MethodGet, "/watermarks/abc", map[string]string{"id": "abc"}))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
@@ -193,7 +193,7 @@ func TestWatermarkHandler_Raw_HappyPath(t *testing.T) {
 	svc.assets["abc"] = &domain.WatermarkAsset{ID: "abc", Name: "logo", ContentType: "image/png"}
 
 	w := httptest.NewRecorder()
-	h.Raw(w, wmReq(t, http.MethodGet, "/watermarks/abc/raw", nil, map[string]string{"id": "abc"}))
+	h.Raw(w, wmReq(t, http.MethodGet, "/watermarks/abc/raw", map[string]string{"id": "abc"}))
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "png-data", w.Body.String())
 	assert.Equal(t, "image/png", w.Header().Get("Content-Type"))
@@ -203,7 +203,7 @@ func TestWatermarkHandler_Raw_InvalidID(t *testing.T) {
 	t.Parallel()
 	h, _, _ := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Raw(w, wmReq(t, http.MethodGet, "/watermarks/!!!/raw", nil, map[string]string{"id": "!!!"}))
+	h.Raw(w, wmReq(t, http.MethodGet, "/watermarks/!!!/raw", map[string]string{"id": "!!!"}))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -211,17 +211,20 @@ func TestWatermarkHandler_Raw_NotFound(t *testing.T) {
 	t.Parallel()
 	h, _, _ := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Raw(w, wmReq(t, http.MethodGet, "/watermarks/missing/raw", nil, map[string]string{"id": "missing"}))
+	h.Raw(w, wmReq(t, http.MethodGet, "/watermarks/missing/raw", map[string]string{"id": "missing"}))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
 // ─── Upload ──────────────────────────────────────────────────────────────────
 
-func wmUploadReq(t *testing.T, query string, filename string, body []byte) *http.Request {
+// wmUploadReq builds a multipart upload with a fixed "logo.png" filename.
+// The filename only matters to *watermarks.Service.Save which is stubbed in
+// these tests, so a constant is fine.
+func wmUploadReq(t *testing.T, query string, body []byte) *http.Request {
 	t.Helper()
 	buf := &bytes.Buffer{}
 	mw := multipart.NewWriter(buf)
-	fw, err := mw.CreateFormFile("file", filename)
+	fw, err := mw.CreateFormFile("file", "logo.png")
 	require.NoError(t, err)
 	_, err = fw.Write(body)
 	require.NoError(t, err)
@@ -236,7 +239,7 @@ func TestWatermarkHandler_Upload_HappyPath(t *testing.T) {
 	t.Parallel()
 	h, _, bus := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Upload(w, wmUploadReq(t, "?name=Logo", "logo.png", []byte("png")))
+	h.Upload(w, wmUploadReq(t, "?name=Logo", []byte("png")))
 	require.Equal(t, http.StatusCreated, w.Code)
 
 	bus.mu.Lock()
@@ -269,7 +272,7 @@ func TestWatermarkHandler_Upload_InvalidContent(t *testing.T) {
 	svc.saveErr = watermarks.ErrInvalidContent
 
 	w := httptest.NewRecorder()
-	h.Upload(w, wmUploadReq(t, "", "logo.png", []byte("not-an-image")))
+	h.Upload(w, wmUploadReq(t, "", []byte("not-an-image")))
 	assert.Equal(t, http.StatusUnsupportedMediaType, w.Code)
 }
 
@@ -279,7 +282,7 @@ func TestWatermarkHandler_Upload_TooLarge(t *testing.T) {
 	svc.saveErr = watermarks.ErrTooLarge
 
 	w := httptest.NewRecorder()
-	h.Upload(w, wmUploadReq(t, "", "logo.png", []byte("x")))
+	h.Upload(w, wmUploadReq(t, "", []byte("x")))
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
@@ -289,7 +292,7 @@ func TestWatermarkHandler_Upload_GenericFailure(t *testing.T) {
 	svc.saveErr = errors.New("disk full")
 
 	w := httptest.NewRecorder()
-	h.Upload(w, wmUploadReq(t, "", "logo.png", []byte("x")))
+	h.Upload(w, wmUploadReq(t, "", []byte("x")))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
@@ -301,7 +304,7 @@ func TestWatermarkHandler_Delete_HappyPath(t *testing.T) {
 	svc.assets["abc"] = &domain.WatermarkAsset{ID: "abc"}
 
 	w := httptest.NewRecorder()
-	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/abc", nil, map[string]string{"id": "abc"}))
+	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/abc", map[string]string{"id": "abc"}))
 	require.Equal(t, http.StatusNoContent, w.Code)
 
 	bus.mu.Lock()
@@ -314,7 +317,7 @@ func TestWatermarkHandler_Delete_InvalidID(t *testing.T) {
 	t.Parallel()
 	h, _, _ := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/!!!", nil, map[string]string{"id": "!!!"}))
+	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/!!!", map[string]string{"id": "!!!"}))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -322,7 +325,7 @@ func TestWatermarkHandler_Delete_NotFound(t *testing.T) {
 	t.Parallel()
 	h, _, _ := newWatermarkHandlerForTest(t)
 	w := httptest.NewRecorder()
-	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/missing", nil, map[string]string{"id": "missing"}))
+	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/missing", map[string]string{"id": "missing"}))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
@@ -332,6 +335,6 @@ func TestWatermarkHandler_Delete_BackendError(t *testing.T) {
 	svc.assets["abc"] = &domain.WatermarkAsset{ID: "abc"}
 	svc.deleteErr = errors.New("disk gone")
 	w := httptest.NewRecorder()
-	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/abc", nil, map[string]string{"id": "abc"}))
+	h.Delete(w, wmReq(t, http.MethodDelete, "/watermarks/abc", map[string]string{"id": "abc"}))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }

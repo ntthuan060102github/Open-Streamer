@@ -54,12 +54,18 @@ func TestConfigHandler_TranscoderPathChanged(t *testing.T) {
 		{"both nil", nil, nil, false},
 		{"current nil, proposed empty", nil, &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{}}, false},
 		{"current set, proposed nil", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/old"}}, nil, true},
-		{"unchanged", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}},
-			&domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}}, false},
-		{"changed", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}},
-			&domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/y"}}, true},
-		{"whitespace ignored", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}},
-			&domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: " /x  "}}, false},
+		{
+			"unchanged", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}},
+			&domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}}, false,
+		},
+		{
+			"changed", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}},
+			&domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/y"}}, true,
+		},
+		{
+			"whitespace ignored", &domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: "/x"}},
+			&domain.GlobalConfig{Transcoder: &config.TranscoderConfig{FFmpegPath: " /x  "}}, false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
