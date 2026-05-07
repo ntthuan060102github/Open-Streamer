@@ -208,6 +208,36 @@ type dashFMP4Packager struct {
 	segCount prometheus.Counter
 }
 
+// dashStreamTypeForCodec maps an AV packet codec to the gomedia TS stream
+// type that onTSFrame's switch statement understands. Returns ok=false for
+// codecs the DASH packager can't handle directly (e.g. RawTSChunk, AC3) —
+// those fall through to the raw-TS pipeline if the source ever produces
+// pkt.TS bytes.
+func dashStreamTypeForCodec(c domain.AVCodec) (mpeg2.TS_STREAM_TYPE, bool) {
+	switch c {
+	case domain.AVCodecH264:
+		return mpeg2.TS_STREAM_H264, true
+	case domain.AVCodecH265:
+		return mpeg2.TS_STREAM_H265, true
+	case domain.AVCodecAAC:
+		return mpeg2.TS_STREAM_AAC, true
+	case domain.AVCodecUnknown,
+		domain.AVCodecRawTSChunk,
+		domain.AVCodecMP2,
+		domain.AVCodecMP3,
+		domain.AVCodecAC3,
+		domain.AVCodecEAC3,
+		domain.AVCodecAV1,
+		domain.AVCodecMPEG2Video:
+		// No direct DASH path — caller falls through to the raw-TS pipeline
+		// (which only fires when pkt.TS is non-empty). Listing each codec
+		// explicitly so the exhaustive linter catches new codec additions.
+		return 0, false
+	default:
+		return 0, false
+	}
+}
+
 // run is the main goroutine: wires the TS pipe, demuxer, and flush ticker.
 func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 	// tb is a buffered pipe: Write never blocks, Read blocks only when empty.
@@ -216,11 +246,32 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 	// producer from reading new packets; the buffer hub then dropped them.
 	tb := newTSBuffer(p.streamID)
 
-	// Producer: buffer → FeedWirePacket → aligned TS → tb.
+	// Producer: buffer → either DIRECT AV path (bypass TS) or TS roundtrip.
+	//
+	// AV packets fed via tsmux + gomedia TSDemuxer roundtrip lose SPS/PPS
+	// NAL units in the demux callback (gomedia's TSDemuxer.OnFrame for
+	// H.264 only delivers slice-bearing access units; standalone SPS/PPS
+	// NAL units before the slice are dropped). Without SPS/PPS reaching
+	// the dashFMP4Packager, tryInitVideoLocked never finds a parseable
+	// parameter set, videoPS grows until the cap, and DASH gives up
+	// video init — observed in production for RTMP / RTSP-pull streams
+	// (test3, test5). Raw-TS sources (SRT, file://, UDP) work because
+	// pkt.TS bypasses tsmux already.
+	//
+	// Direct path: when pkt.AV is set and the codec maps to a known TS
+	// stream type, feed pkt.AV.Data straight into onTSFrame. The AV
+	// packet's Annex-B byte stream already contains SPS|PPS|IDR for
+	// keyframes (the ingestor pull layers prepend the parameter set on
+	// every IDR — see internal/ingestor/pull/rtmp_msg_converter.go and
+	// the equivalent in rtsp.go), so the packager has everything it
+	// needs without any TS round-trip.
+	//
+	// Raw-TS path (pkt.TS non-empty, pkt.AV nil) keeps the existing
+	// align-to-188-then-write-to-tb pipeline so SRT / file:// /
+	// passthrough sources continue to work.
 	go func() {
 		defer tb.Close()
 		var tsCarry []byte
-		var avMux *tsmux.FromAV
 
 		for {
 			select {
@@ -230,40 +281,49 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 				if !ok {
 					return
 				}
-				// On source switch the TS muxer will reset, producing a fresh stream
-				// from timestamp 0.  Any bytes in tsCarry belong to the previous source;
-				// discard them so the pipe never receives a hybrid 188-byte packet that
-				// mixes data from two independent TS streams.
-				if pkt.AV != nil && pkt.AV.Discontinuity {
-					avMux = nil
-					tsCarry = nil
-				}
-				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
-					tsCarry = append(tsCarry, b...)
-					for len(tsCarry) >= 188 {
-						if tsCarry[0] != 0x47 {
-							idx := bytes.IndexByte(tsCarry, 0x47)
-							if idx < 0 {
-								if len(tsCarry) > 187 {
-									tsCarry = tsCarry[len(tsCarry)-187:]
-								}
-								return
-							}
-							tsCarry = tsCarry[idx:]
-							if len(tsCarry) < 188 {
-								return
-							}
+				// Direct AV path: route past the TS round-trip.
+				if pkt.AV != nil && len(pkt.AV.Data) > 0 {
+					cid, ok := dashStreamTypeForCodec(pkt.AV.Codec)
+					if ok {
+						// Discontinuity also resets the demuxer-side carry
+						// to keep the raw-TS branch idempotent if a future
+						// source mixes both forms — defensive.
+						if pkt.AV.Discontinuity {
+							tsCarry = nil
 						}
-						if len(tsCarry) >= 376 && tsCarry[188] != 0x47 {
-							tsCarry = tsCarry[1:]
-							continue
-						}
-						if _, err := tb.Write(tsCarry[:188]); err != nil {
-							return
-						}
-						tsCarry = tsCarry[188:]
+						p.onTSFrame(cid, pkt.AV.Data, pkt.AV.PTSms, pkt.AV.DTSms)
+						continue
 					}
-				})
+				}
+				// Raw-TS path (SRT, file://, UDP): align to 188 boundaries
+				// and feed the demuxer via tb.
+				if len(pkt.TS) == 0 {
+					continue
+				}
+				tsCarry = append(tsCarry, pkt.TS...)
+				for len(tsCarry) >= 188 {
+					if tsCarry[0] != 0x47 {
+						idx := bytes.IndexByte(tsCarry, 0x47)
+						if idx < 0 {
+							if len(tsCarry) > 187 {
+								tsCarry = tsCarry[len(tsCarry)-187:]
+							}
+							break
+						}
+						tsCarry = tsCarry[idx:]
+						if len(tsCarry) < 188 {
+							break
+						}
+					}
+					if len(tsCarry) >= 376 && tsCarry[188] != 0x47 {
+						tsCarry = tsCarry[1:]
+						continue
+					}
+					if _, err := tb.Write(tsCarry[:188]); err != nil {
+						return
+					}
+					tsCarry = tsCarry[188:]
+				}
 			}
 		}
 	}()

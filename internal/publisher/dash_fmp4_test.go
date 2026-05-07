@@ -11,6 +11,9 @@ import (
 
 	"github.com/Eyevinn/mp4ff/mp4"
 	"github.com/stretchr/testify/require"
+	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 // scaleOffset is the unit of cross-track sync — guard against future
@@ -288,4 +291,77 @@ func TestAppendVideoPSLockedStaysLatchedAfterGiveUp(t *testing.T) {
 			"give-up is sticky")
 	}
 	require.Nil(t, p.videoPS, "no append happens after give-up")
+}
+
+// dashStreamTypeForCodec must map every codec the DASH packager actually
+// processes (H264 / H265 / AAC). Anything else returns ok=false so the
+// caller falls back to the raw-TS pipeline, which is the safe default.
+// Regression guard for the AV bypass path: production was missing SPS/PPS
+// in DASH because frames went through the TSMuxer→TSDemuxer round-trip
+// (gomedia's TSDemuxer drops parameter-set NAL units for H264). Direct
+// dispatch via this mapping skips the round-trip entirely.
+func TestDashStreamTypeForCodec(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		codec  domain.AVCodec
+		want   mpeg2.TS_STREAM_TYPE
+		wantOK bool
+	}{
+		{domain.AVCodecH264, mpeg2.TS_STREAM_H264, true},
+		{domain.AVCodecH265, mpeg2.TS_STREAM_H265, true},
+		{domain.AVCodecAAC, mpeg2.TS_STREAM_AAC, true},
+
+		// Codecs without a direct DASH path — must NOT be claimed by the
+		// bypass branch (they'd skip the safe raw-TS fallback otherwise).
+		{domain.AVCodecRawTSChunk, 0, false},
+		{domain.AVCodecMP3, 0, false},
+		{domain.AVCodecAC3, 0, false},
+		{domain.AVCodecUnknown, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := dashStreamTypeForCodec(c.codec)
+		require.Equal(t, c.wantOK, ok, "codec %v ok flag", c.codec)
+		if c.wantOK {
+			require.Equal(t, c.want, got, "codec %v stream type", c.codec)
+		}
+	}
+}
+
+// onTSFrame fed an H264 access unit with SPS+PPS+IDR (the wire shape the
+// ingestor produces for keyframes after RTMP / RTSP pull) MUST produce
+// videoInit. This is the contract the AV bypass relies on — direct calls
+// from the producer goroutine skip the gomedia round-trip and depend on
+// onTSFrame finding parameter sets in the bytes itself.
+func TestOnTSFrameBuildsVideoInitFromAVAnnexBKeyframe(t *testing.T) {
+	t.Parallel()
+
+	// Real-world H264 NAL units captured from a 1080p Main@4.0 stream.
+	// SPS encodes resolution + profile so mp4ff's ParseSPSNALUnit accepts
+	// it; PPS is a typical Main-profile PPS payload.
+	sps := []byte{0x67, 0x4d, 0x40, 0x28, 0xeb, 0x05, 0x07, 0x80, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58}
+	pps := []byte{0x68, 0xee, 0x3c, 0x80}
+	// Synthetic IDR slice — NAL type 5, payload arbitrary. The DASH
+	// packager doesn't decode the slice, only scans NAL types in the
+	// stream for parameter-set extraction.
+	idr := []byte{0x65, 0x88, 0x80, 0x40, 0x00, 0x00}
+
+	startCode := []byte{0, 0, 0, 1}
+	frame := make([]byte, 0, len(sps)+len(pps)+len(idr)+12)
+	frame = append(frame, startCode...)
+	frame = append(frame, sps...)
+	frame = append(frame, startCode...)
+	frame = append(frame, pps...)
+	frame = append(frame, startCode...)
+	frame = append(frame, idr...)
+
+	p := &dashFMP4Packager{}
+	require.Nil(t, p.videoInit, "video init starts unset")
+
+	p.onTSFrame(mpeg2.TS_STREAM_H264, frame, 1000, 1000)
+
+	require.NotNil(t, p.videoInit,
+		"feeding an H264 access unit with SPS+PPS+IDR must produce video init — this is the contract the AV-bypass producer relies on")
+	require.Nil(t, p.videoPS,
+		"once init is built, videoPS is cleared — keeps the bypass loop allocation-free for the rest of the session")
+	require.False(t, p.videoPSGiveUp, "give-up flag must NOT be latched on the success path")
 }
