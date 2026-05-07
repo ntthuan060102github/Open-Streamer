@@ -9,11 +9,33 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// Header keys + media MIMEs used across the manifest and segment handlers.
+// Centralised so we don't drift between routes (and so static analysers
+// don't complain about duplicate string literals).
+const (
+	headerContentType = "Content-Type"
+	headerCacheCtrl   = "Cache-Control"
+	headerPragma      = "Pragma"
+
+	mimeM3U8 = "application/vnd.apple.mpegurl"
+	mimeMPD  = "application/dash+xml"
+	mimeTS   = "video/mp2t"
+	mimeM4S  = "video/iso.segment"
+	mimeMP4  = "video/mp4"
+
+	// cacheNoStore is for DASH manifests — they're rewritten constantly
+	// and a CDN/proxy must not cache them at all.
+	cacheNoStore = "no-store, max-age=0, must-revalidate"
+	// cacheNoCache is for HLS manifests — they need revalidation but can
+	// be cached briefly while the segment list is unchanged.
+	cacheNoCache = "no-cache"
+)
+
 // Mount registers GET /{code}/index.m3u8, GET /{code}/index.mpd, and GET /{code}/* on r.
 func Mount(r chi.Router, hlsDir, dashDir string) {
 	s := &roots{hlsDir: hlsDir, dashDir: dashDir}
-	r.Get("/{code}/index.m3u8", s.serveManifest("index.m3u8", "application/vnd.apple.mpegurl", s.hlsDir))
-	r.Get("/{code}/index.mpd", s.serveManifest("index.mpd", "application/dash+xml", s.dashDir))
+	r.Get("/{code}/index.m3u8", s.serveManifest("index.m3u8", mimeM3U8, s.hlsDir))
+	r.Get("/{code}/index.mpd", s.serveManifest("index.mpd", mimeMPD, s.dashDir))
 	r.Get("/{code}/*", s.serveStreamNested())
 }
 
@@ -36,13 +58,13 @@ func (s *roots) serveManifest(filename, contentType, rootDir string) http.Handle
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", contentType)
+		w.Header().Set(headerContentType, contentType)
 		switch filename {
 		case "index.mpd":
-			w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
+			w.Header().Set(headerCacheCtrl, cacheNoStore)
 		case "index.m3u8":
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set(headerCacheCtrl, cacheNoCache)
+			w.Header().Set(headerPragma, cacheNoCache)
 		}
 		http.ServeFile(w, r, filepath.Join(rootDir, code, filename))
 	}
@@ -73,12 +95,26 @@ func (s *roots) serveStreamNested() http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
+		// Force the correct media MIME for each extension. Without this,
+		// http.ServeFile falls back to mime.TypeByExtension which on most
+		// Linux distros maps `.ts` to `text/vnd.trolltech.linguist` (the
+		// historic Qt Linguist Translation type in /etc/mime.types) — HLS
+		// players that strict-check Content-Type then refuse the segment.
+		// We set the header BEFORE ServeFile so it isn't overwritten.
 		switch ext {
-		case ".mpd":
-			w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
+		case ".ts":
+			w.Header().Set(headerContentType, mimeTS)
 		case ".m3u8":
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set(headerContentType, mimeM3U8)
+			w.Header().Set(headerCacheCtrl, cacheNoCache)
+			w.Header().Set(headerPragma, cacheNoCache)
+		case ".mpd":
+			w.Header().Set(headerContentType, mimeMPD)
+			w.Header().Set(headerCacheCtrl, cacheNoStore)
+		case ".m4s":
+			w.Header().Set(headerContentType, mimeM4S)
+		case ".mp4":
+			w.Header().Set(headerContentType, mimeMP4)
 		}
 		http.ServeFile(w, r, filepath.Join(baseDir, code, rel))
 	}
