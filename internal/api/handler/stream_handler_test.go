@@ -1,0 +1,588 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
+)
+
+// ─── Stubs ────────────────────────────────────────────────────────────────────
+
+type fakeStreamRepoFull struct {
+	mu      sync.Mutex
+	items   map[domain.StreamCode]*domain.Stream
+	listErr error
+	saveErr error
+	delErr  error
+}
+
+func newFakeStreamRepoFull() *fakeStreamRepoFull {
+	return &fakeStreamRepoFull{items: make(map[domain.StreamCode]*domain.Stream)}
+}
+
+func (f *fakeStreamRepoFull) seed(streams ...*domain.Stream) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range streams {
+		clone := *s
+		f.items[s.Code] = &clone
+	}
+}
+
+func (f *fakeStreamRepoFull) List(_ context.Context, _ store.StreamFilter) ([]*domain.Stream, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]*domain.Stream, 0, len(f.items))
+	for _, s := range f.items {
+		clone := *s
+		out = append(out, &clone)
+	}
+	return out, nil
+}
+
+func (f *fakeStreamRepoFull) FindByCode(_ context.Context, code domain.StreamCode) (*domain.Stream, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.items[code]; ok {
+		clone := *s
+		return &clone, nil
+	}
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStreamRepoFull) Save(_ context.Context, s *domain.Stream) error {
+	if f.saveErr != nil {
+		return f.saveErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	clone := *s
+	f.items[s.Code] = &clone
+	return nil
+}
+
+func (f *fakeStreamRepoFull) Delete(_ context.Context, code domain.StreamCode) error {
+	if f.delErr != nil {
+		return f.delErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.items, code)
+	return nil
+}
+
+// stubCoord satisfies streamCoordinator with controllable per-method
+// behaviour. Each method records the codes it received so tests can
+// assert on dispatch. Default returns are zero-value friendly so tests
+// only set the fields they care about.
+type stubCoord struct {
+	mu             sync.Mutex
+	startErr       error
+	updateErr      error
+	statusByCode   map[domain.StreamCode]domain.StreamStatus
+	runningByCode  map[domain.StreamCode]bool
+	startedCodes   []domain.StreamCode
+	stoppedCodes   []domain.StreamCode
+	updatedCodes   []domain.StreamCode
+	abrCopyByCode  map[domain.StreamCode]manager.RuntimeStatus
+	abrMixerByCode map[domain.StreamCode]manager.RuntimeStatus
+}
+
+func newStubCoord() *stubCoord {
+	return &stubCoord{
+		statusByCode:   make(map[domain.StreamCode]domain.StreamStatus),
+		runningByCode:  make(map[domain.StreamCode]bool),
+		abrCopyByCode:  make(map[domain.StreamCode]manager.RuntimeStatus),
+		abrMixerByCode: make(map[domain.StreamCode]manager.RuntimeStatus),
+	}
+}
+
+func (s *stubCoord) StreamStatus(code domain.StreamCode) domain.StreamStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok := s.statusByCode[code]; ok {
+		return v
+	}
+	return domain.StatusStopped
+}
+
+func (s *stubCoord) IsRunning(code domain.StreamCode) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runningByCode[code]
+}
+
+func (s *stubCoord) Start(_ context.Context, stream *domain.Stream) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.startedCodes = append(s.startedCodes, stream.Code)
+	if s.startErr == nil {
+		s.runningByCode[stream.Code] = true
+	}
+	return s.startErr
+}
+
+func (s *stubCoord) Stop(_ context.Context, code domain.StreamCode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stoppedCodes = append(s.stoppedCodes, code)
+	delete(s.runningByCode, code)
+}
+
+func (s *stubCoord) Update(_ context.Context, _, new *domain.Stream) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updatedCodes = append(s.updatedCodes, new.Code)
+	return s.updateErr
+}
+
+func (s *stubCoord) ABRCopyRuntimeStatus(code domain.StreamCode) (manager.RuntimeStatus, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.abrCopyByCode[code]
+	return v, ok
+}
+
+func (s *stubCoord) ABRMixerRuntimeStatus(code domain.StreamCode) (manager.RuntimeStatus, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.abrMixerByCode[code]
+	return v, ok
+}
+
+type stubMgr struct {
+	mu              sync.Mutex
+	statusByCode    map[domain.StreamCode]manager.RuntimeStatus
+	registeredCodes map[domain.StreamCode]bool
+	switchErr       error
+	switchedTo      map[domain.StreamCode]int
+}
+
+func newStubMgr() *stubMgr {
+	return &stubMgr{
+		statusByCode:    make(map[domain.StreamCode]manager.RuntimeStatus),
+		registeredCodes: make(map[domain.StreamCode]bool),
+		switchedTo:      make(map[domain.StreamCode]int),
+	}
+}
+
+func (s *stubMgr) RuntimeStatus(code domain.StreamCode) (manager.RuntimeStatus, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.statusByCode[code]
+	return v, s.registeredCodes[code]
+}
+
+func (s *stubMgr) SwitchInput(code domain.StreamCode, priority int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.switchErr != nil {
+		return s.switchErr
+	}
+	s.switchedTo[code] = priority
+	return nil
+}
+
+type stubTranscoder struct {
+	statusByCode map[domain.StreamCode]transcoder.RuntimeStatus
+}
+
+func (s *stubTranscoder) RuntimeStatus(code domain.StreamCode) (transcoder.RuntimeStatus, bool) {
+	if s == nil || s.statusByCode == nil {
+		return transcoder.RuntimeStatus{}, false
+	}
+	v, ok := s.statusByCode[code]
+	return v, ok
+}
+
+type stubPublisher struct {
+	statusByCode map[domain.StreamCode]publisher.RuntimeStatus
+}
+
+func (s *stubPublisher) RuntimeStatus(code domain.StreamCode) (publisher.RuntimeStatus, bool) {
+	if s == nil || s.statusByCode == nil {
+		return publisher.RuntimeStatus{}, false
+	}
+	v, ok := s.statusByCode[code]
+	return v, ok
+}
+
+type fakeBus struct {
+	mu     sync.Mutex
+	events []domain.Event
+}
+
+func (b *fakeBus) Publish(_ context.Context, ev domain.Event) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.events = append(b.events, ev)
+}
+
+func (b *fakeBus) Subscribe(_ domain.EventType, _ events.HandlerFunc) func() {
+	return func() {}
+}
+
+// newStreamHandlerForTest wires the StreamHandler with stubs across every
+// dependency so each test starts from a controllable baseline.
+func newStreamHandlerForTest(t *testing.T) (*StreamHandler, *fakeStreamRepoFull, *stubCoord, *stubMgr, *fakeBus) {
+	t.Helper()
+	repo := newFakeStreamRepoFull()
+	co := newStubCoord()
+	mg := newStubMgr()
+	tc := &stubTranscoder{}
+	pb := &stubPublisher{}
+	bus := &fakeBus{}
+	h := &StreamHandler{
+		streamRepo:  repo,
+		coordinator: co,
+		manager:     mg,
+		transcoder:  tc,
+		publisher:   pb,
+		bus:         bus,
+	}
+	return h, repo, co, mg, bus
+}
+
+// chiReq builds an http.Request with a chi route param pre-populated so
+// chi.URLParam("code") works inside the handler under test.
+func chiReq(t *testing.T, method, path string, body []byte, params map[string]string) *http.Request {
+	t.Helper()
+	bodyReader := bytes.NewReader(body)
+	r := httptest.NewRequestWithContext(t.Context(), method, path, bodyReader)
+	rctx := chi.NewRouteContext()
+	for k, v := range params {
+		rctx.URLParams.Add(k, v)
+	}
+	r = r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+	return r
+}
+
+// ─── List ────────────────────────────────────────────────────────────────────
+
+func TestStreamHandler_List_AllStreams(t *testing.T) {
+	t.Parallel()
+	h, repo, _, _, _ := newStreamHandlerForTest(t)
+	repo.seed(
+		&domain.Stream{Code: "a"},
+		&domain.Stream{Code: "b"},
+	)
+
+	w := httptest.NewRecorder()
+	h.List(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/streams", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Total int              `json:"total"`
+		Data  []streamResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, 2, resp.Total)
+}
+
+func TestStreamHandler_List_StatusFilter(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "active"}, &domain.Stream{Code: "stopped"})
+	co.runningByCode["active"] = true
+	co.statusByCode["active"] = domain.StatusActive
+	co.statusByCode["stopped"] = domain.StatusStopped
+
+	w := httptest.NewRecorder()
+	h.List(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/streams?status=active", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Total int `json:"total"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, 1, resp.Total, "only active stream should match filter")
+}
+
+func TestStreamHandler_List_InvalidStatusReturns400(t *testing.T) {
+	t.Parallel()
+	h, _, _, _, _ := newStreamHandlerForTest(t)
+	w := httptest.NewRecorder()
+	h.List(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/streams?status=garbage", nil))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestStreamHandler_List_RepoErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h, repo, _, _, _ := newStreamHandlerForTest(t)
+	repo.listErr = errors.New("db down")
+	w := httptest.NewRecorder()
+	h.List(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/streams", nil))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// ─── Get ─────────────────────────────────────────────────────────────────────
+
+func TestStreamHandler_Get_Found(t *testing.T) {
+	t.Parallel()
+	h, repo, _, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "live", Name: "Live"})
+
+	w := httptest.NewRecorder()
+	h.Get(w, chiReq(t, http.MethodGet, "/streams/live", nil, map[string]string{"code": "live"}))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"code":"live"`)
+}
+
+func TestStreamHandler_Get_NotFound(t *testing.T) {
+	t.Parallel()
+	h, _, _, _, _ := newStreamHandlerForTest(t)
+	w := httptest.NewRecorder()
+	h.Get(w, chiReq(t, http.MethodGet, "/streams/missing", nil, map[string]string{"code": "missing"}))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// ─── Put: create + update + edge cases ───────────────────────────────────────
+
+func TestStreamHandler_Put_CreateNew(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, bus := newStreamHandlerForTest(t)
+
+	body := domain.Stream{
+		Inputs: []domain.Input{{URL: "rtmp://src", Priority: 0}},
+	}
+	raw, _ := json.Marshal(body)
+	req := chiReq(t, http.MethodPost, "/streams/news", raw, map[string]string{"code": "news"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+
+	require.Equal(t, http.StatusCreated, w.Code)
+	saved, err := repo.FindByCode(t.Context(), "news")
+	require.NoError(t, err)
+	assert.Equal(t, domain.StreamCode("news"), saved.Code)
+	assert.Contains(t, co.startedCodes, domain.StreamCode("news"), "fresh non-disabled stream must be Started")
+	assert.Len(t, bus.events, 1, "stream.created event must fire")
+	assert.Equal(t, domain.EventStreamCreated, bus.events[0].Type)
+}
+
+func TestStreamHandler_Put_UpdateExisting(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, bus := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{
+		Code:   "live",
+		Inputs: []domain.Input{{URL: "rtmp://orig"}},
+	})
+	co.runningByCode["live"] = true
+
+	updated := domain.Stream{Inputs: []domain.Input{{URL: "rtmp://updated"}}}
+	raw, _ := json.Marshal(updated)
+	req := chiReq(t, http.MethodPost, "/streams/live", raw, map[string]string{"code": "live"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, co.updatedCodes, domain.StreamCode("live"), "update path must call coordinator.Update")
+	updatedEvts := 0
+	for _, e := range bus.events {
+		if e.Type == domain.EventStreamUpdated {
+			updatedEvts++
+		}
+	}
+	assert.Equal(t, 1, updatedEvts, "stream.updated event must fire on update")
+}
+
+func TestStreamHandler_Put_InvalidJSONReturns400(t *testing.T) {
+	t.Parallel()
+	h, _, _, _, _ := newStreamHandlerForTest(t)
+	req := chiReq(t, http.MethodPost, "/streams/x", []byte(`{not-json`), map[string]string{"code": "x"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestStreamHandler_Put_RepoSaveFailure500(t *testing.T) {
+	t.Parallel()
+	h, repo, _, _, _ := newStreamHandlerForTest(t)
+	repo.saveErr = errors.New("disk full")
+	body := domain.Stream{Inputs: []domain.Input{{URL: "rtmp://x"}}}
+	raw, _ := json.Marshal(body)
+	req := chiReq(t, http.MethodPost, "/streams/y", raw, map[string]string{"code": "y"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestStreamHandler_Put_DisabledStreamSkipsStart(t *testing.T) {
+	t.Parallel()
+	h, _, co, _, _ := newStreamHandlerForTest(t)
+	body := domain.Stream{
+		Disabled: true,
+		Inputs:   []domain.Input{{URL: "rtmp://x"}},
+	}
+	raw, _ := json.Marshal(body)
+	req := chiReq(t, http.MethodPost, "/streams/z", raw, map[string]string{"code": "z"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	assert.Empty(t, co.startedCodes, "disabled stream must NOT be Started")
+}
+
+// ─── Delete ─────────────────────────────────────────────────────────────────
+
+func TestStreamHandler_Delete_Existing(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, bus := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "doomed"})
+	co.runningByCode["doomed"] = true
+
+	req := chiReq(t, http.MethodDelete, "/streams/doomed", nil, map[string]string{"code": "doomed"})
+	w := httptest.NewRecorder()
+	h.Delete(w, req)
+
+	assert.Equal(t, http.StatusNoContent, w.Code)
+	_, err := repo.FindByCode(t.Context(), "doomed")
+	assert.ErrorIs(t, err, store.ErrNotFound)
+	assert.Contains(t, co.stoppedCodes, domain.StreamCode("doomed"))
+	deletedEvts := 0
+	for _, e := range bus.events {
+		if e.Type == domain.EventStreamDeleted {
+			deletedEvts++
+		}
+	}
+	assert.Equal(t, 1, deletedEvts)
+}
+
+// Delete is idempotent — repeating the call after a successful delete (or
+// against a code that was never created) returns 204 because both Stop()
+// and the underlying store.Delete() tolerate "no such stream". The
+// front-end relies on this for retry semantics.
+func TestStreamHandler_Delete_MissingIsIdempotent(t *testing.T) {
+	t.Parallel()
+	h, _, _, _, _ := newStreamHandlerForTest(t)
+	req := chiReq(t, http.MethodDelete, "/streams/missing", nil, map[string]string{"code": "missing"})
+	w := httptest.NewRecorder()
+	h.Delete(w, req)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+}
+
+// ─── Restart ────────────────────────────────────────────────────────────────
+
+func TestStreamHandler_Restart_HappyPath(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "restart-me"})
+
+	req := chiReq(t, http.MethodPost, "/streams/restart-me/restart", nil, map[string]string{"code": "restart-me"})
+	w := httptest.NewRecorder()
+	h.Restart(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, co.stoppedCodes, domain.StreamCode("restart-me"), "restart must Stop first")
+	assert.Contains(t, co.startedCodes, domain.StreamCode("restart-me"), "restart must Start after Stop")
+}
+
+func TestStreamHandler_Restart_DisabledRejected(t *testing.T) {
+	t.Parallel()
+	h, repo, _, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "off", Disabled: true})
+
+	req := chiReq(t, http.MethodPost, "/streams/off/restart", nil, map[string]string{"code": "off"})
+	w := httptest.NewRecorder()
+	h.Restart(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestStreamHandler_Restart_StartFailure500(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "fail"})
+	co.startErr = errors.New("ffmpeg not found")
+
+	req := chiReq(t, http.MethodPost, "/streams/fail/restart", nil, map[string]string{"code": "fail"})
+	w := httptest.NewRecorder()
+	h.Restart(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// ─── SwitchInput ────────────────────────────────────────────────────────────
+
+func TestStreamHandler_SwitchInput_HappyPath(t *testing.T) {
+	t.Parallel()
+	h, _, _, mg, _ := newStreamHandlerForTest(t)
+
+	body := bytes.NewBufferString(`{"priority": 2}`)
+	req := chiReq(t, http.MethodPost, "/streams/live/inputs/switch", body.Bytes(), map[string]string{"code": "live"})
+	w := httptest.NewRecorder()
+	h.SwitchInput(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 2, mg.switchedTo["live"])
+}
+
+func TestStreamHandler_SwitchInput_BadJSON(t *testing.T) {
+	t.Parallel()
+	h, _, _, _, _ := newStreamHandlerForTest(t)
+	req := chiReq(t, http.MethodPost, "/streams/x/inputs/switch", []byte(`{nope`), map[string]string{"code": "x"})
+	w := httptest.NewRecorder()
+	h.SwitchInput(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestStreamHandler_SwitchInput_ManagerError(t *testing.T) {
+	t.Parallel()
+	h, _, _, mg, _ := newStreamHandlerForTest(t)
+	mg.switchErr = fmt.Errorf("priority not registered")
+	req := chiReq(t, http.MethodPost, "/streams/x/inputs/switch", []byte(`{"priority":1}`), map[string]string{"code": "x"})
+	w := httptest.NewRecorder()
+	h.SwitchInput(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// ─── withStatus + buildMediaSummary ────────────────────────────────────────
+
+// withStatus assembles the {Stream, Runtime} response envelope. Verify it
+// substitutes the ABR-copy / ABR-mixer runtime when the stream is not
+// registered with the manager (concrete behaviour the front-end depends on
+// to surface "unknown" state correctly).
+func TestStreamHandler_WithStatus_ABRCopyFallback(t *testing.T) {
+	t.Parallel()
+	h, _, co, _, _ := newStreamHandlerForTest(t)
+	co.statusByCode["abr"] = domain.StatusActive
+	abrRT := manager.RuntimeStatus{ActiveInputPriority: 0}
+	co.abrCopyByCode["abr"] = abrRT
+
+	resp := h.withStatus(&domain.Stream{Code: "abr"})
+	assert.Equal(t, domain.StatusActive, resp.Runtime.Status)
+}
+
+func TestBuildMediaSummary_NoTranscoderMirrorsInputs(t *testing.T) {
+	t.Parallel()
+	s := &domain.Stream{Code: "x"}
+	inputs := []manager.InputHealthSnapshot{
+		{
+			InputPriority: 0,
+			BitrateKbps:   1500,
+			Tracks: []domain.MediaTrackInfo{
+				{Kind: domain.MediaTrackVideo, Codec: domain.CodecLabel(domain.AVCodecH264)},
+			},
+		},
+	}
+	got := buildMediaSummary(s, inputs, 0)
+	require.NotNil(t, got)
+	assert.Equal(t, inputs[0].BitrateKbps, got.InputBitrateKbps)
+	assert.Equal(t, inputs[0].BitrateKbps, got.OutputBitrateKbps,
+		"no transcoder → output mirrors input")
+}

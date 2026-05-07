@@ -50,12 +50,30 @@ const (
 )
 
 // recordingSession tracks an in-memory active DVR recording.
+//
+// `streamCode` and `recordingID` are immutable copies of the corresponding
+// `recording` fields, captured once at session creation. The recording
+// goroutine (record → flushSegment → applyRetention) reads these instead
+// of `recording.*` so log/event/metric formatting is race-free against
+// `StopRecording` which sets `recording.StoppedAt` and `Status` from the
+// caller goroutine.
+//
+// `done` is closed by the recording goroutine when it exits. StopRecording
+// waits on it before mutating `recording.{StoppedAt,Status}` so the goroutine
+// has finished its last `recRepo.Save(sess.recording)` call (which
+// reads the struct as a whole) before any field is written. Without
+// this synchronisation the race detector trips reliably under retention
+// pruning loads where the goroutine is still flushing when the test
+// stops the recording.
 type recordingSession struct {
-	recording *domain.Recording
-	index     *domain.DVRIndex
-	segments  []segmentMeta // in-memory per-segment state, NOT in index.json
-	dvrCfg    *domain.StreamDVRConfig
-	cancel    context.CancelFunc
+	recording   *domain.Recording
+	streamCode  domain.StreamCode
+	recordingID domain.RecordingID
+	index       *domain.DVRIndex
+	segments    []segmentMeta // in-memory per-segment state, NOT in index.json
+	dvrCfg      *domain.StreamDVRConfig
+	cancel      context.CancelFunc
+	done        chan struct{}
 }
 
 // Service manages DVR recording sessions.
@@ -178,16 +196,22 @@ func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	sess := &recordingSession{
-		recording: rec,
-		index:     idx,
-		segments:  segments,
-		dvrCfg:    dvrCfg,
-		cancel:    cancel,
+		recording:   rec,
+		streamCode:  rec.StreamCode,
+		recordingID: rec.ID,
+		index:       idx,
+		segments:    segments,
+		dvrCfg:      dvrCfg,
+		cancel:      cancel,
+		done:        make(chan struct{}),
 	}
 	s.sessions[streamID] = sess
 
 	nextIdx := idx.SegmentCount
-	go s.record(workerCtx, sess, subscribeID, segDir, nextIdx, resuming, segDur)
+	go func() {
+		defer close(sess.done)
+		s.record(workerCtx, sess, subscribeID, segDir, nextIdx, resuming, segDur)
+	}()
 
 	if s.m != nil {
 		s.m.DVRRecordingActive.WithLabelValues(string(streamID)).Set(1)
@@ -219,6 +243,20 @@ func (s *Service) StopRecording(ctx context.Context, streamID domain.StreamCode)
 	sess.cancel()
 	delete(s.sessions, streamID)
 	s.mu.Unlock()
+
+	// Wait for the recording goroutine to fully drain (final flushSegment
+	// write + last recRepo.Save with the in-flight struct) before we mutate
+	// sess.recording's StoppedAt/Status. Without this barrier the goroutine's
+	// `s.recRepo.Save(ctx, sess.recording)` reads the struct concurrently with
+	// the writes below and the race detector trips under retention-pruning
+	// loads. Bounded by ctx — a misbehaving goroutine can't pin StopRecording
+	// forever.
+	select {
+	case <-sess.done:
+	case <-ctx.Done():
+		// ctx cancelled before goroutine drained — proceed anyway; the
+		// goroutine will exit on its own thanks to sess.cancel() above.
+	}
 
 	now := time.Now()
 	sess.recording.StoppedAt = &now
@@ -606,12 +644,18 @@ func (s *Service) applyRetention(sess *recordingSession, segDir string) {
 		// Background context is intentional — applyRetention runs from
 		// the long-lived segmenter loop, not a request-scoped path, so
 		// no caller cancellation to honour.
+		// Read sess.streamCode / sess.recordingID (immutable copies set at
+		// session creation) instead of dereferencing sess.recording — the
+		// recording goroutine runs concurrently with StopRecording's
+		// `sess.recording.StoppedAt = &now` write, and even reading an
+		// unrelated field of the same pointer trips the race detector.
+		// See recordingSession docstring.
 		if s.bus != nil {
 			s.bus.Publish(context.Background(), domain.Event{ //nolint:contextcheck // intentional Background
 				Type:       domain.EventDVRSegmentPruned,
-				StreamCode: sess.recording.StreamCode,
+				StreamCode: sess.streamCode,
 				Payload: map[string]any{
-					"recording_id":  sess.recording.ID,
+					"recording_id":  sess.recordingID,
 					"segment_index": oldest.index,
 					"size_bytes":    oldest.size,
 					"reason":        reason,
@@ -619,7 +663,7 @@ func (s *Service) applyRetention(sess *recordingSession, segDir string) {
 			})
 		}
 		if s.m != nil && s.m.DVRRetentionPrunedBytes != nil {
-			s.m.DVRRetentionPrunedBytes.WithLabelValues(string(sess.recording.StreamCode)).Add(float64(oldest.size))
+			s.m.DVRRetentionPrunedBytes.WithLabelValues(string(sess.streamCode)).Add(float64(oldest.size))
 		}
 
 		// Prune gaps that ended before the new oldest segment's wall time.

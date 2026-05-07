@@ -19,13 +19,46 @@ import (
 	"github.com/samber/do/v2"
 )
 
+// streamCoordinator captures every coordinator method StreamHandler uses.
+// Defined as an interface so tests can inject a tiny stub instead of
+// wiring the full coordinator dependency graph (buffer + manager + tc +
+// pub + dvr + bus + metrics — see internal/coordinator/coordinator.go).
+// *coordinator.Coordinator satisfies this implicitly.
+type streamCoordinator interface {
+	StreamStatus(code domain.StreamCode) domain.StreamStatus
+	IsRunning(code domain.StreamCode) bool
+	Start(ctx context.Context, stream *domain.Stream) error
+	Stop(ctx context.Context, code domain.StreamCode)
+	Update(ctx context.Context, old, new *domain.Stream) error
+	ABRCopyRuntimeStatus(code domain.StreamCode) (manager.RuntimeStatus, bool)
+	ABRMixerRuntimeStatus(code domain.StreamCode) (manager.RuntimeStatus, bool)
+}
+
+// streamManagerDep / streamTranscoderDep / streamPublisherDep narrow
+// each upstream service to just the read-only RuntimeStatus / SwitchInput
+// surface the handler needs. Same rationale as streamCoordinator —
+// keeps the test harness from having to instantiate a full ingestor +
+// FFmpeg pool just to call a List handler.
+type streamManagerDep interface {
+	RuntimeStatus(code domain.StreamCode) (manager.RuntimeStatus, bool)
+	SwitchInput(code domain.StreamCode, priority int) error
+}
+
+type streamTranscoderDep interface {
+	RuntimeStatus(code domain.StreamCode) (transcoder.RuntimeStatus, bool)
+}
+
+type streamPublisherDep interface {
+	RuntimeStatus(code domain.StreamCode) (publisher.RuntimeStatus, bool)
+}
+
 // StreamHandler handles stream lifecycle REST endpoints.
 type StreamHandler struct {
 	streamRepo  store.StreamRepository
-	coordinator *coordinator.Coordinator
-	manager     *manager.Service
-	transcoder  *transcoder.Service
-	publisher   *publisher.Service
+	coordinator streamCoordinator
+	manager     streamManagerDep
+	transcoder  streamTranscoderDep
+	publisher   streamPublisherDep
 	bus         events.Bus
 }
 
