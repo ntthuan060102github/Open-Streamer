@@ -54,6 +54,10 @@ run: ## Run server without building a persistent binary
 install: ## Install server binary to $$GOBIN or $$GOPATH/bin (with version stamping)
 	$(GO) install $(GOFLAGS) -ldflags="$(LDFLAGS)" $(MAIN_PKG)
 
+.PHONY: build-dev
+build-dev: ## Cross-compile a release-style tarball for a Go-less server (default linux/amd64, version=dev)
+	./scripts/build-dev.sh
+
 # --- quality ---
 
 .PHONY: generate

@@ -1,6 +1,7 @@
 package tsmux
 
 import (
+	"github.com/Eyevinn/mp4ff/avc"
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
@@ -122,8 +123,16 @@ func FeedWirePacket(ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]by
 // some upstream code paths or stream variations have produced frames
 // without parameter sets. Scanning raw TS bytes is a defensive
 // fallback that does NOT depend on the demuxer's frame-splitting
-// behaviour — at the cost of false positives if SPS-shaped bytes
-// appear inside payload data (rare in practice for short scans).
+// behaviour.
+//
+// SPS validation: every candidate (byte after a start code with low-5
+// bits == 7) is parsed via mp4ff's avc.ParseSPSNALUnit. False
+// positives — random payload bytes that look like an Annex-B start
+// code followed by a byte whose nal_unit_type bits equal 7 — fail
+// parsing, so we keep scanning forward. Without this validation we
+// returned ~1KB blobs of payload as "SPS" and pushed garbage AVC
+// sequence headers to RTMP clients (observed: width=16, height=16,
+// ProfileIdc=1 — impossible for real video).
 //
 // This is a best-effort scan: NAL units split across TS-packet
 // boundaries (with adaptation-field stuffing) may be missed. For SPS
@@ -134,36 +143,76 @@ func FeedWirePacket(ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]by
 // input — we copy out so subsequent buffer reuse cannot corrupt the
 // cached parameter sets).
 func FindH264ParameterSets(raw []byte) (sps, pps []byte) {
-	sps = findNALWithType(raw, 7)
-	pps = findNALWithType(raw, 8)
+	sps = findValidSPS(raw)
+	pps = findNALWithType(raw, 8, 0)
+	if pps != nil && !looksLikePPS(pps) {
+		pps = nil
+	}
 	return sps, pps
 }
 
+// findValidSPS scans raw repeatedly for nal_unit_type 7, parses each
+// candidate via mp4ff, and returns the first one that parses to a
+// plausible SPS (width >= 32 and height >= 32 — anything smaller is
+// almost certainly a false positive). Returns nil if no candidate
+// validates.
+func findValidSPS(raw []byte) []byte {
+	from := 0
+	for {
+		cand, next := findNALWithTypeAt(raw, 7, from)
+		if cand == nil {
+			return nil
+		}
+		if sps, err := avc.ParseSPSNALUnit(cand, false); err == nil && sps != nil {
+			if sps.Width >= 32 && sps.Height >= 32 {
+				return cand
+			}
+		}
+		from = next
+	}
+}
+
+// looksLikePPS rejects oversized blobs that are almost certainly
+// payload data masquerading as a PPS. Real PPS units are typically
+// <100 bytes; we allow 256 as a conservative ceiling.
+func looksLikePPS(pps []byte) bool {
+	return len(pps) > 0 && len(pps) <= 256
+}
+
 // findNALWithType returns the first NAL with the given nal_unit_type
-// (low 5 bits of the NAL header byte) in `raw`, or nil when not found.
-// Matches both 4-byte (00 00 00 01) and 3-byte (00 00 01) Annex-B start
-// codes and on `(headerByte & 0x1F) == nalType`, so any nal_ref_idc
-// (high bits) accepts — production streams use 0x67 (nal_ref_idc=3,
-// type=7) for SPS but in principle 0x07 (nal_ref_idc=0) is also valid.
-func findNALWithType(raw []byte, nalType byte) []byte {
-	for i := 0; i+4 < len(raw); i++ {
+// in `raw`, starting the scan from `start`. Matches both 4-byte and
+// 3-byte Annex-B start codes.
+func findNALWithType(raw []byte, nalType byte, start int) []byte {
+	body, _ := findNALWithTypeAt(raw, nalType, start)
+	return body
+}
+
+// findNALWithTypeAt is like findNALWithType but also returns the byte
+// offset of the matched NAL header so callers can resume scanning past
+// a failed-validation candidate.
+func findNALWithTypeAt(raw []byte, nalType byte, start int) (body []byte, headerIdx int) {
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i+4 < len(raw); i++ {
 		if raw[i] != 0x00 {
 			continue
 		}
 		// 4-byte start code: 00 00 00 01
-		if i+4 < len(raw) && raw[i+1] == 0x00 && raw[i+2] == 0x00 && raw[i+3] == 0x01 {
+		if raw[i+1] == 0x00 && raw[i+2] == 0x00 && raw[i+3] == 0x01 {
 			if raw[i+4]&0x1F == nalType {
-				return extractNALBody(raw, i+4)
+				return extractNALBody(raw, i+4), i + 4
 			}
+			continue
 		}
 		// 3-byte start code: 00 00 01
-		if i+3 < len(raw) && raw[i+1] == 0x00 && raw[i+2] == 0x01 {
+		if raw[i+1] == 0x00 && raw[i+2] == 0x01 {
 			if raw[i+3]&0x1F == nalType {
-				return extractNALBody(raw, i+3)
+				return extractNALBody(raw, i+3), i + 3
 			}
 		}
 	}
-	return nil
+	return nil, len(raw)
 }
 
 // extractNALBody returns the bytes of a single NAL starting at startIdx

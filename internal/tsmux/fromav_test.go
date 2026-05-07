@@ -224,20 +224,24 @@ func TestFeedWirePacketNilInputs(t *testing.T) {
 	}
 }
 
+// realSPS is a captured 1080p Main@4.0 SPS — long enough that
+// mp4ff.avc.ParseSPSNALUnit decodes it to a valid frame size, so the
+// scanner's validation step accepts it. Used by tests that need a
+// scannable SPS.
+var realSPS = []byte{0x67, 0x4d, 0x40, 0x28, 0xeb, 0x05, 0x07, 0x80, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc6, 0x58}
+
 // FindH264ParameterSets must locate SPS (NAL type 7) + PPS (NAL type 8)
 // inside an Annex-B byte stream. Both 4-byte and 3-byte start codes are
 // in production use (the muxer used by gomedia outputs 4-byte; some
 // embedded encoders / RTSP sources emit 3-byte).
 func TestFindH264ParameterSetsBothPresent(t *testing.T) {
-	// Realistic 1080p Main@4.0 SPS + a typical Main-profile PPS.
-	sps := []byte{0x67, 0x4d, 0x40, 0x28, 0xeb, 0x05, 0x07, 0x80, 0x44, 0x00}
 	pps := []byte{0x68, 0xee, 0x3c, 0x80}
 	idr := []byte{0x65, 0x88, 0x80, 0x40, 0x00, 0x00, 0x00}
 
 	startCode := []byte{0, 0, 0, 1}
 	stream := make([]byte, 0, 64)
 	stream = append(stream, startCode...)
-	stream = append(stream, sps...)
+	stream = append(stream, realSPS...)
 	stream = append(stream, startCode...)
 	stream = append(stream, pps...)
 	stream = append(stream, startCode...)
@@ -261,12 +265,11 @@ func TestFindH264ParameterSetsBothPresent(t *testing.T) {
 // 3-byte Annex-B start codes (00 00 01) are valid and used by some
 // encoders. The scanner must accept them.
 func TestFindH264ParameterSets3ByteStartCode(t *testing.T) {
-	sps := []byte{0x67, 0x42, 0xc0, 0x1e}
 	pps := []byte{0x68, 0xce, 0x38, 0x80}
 
 	startCode := []byte{0, 0, 1}
 	stream := append([]byte{}, startCode...)
-	stream = append(stream, sps...)
+	stream = append(stream, realSPS...)
 	stream = append(stream, startCode...)
 	stream = append(stream, pps...)
 
@@ -282,15 +285,14 @@ func TestFindH264ParameterSets3ByteStartCode(t *testing.T) {
 // SPS without a trailing NAL still returns the SPS body up to end of
 // buffer. (PPS missing returns nil for PPS — caller handles.)
 func TestFindH264ParameterSetsSPSOnlyAtEnd(t *testing.T) {
-	sps := []byte{0x67, 0x42, 0xc0, 0x1e, 0xff, 0xee}
-	stream := append([]byte{0, 0, 0, 1}, sps...)
+	stream := append([]byte{0, 0, 0, 1}, realSPS...)
 
 	gotSPS, gotPPS := FindH264ParameterSets(stream)
 	if gotSPS == nil {
 		t.Fatal("SPS not found")
 	}
-	if len(gotSPS) != len(sps) {
-		t.Errorf("SPS body length = %d, want %d", len(gotSPS), len(sps))
+	if len(gotSPS) != len(realSPS) {
+		t.Errorf("SPS body length = %d, want %d", len(gotSPS), len(realSPS))
 	}
 	if gotPPS != nil {
 		t.Errorf("PPS should be nil when not present, got %v", gotPPS)
@@ -310,11 +312,10 @@ func TestFindH264ParameterSetsAbsent(t *testing.T) {
 // The returned slices must be COPIES of the matched bytes — caller may
 // retain them long-term while the input buffer is reused.
 func TestFindH264ParameterSetsReturnsCopies(t *testing.T) {
-	sps := []byte{0x67, 0x42, 0xc0, 0x1e}
 	pps := []byte{0x68, 0xce, 0x38, 0x80}
-	stream := make([]byte, 0, 4+len(sps)+4+len(pps))
+	stream := make([]byte, 0, 4+len(realSPS)+4+len(pps))
 	stream = append(stream, 0, 0, 0, 1)
-	stream = append(stream, sps...)
+	stream = append(stream, realSPS...)
 	stream = append(stream, 0, 0, 0, 1)
 	stream = append(stream, pps...)
 
@@ -328,5 +329,68 @@ func TestFindH264ParameterSetsReturnsCopies(t *testing.T) {
 	}
 	if gotPPS[0] != 0x68 {
 		t.Errorf("PPS was a slice into input; expected copy, got first byte 0x%x", gotPPS[0])
+	}
+}
+
+// A byte sequence that LOOKS like an Annex-B start code + nal_unit_type 7
+// header, but whose body fails mp4ff SPS parsing, must NOT be returned
+// as SPS. Random TS payload data containing 00 00 00 01 0x67 sequences
+// has appeared in production and previously surfaced as a 1.1KB blob
+// that downstream lal serialised into a bogus AVC sequence header
+// (width=16, height=16, ProfileIdc=1).
+func TestFindH264ParameterSetsRejectsInvalidCandidate(t *testing.T) {
+	// A start code followed by 0x67 then random bytes — mp4ff will
+	// reject this as a malformed SPS.
+	junk := []byte{
+		0x00, 0x00, 0x00, 0x01, 0x67,
+		0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44,
+	}
+	gotSPS, _ := FindH264ParameterSets(junk)
+	if gotSPS != nil {
+		t.Errorf("invalid SPS-shaped bytes must be rejected, got %d bytes back", len(gotSPS))
+	}
+}
+
+// When the stream contains a leading invalid SPS-shaped sequence and a
+// later valid one, the scanner must skip past the invalid match and
+// return the real SPS.
+func TestFindH264ParameterSetsSkipsInvalidThenFindsValid(t *testing.T) {
+	// First a junk 0x67 (won't parse), then a real SPS, then a PPS.
+	junk := []byte{0x00, 0x00, 0x00, 0x01, 0x67, 0xAA, 0xBB, 0xCC}
+	pps := []byte{0x68, 0xce, 0x38, 0x80}
+
+	stream := append([]byte{}, junk...)
+	stream = append(stream, 0, 0, 0, 1)
+	stream = append(stream, realSPS...)
+	stream = append(stream, 0, 0, 0, 1)
+	stream = append(stream, pps...)
+
+	gotSPS, gotPPS := FindH264ParameterSets(stream)
+	if gotSPS == nil {
+		t.Fatal("expected the real SPS to be returned after skipping the invalid candidate")
+	}
+	if len(gotSPS) != len(realSPS) {
+		t.Errorf("returned SPS length = %d, want %d (matched the junk instead?)", len(gotSPS), len(realSPS))
+	}
+	if gotPPS == nil {
+		t.Fatal("PPS not found")
+	}
+}
+
+// PPS with implausible size (>256 bytes) is rejected — typical PPS is
+// well under 100 bytes; a >1KB blob is almost certainly payload.
+func TestFindH264ParameterSetsRejectsOversizedPPS(t *testing.T) {
+	// Construct: real SPS, then 0x68 followed by 300 bytes of "payload"
+	// with no following start code (so extractNALBody returns the lot).
+	stream := append([]byte{0, 0, 0, 1}, realSPS...)
+	stream = append(stream, 0, 0, 0, 1, 0x68)
+	stream = append(stream, make([]byte, 300)...)
+
+	gotSPS, gotPPS := FindH264ParameterSets(stream)
+	if gotSPS == nil {
+		t.Fatal("SPS should still be returned")
+	}
+	if gotPPS != nil {
+		t.Errorf("oversized PPS (%d bytes) must be rejected", len(gotPPS))
 	}
 }
