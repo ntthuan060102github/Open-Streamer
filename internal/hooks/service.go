@@ -39,9 +39,10 @@ import (
 // metricsHooks abstracts the Prometheus surface the dispatcher writes to.
 // Nil-safe: tests that wire only hooks can omit the metrics dependency.
 type metricsHooks struct {
-	delivery     *prometheus.CounterVec // {hook_id, hook_type, outcome}
-	eventDropped *prometheus.CounterVec // {hook_id}
-	queueDepth   *prometheus.GaugeVec   // {hook_id}
+	delivery     *prometheus.CounterVec   // {hook_id, hook_type, outcome, reason}
+	eventDropped *prometheus.CounterVec   // {hook_id}
+	queueDepth   *prometheus.GaugeVec     // {hook_id}
+	batchSize    *prometheus.HistogramVec // {hook_id}
 }
 
 // ErrHookTestUnsupported is returned when the hook type cannot receive a synthetic test delivery.
@@ -92,6 +93,7 @@ func New(i do.Injector) (*Service, error) {
 			delivery:     m.HooksDeliveryTotal,
 			eventDropped: m.HooksEventsDroppedTotal,
 			queueDepth:   m.HooksBatchQueueDepth,
+			batchSize:    m.HooksBatchSize,
 		}
 	}
 	return svc, nil
@@ -131,14 +133,34 @@ func (s *Service) DeliverTestEvent(ctx context.Context, id domain.HookID) error 
 	case domain.HookTypeFile:
 		err := s.deliverFile(h, ev)
 		if err != nil {
-			s.observeDelivery(h, "failure")
+			s.observeDelivery(h, "failure", classifyFileDeliveryErr(err))
 		} else {
-			s.observeDelivery(h, "success")
+			s.observeDelivery(h, "success", "ok")
 		}
 		return err
 	default:
 		return fmt.Errorf("%w: %s", ErrHookTestUnsupported, h.Type)
 	}
+}
+
+// classifyFileDeliveryErr maps a file-sink error onto the same `reason`
+// taxonomy as HTTP delivery so dashboards can use one expression to
+// alert across both hook types. File errors are simpler — there's no
+// transport / status distinction — so we collapse most failures into
+// "transport" (filesystem-level) with "encode" reserved for marshal
+// failures emitted by deliverFile itself.
+func classifyFileDeliveryErr(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	msg := err.Error()
+	switch {
+	case strings.HasPrefix(msg, "file delivery: marshal"):
+		return "encode"
+	case strings.Contains(msg, "permission denied"), strings.Contains(msg, "no such file"):
+		return "transport"
+	}
+	return "transport"
 }
 
 // Start subscribes to all domain events and begins dispatching.
@@ -215,9 +237,9 @@ func (s *Service) dispatch(ctx context.Context, event domain.Event) error {
 					"stream_code", event.StreamCode,
 					"err", err,
 				)
-				s.observeDelivery(h, "failure")
+				s.observeDelivery(h, "failure", classifyFileDeliveryErr(err))
 			} else {
-				s.observeDelivery(h, "success")
+				s.observeDelivery(h, "success", "ok")
 			}
 		default:
 			slog.Warn("hooks: unknown hook type", "hook_id", h.ID, "type", h.Type)
@@ -344,9 +366,10 @@ func (s *Service) deliverFile(h *domain.Hook, event domain.Event) error {
 }
 
 // observeDelivery bumps the per-hook delivery counter labelled with the
-// outcome ("success" / "failure"). Nil-safe: tests without metrics injection
-// pass through without writing anything.
-func (s *Service) observeDelivery(h *domain.Hook, outcome string) {
+// outcome ("success"/"failure") and reason (see classifyHookDeliveryErr
+// for the reason taxonomy; pass "ok" on success). Nil-safe: tests
+// without metrics injection pass through without writing anything.
+func (s *Service) observeDelivery(h *domain.Hook, outcome, reason string) {
 	if s.m == nil {
 		return
 	}
@@ -354,30 +377,47 @@ func (s *Service) observeDelivery(h *domain.Hook, outcome string) {
 		"hook_id":   string(h.ID),
 		"hook_type": string(h.Type),
 		"outcome":   outcome,
+		"reason":    reason,
 	}).Inc()
 }
 
 // batchMetricsFor pre-binds the per-hook Prometheus instruments the batcher
-// hot path uses so each enqueue/flush avoids a WithLabelValues map lookup.
-// Returns the zero value when the metrics dependency wasn't injected.
+// hot path uses so each enqueue/flush avoids a WithLabelValues map lookup
+// for the high-frequency drop / queue-depth gauges. Delivery counter is
+// looked up dynamically (per outcome+reason combination) because pre-
+// binding all 7+ outcome/reason pairs would clutter the struct without
+// meaningful CPU savings — the lookup is one ns-scale map hit per batch
+// flush. Returns the zero value when the metrics dependency wasn't
+// injected.
 func (s *Service) batchMetricsFor(h *domain.Hook) batchMetrics {
 	if s.m == nil {
 		return batchMetrics{}
 	}
+	hookID := string(h.ID)
+	hookType := string(h.Type)
 	return batchMetrics{
-		deliverSuccess: s.m.delivery.With(prometheus.Labels{
-			"hook_id":   string(h.ID),
-			"hook_type": string(h.Type),
-			"outcome":   "success",
-		}),
-		deliverFailure: s.m.delivery.With(prometheus.Labels{
-			"hook_id":   string(h.ID),
-			"hook_type": string(h.Type),
-			"outcome":   "failure",
-		}),
-		dropped:    s.m.eventDropped.WithLabelValues(string(h.ID)),
-		queueDepth: s.m.queueDepth.WithLabelValues(string(h.ID)),
+		observeDelivery: func(outcome, reason string) {
+			s.m.delivery.With(prometheus.Labels{
+				"hook_id":   hookID,
+				"hook_type": hookType,
+				"outcome":   outcome,
+				"reason":    reason,
+			}).Inc()
+		},
+		dropped:    s.m.eventDropped.WithLabelValues(hookID),
+		queueDepth: s.m.queueDepth.WithLabelValues(hookID),
+		batchSize:  s.batchSizeFor(h),
 	}
+}
+
+// batchSizeFor returns the per-hook batch-size histogram observer, or nil
+// when the metric isn't registered (tests). Split out from batchMetricsFor
+// to keep the s.m == nil guard from spreading.
+func (s *Service) batchSizeFor(h *domain.Hook) prometheus.Observer {
+	if s.m == nil || s.m.batchSize == nil {
+		return nil
+	}
+	return s.m.batchSize.WithLabelValues(string(h.ID))
 }
 
 // lockForFile returns the per-target mutex, lazy-creating one on first use.

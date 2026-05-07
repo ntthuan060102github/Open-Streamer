@@ -263,6 +263,7 @@ func (s *Service) serveHLSAdaptive(ctx context.Context, stream *domain.Stream, s
 				hasAudio:    hasAudio,
 				failoverGen: func() uint64 { return s.hlsFailoverGenSnapshot(code) },
 				segCount:    s.hlsSegCounter(code, r.Slug),
+				segWriteDur: s.segWriteDurObserver(code, "hls"),
 			}
 			runHLSSegmenter(ctx, code, sub, shardDir, shardManifest,
 				segSec, win, hist, eph, opts)

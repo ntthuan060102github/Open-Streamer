@@ -1,6 +1,7 @@
 package publisher
 
 import (
+	"context"
 	"sort"
 	"sync"
 	"time"
@@ -97,6 +98,7 @@ func (s *Service) getOrCreatePushState(streamID domain.StreamCode, url string) *
 func (s *Service) setPushStatus(streamID domain.StreamCode, url string, status PushStatus) {
 	st := s.getOrCreatePushState(streamID, url)
 	st.mu.Lock()
+	prev := st.status
 	st.status = status
 	if status == PushStatusActive {
 		st.connectedAt = time.Now()
@@ -110,6 +112,40 @@ func (s *Service) setPushStatus(streamID domain.StreamCode, url string, status P
 	if g := s.pushStateGauge(streamID, url); g != nil {
 		g.Set(float64(pushStatusToInt(status)))
 	}
+	// Emit only on transitions — re-entering the same status (e.g. setPushStatus
+	// called twice in a row from a flapping retry path) would otherwise spam
+	// hooks with redundant deliveries.
+	if prev != status && s.bus != nil {
+		s.publishPushEvent(streamID, url, status)
+	}
+}
+
+// publishPushEvent maps the PushStatus enum to a domain.EventType and emits on
+// the bus. Payload carries `url` so consumers can route by destination without
+// digging into runtime API. Background context is intentional here — the push
+// goroutine outlives any single request, and event delivery is async via the
+// worker pool — so we deliberately decouple from per-request cancellation.
+//
+//nolint:contextcheck // intentional Background — see comment above.
+func (s *Service) publishPushEvent(streamID domain.StreamCode, url string, status PushStatus) {
+	var typ domain.EventType
+	switch status {
+	case PushStatusStarting:
+		typ = domain.EventPushStarted
+	case PushStatusActive:
+		typ = domain.EventPushActive
+	case PushStatusReconnecting:
+		typ = domain.EventPushReconnecting
+	case PushStatusFailed:
+		typ = domain.EventPushFailed
+	default:
+		return
+	}
+	s.bus.Publish(context.Background(), domain.Event{
+		Type:       typ,
+		StreamCode: streamID,
+		Payload:    map[string]any{"url": url},
+	})
 }
 
 // pushStatusToInt encodes PushStatus as the small integer reported by the

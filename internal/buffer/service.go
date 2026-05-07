@@ -6,6 +6,7 @@ package buffer
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/do/v2"
@@ -110,11 +111,70 @@ func New(i do.Injector) (*Service, error) {
 	if mm, err := do.Invoke[*metrics.Metrics](i); err == nil {
 		m = mm
 	}
-	return &Service{
+	svc := &Service{
 		cfg:     cfg,
 		m:       m,
 		buffers: make(map[domain.StreamCode]*ringBuffer),
-	}, nil
+	}
+	if m != nil {
+		// Sampler runs forever — it's cheap (constant-time per stream) and
+		// has no graceful-stop contract because the process owns its own
+		// lifecycle. 2s is fast enough for the 15s default Prometheus
+		// scrape interval to see fresh-ish values without overlap, while
+		// being slow enough that the sampler doesn't show up in CPU
+		// profiles for production-sized stream counts (~hundreds).
+		go svc.sampleLoop(2 * time.Second)
+	}
+	return svc, nil
+}
+
+// sampleLoop periodically computes BufferCapacityUsed (max channel depth
+// across subscribers, normalised to 0..1) and BufferSubscribers (count) per
+// stream and writes them to the gauges. Reads are RLock-only — no impact
+// on the write hot path.
+func (s *Service) sampleLoop(interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for range t.C {
+		s.sampleOnce()
+	}
+}
+
+// sampleOnce takes one snapshot. Split out so a future graceful-shutdown
+// hook can call it once on the way out for a final-tick refresh, and so
+// tests can drive the metrics deterministically without relying on time.
+func (s *Service) sampleOnce() {
+	if s.m == nil {
+		return
+	}
+	type bufSnap struct {
+		code     domain.StreamCode
+		maxDepth int
+		nSubs    int
+		cap      int
+	}
+	s.mu.RLock()
+	snaps := make([]bufSnap, 0, len(s.buffers))
+	for code, rb := range s.buffers {
+		rb.mu.Lock()
+		max := 0
+		for _, sub := range rb.subs {
+			if d := len(sub.ch); d > max {
+				max = d
+			}
+		}
+		snaps = append(snaps, bufSnap{code: code, maxDepth: max, nSubs: len(rb.subs), cap: s.cfg.Capacity})
+		rb.mu.Unlock()
+	}
+	s.mu.RUnlock()
+	for _, sn := range snaps {
+		var frac float64
+		if sn.cap > 0 {
+			frac = float64(sn.maxDepth) / float64(sn.cap)
+		}
+		s.m.BufferCapacityUsed.WithLabelValues(string(sn.code)).Set(frac)
+		s.m.BufferSubscribers.WithLabelValues(string(sn.code)).Set(float64(sn.nSubs))
+	}
 }
 
 // NewServiceForTesting creates a Service without DI, for use in unit tests.

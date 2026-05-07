@@ -49,8 +49,9 @@ func (s *Service) serveDASH(ctx context.Context, streamID domain.StreamCode) {
 		cfg.LiveHistory,
 		cfg.LiveEphemeral,
 		&dashRunOpts{
-			packAudio: true,
-			segCount:  s.dashSegCounter(streamID, "main"),
+			packAudio:   true,
+			segCount:    s.dashSegCounter(streamID, "main"),
+			segWriteDur: s.segWriteDurObserver(streamID, "dash"),
 		},
 	)
 

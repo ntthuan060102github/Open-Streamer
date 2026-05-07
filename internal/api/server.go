@@ -20,6 +20,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
 	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
+	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -50,6 +51,10 @@ type Server struct {
 	// is not wired (e.g. minimal API-only test harness) — the route is
 	// then skipped at mount time.
 	pub *publisher.Service
+
+	// m exposes the Prometheus metrics surface; nil when running tests
+	// without DI. Used by the request-duration middleware below.
+	m *metrics.Metrics
 
 	router *chi.Mux
 	http   *http.Server
@@ -87,7 +92,50 @@ func New(i do.Injector) (*Server, error) {
 	if pub, err := do.Invoke[*publisher.Service](i); err == nil {
 		s.pub = pub
 	}
+	// Metrics is optional for the same reason — minimal harness tests
+	// build the server without DI.
+	if m, err := do.Invoke[*metrics.Metrics](i); err == nil {
+		s.m = m
+	}
 	return s, nil
+}
+
+// httpDurationMiddleware records request latency into the
+// open_streamer_http_request_duration_seconds histogram. Routes use chi
+// route patterns (e.g. "/streams/{code}") rather than full paths so label
+// cardinality stays bounded by the number of registered handlers, not by
+// the number of unique stream codes / hook IDs / segment numbers in
+// flight. Pre-promhttp metrics endpoint and /healthz both fast-path bypass
+// the wrapper to avoid self-instrumenting the scraper.
+func (s *Server) httpDurationMiddleware(next http.Handler) http.Handler {
+	if s.m == nil || s.m.HTTPRequestDuration == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Self-scraping carries no useful signal and would skew percentile
+		// dashboards downward (it's fast and constant-rate). /healthz and
+		// /readyz are similarly noise — usually probed every 1-5s by a
+		// load balancer.
+		switch r.URL.Path {
+		case "/metrics", "/healthz", "/readyz":
+			next.ServeHTTP(w, r)
+			return
+		}
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		start := time.Now()
+		next.ServeHTTP(ww, r)
+		// chi populates the route ctx during routing; reading after
+		// ServeHTTP returns gives the matched template (or "" for 404).
+		route := chi.RouteContext(r.Context()).RoutePattern()
+		if route == "" {
+			route = "unknown"
+		}
+		s.m.HTTPRequestDuration.WithLabelValues(
+			route,
+			r.Method,
+			fmt.Sprintf("%d", ww.Status()),
+		).Observe(time.Since(start).Seconds())
+	})
 }
 
 func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
@@ -100,6 +148,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	}
 	r.Use(middleware.Recoverer)
 	r.Use(skipMediaLogger(slogAccessLogger))
+	r.Use(s.httpDurationMiddleware)
 	r.Use(middleware.Timeout(120 * time.Second))
 
 	r.Get("/healthz", healthz)

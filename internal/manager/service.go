@@ -928,7 +928,16 @@ func (s *Service) runProbe(streamID domain.StreamCode, state *streamState, task 
 	defer cancel()
 
 	if err := s.ingestor.Probe(probeCtx, task.input); err != nil {
+		// Probe failure: input is still unhealthy. Record so dashboards can
+		// distinguish "probe loop alive but target down" from "probe loop
+		// dead" (= no probe metrics for N minutes — alert).
+		if s.m != nil && s.m.ManagerProbeAttemptsTotal != nil {
+			s.m.ManagerProbeAttemptsTotal.WithLabelValues(string(streamID), "failure").Inc()
+		}
 		return // stays StatusDegraded; probe is retried after failbackProbeCooldown
+	}
+	if s.m != nil && s.m.ManagerProbeAttemptsTotal != nil {
+		s.m.ManagerProbeAttemptsTotal.WithLabelValues(string(streamID), "success").Inc()
 	}
 
 	state.mu.Lock()
@@ -948,6 +957,22 @@ func (s *Service) runProbe(streamID domain.StreamCode, state *streamState, task 
 		"input_priority", task.priority,
 		"was_exhausted", wasExhausted,
 	)
+
+	// Emit a dedicated `input.recovered` event distinct from the
+	// `input.failover` reason="failback"/"recovery" path. Consumers
+	// subscribing to recovery transitions (oncall dashboards, automatic
+	// page-resolve hooks) shouldn't have to inspect the failover payload
+	// reason field — `input.recovered` is the unambiguous signal that a
+	// previously-degraded source is healthy again. The follow-on
+	// failover (if any) still emits `input.failover` separately.
+	s.bus.Publish(state.monCtx, domain.Event{
+		Type:       domain.EventInputRecovered,
+		StreamCode: streamID,
+		Payload: map[string]any{
+			"input_priority": task.priority,
+			"was_exhausted":  wasExhausted,
+		},
+	})
 
 	// Two reasons to failover after a successful probe:
 	//   1. Exhausted recovery — the active worker died (EOF / non-retriable

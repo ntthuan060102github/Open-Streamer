@@ -630,6 +630,31 @@ func (s *Service) dashSegCounter(streamID domain.StreamCode, profile string) pro
 	return s.m.PublisherSegmentsTotal.WithLabelValues(string(streamID), "dash", profile)
 }
 
+// segWriteDurObserver pre-binds the segment-write-duration histogram for
+// the given stream + format. The histogram tracks wall-clock time spent
+// in os.WriteFile / writeFileAtomic — sustained P99 growth signals disk
+// I/O backpressure before BufferDropsTotal does. Nil-safe.
+func (s *Service) segWriteDurObserver(streamID domain.StreamCode, format string) prometheus.Observer {
+	if s.m == nil || s.m.PublisherSegmentWriteDuration == nil {
+		return nil
+	}
+	return s.m.PublisherSegmentWriteDuration.WithLabelValues(string(streamID), format)
+}
+
+// pushBytesObserver returns a closure that increments the per-(stream,
+// dest_url) push-bytes counter. Returning a closure (rather than the
+// raw Counter) lets the push packager remain agnostic of Prometheus
+// types — `func(n int)` is the smallest interface for "count bytes
+// written". Nil when metrics aren't wired so the packager can short-
+// circuit instead of paying a method-call per RTMP msg in tests.
+func (s *Service) pushBytesObserver(streamID domain.StreamCode, destURL string) func(int) {
+	if s.m == nil || s.m.PublisherPushBytes == nil {
+		return nil
+	}
+	c := s.m.PublisherPushBytes.WithLabelValues(string(streamID), destURL)
+	return func(n int) { c.Add(float64(n)) }
+}
+
 // pushStateGauge pre-binds the per-(stream, dest_url) push state gauge.
 // Nil-safe — push workers tolerate a nil gauge in tests.
 func (s *Service) pushStateGauge(streamID domain.StreamCode, destURL string) prometheus.Gauge {

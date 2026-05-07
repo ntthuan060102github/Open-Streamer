@@ -69,6 +69,10 @@ type dashRunOpts struct {
 	// segCount counts {video, audio} segment writes — pre-bound to
 	// {stream_code,format=dash,profile} so the hot path is map-lookup-free.
 	segCount prometheus.Counter
+	// segWriteDur observes os.WriteFile latency for both audio and video
+	// segments (label format="dash"). Single observer covers both because
+	// the "where is the disk slow" question doesn't differ by track type.
+	segWriteDur prometheus.Observer
 }
 
 // runDASHFMP4Packager is the entry point used by both serveDASH and serveDASHAdaptive.
@@ -114,6 +118,7 @@ func runDASHFMP4Packager(
 		}
 		p.packAudio = opts.packAudio
 		p.segCount = opts.segCount
+		p.segWriteDur = opts.segWriteDur
 	}
 
 	p.run(ctx, sub)
@@ -206,6 +211,8 @@ type dashFMP4Packager struct {
 
 	// Pre-bound DASH segment counter (covers both video + audio writes); nil-safe.
 	segCount prometheus.Counter
+	// Pre-bound segment-write-duration histogram observer; nil-safe.
+	segWriteDur prometheus.Observer
 }
 
 // dashStreamTypeForCodec maps an AV packet codec to the gomedia TS stream
@@ -891,9 +898,13 @@ func (p *dashFMP4Packager) writeVideoSegmentLocked() error {
 		p.vSegN--
 		return fmt.Errorf("encode video segment: %w", err)
 	}
+	writeStart := time.Now()
 	if err := writeFileAtomic(path, buf.Bytes()); err != nil {
 		p.vSegN--
 		return fmt.Errorf("write video segment: %w", err)
+	}
+	if p.segWriteDur != nil {
+		p.segWriteDur.Observe(time.Since(writeStart).Seconds())
 	}
 
 	if p.segCount != nil {
@@ -955,9 +966,13 @@ func (p *dashFMP4Packager) writeAudioSegmentLocked() error {
 		p.aSegN--
 		return fmt.Errorf("encode audio segment: %w", err)
 	}
+	writeStart := time.Now()
 	if err := writeFileAtomic(path, buf.Bytes()); err != nil {
 		p.aSegN--
 		return fmt.Errorf("write audio segment: %w", err)
+	}
+	if p.segWriteDur != nil {
+		p.segWriteDur.Observe(time.Since(writeStart).Seconds())
 	}
 
 	if p.segCount != nil {

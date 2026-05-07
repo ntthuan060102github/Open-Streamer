@@ -871,6 +871,43 @@ func (c *Coordinator) reconcileOnce(ctx context.Context) {
 				"stream_code", st.Code, "err", err)
 		}
 	}
+	c.refreshStatusGauge(streams)
+	if c.m != nil && c.m.ReconcilerLastRunSeconds != nil {
+		// Stamp wall-clock seconds so a Grafana panel can compute "time
+		// since last reconcile" via `time() - this gauge`. Set on every
+		// successful pass — the absence of advancement across scrapes is
+		// the alert signal.
+		c.m.ReconcilerLastRunSeconds.Set(float64(time.Now().Unix()))
+	}
+}
+
+// refreshStatusGauge updates open_streamer_streams_total per status bucket.
+// Computes the snapshot from the just-listed stream set + current
+// coordinator status query so dashboards see one consistent picture per
+// reconciler tick. Buckets that go to zero (e.g. last degraded stream
+// just recovered) are written explicitly rather than dropped — Prometheus
+// gauges that disappear and reappear cause Grafana panels to render
+// "No Data" gaps instead of a clean horizontal line at zero.
+func (c *Coordinator) refreshStatusGauge(streams []*domain.Stream) {
+	if c.m == nil || c.m.StreamsTotal == nil {
+		return
+	}
+	counts := map[domain.StreamStatus]int{
+		domain.StatusIdle:     0,
+		domain.StatusActive:   0,
+		domain.StatusDegraded: 0,
+		domain.StatusStopped:  0,
+	}
+	for _, st := range streams {
+		if st == nil {
+			continue
+		}
+		s := c.StreamStatus(st.Code)
+		counts[s]++
+	}
+	for status, n := range counts {
+		c.m.StreamsTotal.WithLabelValues(string(status)).Set(float64(n))
+	}
 }
 
 // transcoderConfigWithWatermark returns a shallow clone of stream.Transcoder

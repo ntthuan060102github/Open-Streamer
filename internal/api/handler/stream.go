@@ -271,6 +271,19 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, map[string]any{"data": *body})
 		return
 	}
+	// Existing record was overwritten with new config — emit so audit/inventory
+	// hooks can sync without polling. Payload carries the diff trigger flags
+	// the coordinator already computed so consumers know whether the pipeline
+	// was just persisted, freshly enabled, or restarted with topology changes.
+	h.bus.Publish(r.Context(), domain.Event{
+		Type:       domain.EventStreamUpdated,
+		StreamCode: body.Code,
+		Payload: map[string]any{
+			"was_running": wasRunning,
+			"now_enabled": nowEnabled,
+			"disabled":    body.Disabled,
+		},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"data": *body})
 }
 

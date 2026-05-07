@@ -178,6 +178,20 @@ func (h *ConfigHandler) ReplaceConfigYAML(w http.ResponseWriter, r *http.Request
 	streamsAfter, _ := h.streamRepo.List(r.Context(), store.StreamFilter{})
 	hooksAfter, _ := h.hookRepo.List(r.Context())
 	vodAfter, _ := h.vodRepo.List(r.Context())
+
+	// Bulk YAML replace fans out into many smaller mutations (streams + hooks
+	// + vod + global config) but operators usually want ONE event for the
+	// whole transaction — easier to correlate in audit dashboards than 50
+	// individual stream.updated/hook.updated entries. The fine-grained events
+	// are still emitted by their respective Apply paths. Nil-safe so tests
+	// building the handler without DI don't NPE.
+	if h.bus != nil {
+		h.bus.Publish(r.Context(), domain.Event{
+			Type:    domain.EventConfigChanged,
+			Payload: map[string]any{"source": "put_config_yaml"},
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"global_config": current,
 		"streams":       streamsAfter,

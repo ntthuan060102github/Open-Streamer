@@ -111,6 +111,8 @@ walkthrough in [USER_GUIDE.md](./docs/USER_GUIDE.md).
 | [CONFIG.md](./docs/CONFIG.md) | Operator | Every config field with examples + defaults reference |
 | [ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Contributor | Subsystem design, invariants, data flow |
 | [APP_FLOW.md](./docs/APP_FLOW.md) | Contributor / Ops | Step-by-step traces (boot, failover, transcoder crash, hot-reload) + full events reference |
+| [EVENTS.md](./docs/EVENTS.md) | Operator / Integrator | Catalogue of every domain event, payload shape, hook recipes |
+| [METRICS.md](./docs/METRICS.md) | Operator / SRE | Prometheus metrics reference + dashboard / alert PromQL examples |
 | [FEATURES_CHECKLIST.md](./docs/FEATURES_CHECKLIST.md) | Everyone | What's implemented today, what's planned, what's locked-out |
 
 API spec auto-generated at `/swagger/` (run `make swagger` to

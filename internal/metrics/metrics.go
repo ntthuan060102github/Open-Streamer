@@ -98,6 +98,74 @@ type Metrics struct {
 	// stream, 0 otherwise. Combine with rate(DVRSegmentsWrittenTotal) to
 	// alert on "DVR enabled but no segments flowing".
 	DVRRecordingActive *prometheus.GaugeVec
+	// DVRRetentionPrunedBytes counts bytes deleted by the retention loop
+	// per stream. Useful for capacity planning (how much churn the
+	// retention policy is creating) and as the canonical signal that
+	// retention is actually running. Pair with the rate of incoming
+	// DVRBytesWrittenTotal to verify steady-state behaviour.
+	DVRRetentionPrunedBytes *prometheus.CounterVec
+
+	// ── Buffer Hub (capacity + fan-out visibility) ────────────────────────────
+	// BufferCapacityUsed reports the MAX subscriber-channel depth on a
+	// stream's ring buffer, as a fraction of capacity (0.0 — 1.0). We
+	// emit max-across-subscribers (not per-consumer) because the buffer
+	// API doesn't know which consumer attached — operators get the
+	// leading-indicator signal (something is back-pressuring) without
+	// the label-cardinality blowup of one series per anonymous consumer.
+	// Refreshed by a sampler goroutine every BufferSampleInterval.
+	BufferCapacityUsed *prometheus.GaugeVec
+	// BufferSubscribers reports the number of active subscribers (consumer
+	// channels) on a stream's buffer. Visibility into fan-out density —
+	// confirms that publisher / transcoder / DVR have all attached, and
+	// catches "stream registered but no consumers" misconfigurations.
+	BufferSubscribers *prometheus.GaugeVec
+
+	// ── HTTP API (request observability) ──────────────────────────────────────
+	// HTTPRequestDuration is the standard request-latency histogram per
+	// route + method + status. Use route TEMPLATES (e.g. "/streams/{code}")
+	// not full paths to keep label cardinality bounded. Buckets cover the
+	// fast hot-path APIs (List, Get) and slow long-poll / sweep endpoints.
+	HTTPRequestDuration *prometheus.HistogramVec
+
+	// ── Publisher (segment write timing + push bytes) ─────────────────────────
+	// PublisherSegmentWriteDuration is the wall-clock time to write one
+	// HLS / DASH segment to disk. Sustained tail-latency growth signals
+	// disk I/O backpressure before BufferDropsTotal reflects it. Buckets
+	// cover the fast (single-rendition local SSD) and slow (network FS)
+	// regimes.
+	PublisherSegmentWriteDuration *prometheus.HistogramVec
+	// PublisherPushBytes counts bytes shipped per push destination. Useful
+	// for egress-cost dashboards (CDN bandwidth attribution per dest_url)
+	// and as the canonical "is push actually delivering data" signal.
+	PublisherPushBytes *prometheus.CounterVec
+
+	// ── Stream rollup (top-level operator dashboard) ──────────────────────────
+	// StreamsTotal reports the count of streams in each top-level status
+	// bucket. Reconciler refreshes this once per tick so a Grafana panel
+	// can show the system-wide health summary without scraping per-stream
+	// gauges and reducing client-side.
+	StreamsTotal *prometheus.GaugeVec
+
+	// ── Hooks (delivery error categorisation + batch sizing) ──────────────────
+	// HooksBatchSize is the per-delivery batch size histogram. Tunes
+	// `BatchMaxItems` — small batches = wasted HTTP overhead, large
+	// batches = stale data. Pair with HooksDeliveryTotal to see whether
+	// flushes are size-driven or interval-driven.
+	HooksBatchSize *prometheus.HistogramVec
+
+	// ── Manager (probe loop visibility) ───────────────────────────────────────
+	// ManagerProbeAttemptsTotal counts failback probe runs against
+	// degraded inputs, labelled by outcome (`success`/`failure`). Alert
+	// on absence of probes (`absent_over_time(...[5m]) > 0`) — silent
+	// probe loop means the manager never re-checks degraded inputs.
+	ManagerProbeAttemptsTotal *prometheus.CounterVec
+
+	// ── Reconciler (safety-net liveness) ──────────────────────────────────────
+	// ReconcilerLastRunSeconds is the Unix timestamp of the last
+	// successful reconciler tick. Should advance every 10s; an unchanged
+	// value across multiple scrapes means the reconciler goroutine has
+	// died — the safety net is gone.
+	ReconcilerLastRunSeconds prometheus.Gauge
 }
 
 // New registers all metrics and returns a Metrics instance.
@@ -191,8 +259,18 @@ func New(i do.Injector) (*Metrics, error) {
 
 		HooksDeliveryTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "open_streamer_hooks_delivery_total",
-			Help: "Total hook delivery attempts per hook, type and outcome (success|failure). For HTTP hooks each batch is one delivery.",
-		}, []string{"hook_id", "hook_type", "outcome"}),
+			// reason categorises failures so dashboards can split alert thresholds:
+			//   "ok"        — success
+			//   "timeout"   — context deadline / TCP timeout
+			//   "http_4xx"  — target returned 4xx (likely auth / payload bug, not transient)
+			//   "http_5xx"  — target returned 5xx (transient, expected to retry)
+			//   "transport" — connection refused / DNS / TLS handshake
+			//   "encode"    — body marshal / signing failure
+			// Successful deliveries record reason="ok" so a single PromQL
+			// expression `rate(...{reason!="ok"}[5m])` gives the failure rate
+			// regardless of category.
+			Help: "Total hook delivery attempts per hook, type, outcome (success|failure) and reason (ok|timeout|http_4xx|http_5xx|transport|encode). For HTTP hooks each batch is one delivery.",
+		}, []string{"hook_id", "hook_type", "outcome", "reason"}),
 
 		HooksEventsDroppedTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "open_streamer_hooks_events_dropped_total",
@@ -208,6 +286,65 @@ func New(i do.Injector) (*Metrics, error) {
 			Name: "open_streamer_dvr_recording_active",
 			Help: "1 while a DVR recording is being written for the stream, 0 otherwise.",
 		}, []string{"stream_code"}),
+
+		DVRRetentionPrunedBytes: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_dvr_retention_pruned_bytes_total",
+			Help: "Total bytes deleted by the DVR retention loop per stream. reason label classifies the trigger (age vs size).",
+		}, []string{"stream_code"}),
+
+		BufferCapacityUsed: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "open_streamer_buffer_capacity_used",
+			Help: "Max subscriber-channel depth on a stream's ring buffer as a fraction of capacity (0.0-1.0). Leading indicator before BufferDropsTotal increments.",
+		}, []string{"stream_code"}),
+
+		BufferSubscribers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "open_streamer_buffer_subscribers",
+			Help: "Currently active subscribers (consumer channels) on the stream's buffer.",
+		}, []string{"stream_code"}),
+
+		HTTPRequestDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "open_streamer_http_request_duration_seconds",
+			Help: "HTTP request latency per route template, method and status code. Buckets cover fast hot-path APIs and slow sweep endpoints.",
+			// 1ms..30s — covers JSON CRUD, swagger.json, slow YAML round-trips.
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		}, []string{"route", "method", "status"}),
+
+		PublisherSegmentWriteDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "open_streamer_publisher_segment_write_duration_seconds",
+			Help: "Wall-clock time to write one HLS/DASH segment to disk per stream and format. Sustained tail-latency rise signals disk I/O backpressure.",
+			// 1ms..2s — local SSD writes typically <50ms; network FS / busy
+			// disk can spike past 1s. Above 2s downstream players miss the
+			// segment-target window anyway.
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2},
+		}, []string{"stream_code", "format"}),
+
+		PublisherPushBytes: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_publisher_push_bytes_total",
+			Help: "Total bytes shipped per push destination (counts payload bytes only, excluding RTMP chunk headers).",
+		}, []string{"stream_code", "dest_url"}),
+
+		StreamsTotal: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "open_streamer_streams_total",
+			Help: "Number of streams currently in each top-level status (idle|active|degraded|stopped|exhausted). Refreshed by the coordinator reconciler.",
+		}, []string{"status"}),
+
+		HooksBatchSize: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "open_streamer_hooks_batch_size",
+			Help: "Number of events per HTTP hook delivery batch. Tunes BatchMaxItems — small batches = wasted overhead, large = stale data.",
+			// Powers of 2 from 1 to 1024 — covers tiny single-event flushes
+			// up to the typical max queue cap.
+			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
+		}, []string{"hook_id"}),
+
+		ManagerProbeAttemptsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_manager_probe_attempts_total",
+			Help: "Failback probe runs against degraded inputs per stream and outcome (success|failure).",
+		}, []string{"stream_code", "outcome"}),
+
+		ReconcilerLastRunSeconds: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "open_streamer_reconciler_last_run_seconds",
+			Help: "Unix timestamp of the most recent reconciler tick. Stale value across scrapes means the safety-net loop has stalled.",
+		}),
 	}
 
 	return m, nil

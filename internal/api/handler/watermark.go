@@ -11,6 +11,7 @@ import (
 	"github.com/samber/do/v2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/watermarks"
 )
 
@@ -30,12 +31,14 @@ const (
 // management widgets can be reused with minimal adaptation.
 type WatermarkHandler struct {
 	svc *watermarks.Service
+	bus events.Bus
 }
 
 // NewWatermarkHandler is the samber/do constructor.
 func NewWatermarkHandler(i do.Injector) (*WatermarkHandler, error) {
 	return &WatermarkHandler{
 		svc: do.MustInvoke[*watermarks.Service](i),
+		bus: do.MustInvoke[events.Bus](i),
 	}, nil
 }
 
@@ -159,6 +162,19 @@ func (h *WatermarkHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	asset, err := h.svc.Save(displayName, filename, src)
 	switch {
 	case err == nil:
+		// Audit event for asset library mutations — small payload (id +
+		// display name) so hooks can sync inventory without re-fetching
+		// the full asset list. Nil-safe for tests building the handler
+		// without DI.
+		if h.bus != nil {
+			h.bus.Publish(r.Context(), domain.Event{
+				Type: domain.EventWatermarkAssetCreated,
+				Payload: map[string]any{
+					"asset_id": string(asset.ID),
+					"name":     asset.Name,
+				},
+			})
+		}
 		writeJSON(w, http.StatusCreated, map[string]any{"data": asset})
 	case errors.Is(err, watermarks.ErrInvalidContent):
 		writeError(w, http.StatusUnsupportedMediaType, "INVALID_IMAGE", err.Error())
@@ -195,6 +211,12 @@ func (h *WatermarkHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 		serverError(w, r, "DELETE_FAILED", "delete watermark asset", err)
 		return
+	}
+	if h.bus != nil {
+		h.bus.Publish(r.Context(), domain.Event{
+			Type:    domain.EventWatermarkAssetDeleted,
+			Payload: map[string]any{"asset_id": string(id)},
+		})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

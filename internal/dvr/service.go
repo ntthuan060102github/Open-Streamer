@@ -467,7 +467,7 @@ func (s *Service) flushSegment(
 	sess.index.TotalSizeBytes += size
 	sess.index.LastSegmentAt = wallTime
 
-	s.applyRetention(sess, segDir)
+	s.applyRetention(sess, segDir) //nolint:contextcheck // applyRetention publishes events with intentional Background ctx (segmenter loop, not request-scoped)
 	writePlaylist(sess.segments, segDir, false)
 
 	if err := saveIndex(segDir, sess.index); err != nil {
@@ -593,6 +593,34 @@ func (s *Service) applyRetention(sess *recordingSession, segDir string) {
 		sess.index.TotalSizeBytes -= oldest.size
 		sess.index.SegmentCount--
 		sess.segments = sess.segments[1:]
+
+		// Emit one event per pruned segment so capacity / cost dashboards
+		// and downstream archivers can react. Reason classifies the trigger
+		// because operators alerting on aggressive retention want to know
+		// whether they hit the time floor or the size cap. Bus delivery is
+		// async via the worker pool so we don't slow the segmenter loop.
+		reason := "size"
+		if expired {
+			reason = "age"
+		}
+		// Background context is intentional — applyRetention runs from
+		// the long-lived segmenter loop, not a request-scoped path, so
+		// no caller cancellation to honour.
+		if s.bus != nil {
+			s.bus.Publish(context.Background(), domain.Event{ //nolint:contextcheck // intentional Background
+				Type:       domain.EventDVRSegmentPruned,
+				StreamCode: sess.recording.StreamCode,
+				Payload: map[string]any{
+					"recording_id":  sess.recording.ID,
+					"segment_index": oldest.index,
+					"size_bytes":    oldest.size,
+					"reason":        reason,
+				},
+			})
+		}
+		if s.m != nil && s.m.DVRRetentionPrunedBytes != nil {
+			s.m.DVRRetentionPrunedBytes.WithLabelValues(string(sess.recording.StreamCode)).Add(float64(oldest.size))
+		}
 
 		// Prune gaps that ended before the new oldest segment's wall time.
 		if len(sess.segments) > 0 {

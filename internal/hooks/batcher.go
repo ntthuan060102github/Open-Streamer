@@ -24,9 +24,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,11 +43,18 @@ import (
 // batchMetrics holds the pre-bound Prometheus instruments for one batcher.
 // Pre-binding once (instead of WithLabelValues per write) keeps the hot
 // path map-lookup-free. Any field may be nil when metrics aren't injected.
+//
+// observeDelivery is a closure that increments
+// `open_streamer_hooks_delivery_total` with the right (outcome, reason)
+// labels — pre-binding ALL six failure reasons would explode label
+// cardinality in the struct, so the closure looks them up via a tiny map
+// owned by service.batchMetricsFor. Single counter lookup per delivery
+// (~ns), well below the HTTP request cost it accompanies.
 type batchMetrics struct {
-	deliverSuccess prometheus.Counter
-	deliverFailure prometheus.Counter
-	dropped        prometheus.Counter
-	queueDepth     prometheus.Gauge
+	observeDelivery func(outcome, reason string)
+	dropped         prometheus.Counter
+	queueDepth      prometheus.Gauge
+	batchSize       prometheus.Observer
 }
 
 // batchConfig snapshots the per-hook dispatch parameters at batcher
@@ -177,23 +186,97 @@ func (b *httpBatcher) run(ctx context.Context) {
 	}
 }
 
+// classifyHookDeliveryErr maps a deliverBatch error onto the `reason`
+// label used by `open_streamer_hooks_delivery_total`. The taxonomy
+// matches what operators want to alert on:
+//
+//   - "encode"    — JSON marshal / request build / HMAC failure (bug, not transient)
+//   - "timeout"   — context deadline / TCP timeout (configure / scale)
+//   - "http_4xx"  — target rejected (auth / payload schema; needs human)
+//   - "http_5xx"  — target overloaded / down (transient, expected to retry)
+//   - "transport" — connection refused, DNS, TLS handshake failure
+//   - "unknown"   — shouldn't happen; if seen, classifier is missing a case
+//
+// The classifier inspects the wrapped error message because deliverBatch
+// emits strings rather than typed errors. Acceptable for a bounded vocab.
+func classifyHookDeliveryErr(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	msg := err.Error()
+	switch {
+	case strings.HasPrefix(msg, "marshal batch:"), strings.HasPrefix(msg, "create request:"):
+		return "encode"
+	case strings.HasPrefix(msg, "unexpected status:"):
+		return classifyHTTPStatusErr(msg)
+	case strings.HasPrefix(msg, "http post:"):
+		// Could be timeout disguised as a generic transport error from net/http.
+		if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+			return "timeout"
+		}
+		return "transport"
+	}
+	return "unknown"
+}
+
+// classifyHTTPStatusErr extracts the status code from an "unexpected
+// status: NNN ..." error and buckets it. Returns "unknown" on parse
+// failure rather than mis-classifying.
+func classifyHTTPStatusErr(msg string) string {
+	// "unexpected status: 4XX ..." — status starts at offset len("unexpected status: ").
+	const prefix = "unexpected status: "
+	if !strings.HasPrefix(msg, prefix) {
+		return "unknown"
+	}
+	rest := msg[len(prefix):]
+	// Status is the first whitespace- or end-delimited token.
+	end := strings.IndexAny(rest, " \t")
+	if end < 0 {
+		end = len(rest)
+	}
+	status, convErr := strconv.Atoi(rest[:end])
+	if convErr != nil {
+		return "unknown"
+	}
+	switch {
+	case status >= 400 && status < 500:
+		return "http_4xx"
+	case status >= 500 && status < 600:
+		return "http_5xx"
+	default:
+		return "unknown"
+	}
+}
+
 // flushOnce takes the current queue and ships it. On failure the events
 // are merged back into the queue head so the next flush retries them
-// in chronological order.
+// in chronological order. Records the batch size on every flush attempt
+// (success or failure) so the histogram captures the real distribution
+// — failed batches still represent work the batcher is doing.
 func (b *httpBatcher) flushOnce(ctx context.Context) {
 	batch := b.takeBatch()
 	if len(batch) == 0 {
 		return
 	}
+	if b.m.batchSize != nil {
+		b.m.batchSize.Observe(float64(len(batch)))
+	}
 	if err := b.deliverBatch(ctx, batch); err != nil {
-		if b.m.deliverFailure != nil {
-			b.m.deliverFailure.Inc()
+		if b.m.observeDelivery != nil {
+			b.m.observeDelivery("failure", classifyHookDeliveryErr(err))
 		}
 		b.requeue(batch, err)
 		return
 	}
-	if b.m.deliverSuccess != nil {
-		b.m.deliverSuccess.Inc()
+	if b.m.observeDelivery != nil {
+		b.m.observeDelivery("success", "ok")
 	}
 }
 

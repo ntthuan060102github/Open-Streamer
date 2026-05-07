@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/samber/do/v2"
@@ -17,6 +18,7 @@ import (
 type HookHandler struct {
 	hookRepo store.HookRepository
 	hooks    *hooks.Service
+	bus      events.Bus
 }
 
 // NewHookHandler creates a HookHandler and registers it with the DI injector.
@@ -24,7 +26,25 @@ func NewHookHandler(i do.Injector) (*HookHandler, error) {
 	return &HookHandler{
 		hookRepo: do.MustInvoke[store.HookRepository](i),
 		hooks:    do.MustInvoke[*hooks.Service](i),
+		bus:      do.MustInvoke[events.Bus](i),
 	}, nil
+}
+
+// publishHookEvent emits a hook lifecycle meta-event. Audit-only — small
+// payload (`hook_id` plus type) since the consumer can call GET /hooks/{id}
+// to fetch full state when needed. Nil-safe for tests building the
+// handler without DI.
+func (h *HookHandler) publishHookEvent(r *http.Request, typ domain.EventType, hook *domain.Hook) {
+	if h.bus == nil || hook == nil {
+		return
+	}
+	h.bus.Publish(r.Context(), domain.Event{
+		Type: typ,
+		Payload: map[string]any{
+			"hook_id":   string(hook.ID),
+			"hook_type": string(hook.Type),
+		},
+	})
 }
 
 // List registered hooks.
@@ -63,6 +83,7 @@ func (h *HookHandler) Create(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "SAVE_FAILED", "create hook", err)
 		return
 	}
+	h.publishHookEvent(r, domain.EventHookCreated, &hook)
 	writeJSON(w, http.StatusCreated, map[string]any{"data": hook})
 }
 
@@ -113,6 +134,7 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "SAVE_FAILED", "update hook", err)
 		return
 	}
+	h.publishHookEvent(r, domain.EventHookUpdated, &hook)
 	writeJSON(w, http.StatusOK, map[string]any{"data": hook})
 }
 
@@ -125,9 +147,18 @@ func (h *HookHandler) Update(w http.ResponseWriter, r *http.Request) {
 // @Router /hooks/{hid} [delete].
 func (h *HookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	hid := domain.HookID(chi.URLParam(r, "hid"))
+	// Look up the hook BEFORE delete so the published event can carry the
+	// hook type — otherwise post-delete consumers can't tell HTTP from file
+	// without storing their own copy. Lookup failure (already-deleted) still
+	// proceeds with the delete: the operation is idempotent and we don't
+	// want to fail an audit due to a missing record.
+	prior, _ := h.hookRepo.FindByID(r.Context(), hid)
 	if err := h.hookRepo.Delete(r.Context(), hid); err != nil {
 		serverError(w, r, "DELETE_FAILED", "delete hook", err)
 		return
+	}
+	if prior != nil {
+		h.publishHookEvent(r, domain.EventHookDeleted, prior)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -10,6 +10,7 @@ type EventType string
 const (
 	// Stream lifecycle — published by coordinator and API handler.
 	EventStreamCreated EventType = "stream.created"
+	EventStreamUpdated EventType = "stream.updated" // PUT /streams/{code} on existing record
 	EventStreamStarted EventType = "stream.started"
 	EventStreamStopped EventType = "stream.stopped"
 	EventStreamDeleted EventType = "stream.deleted"
@@ -19,18 +20,41 @@ const (
 	EventInputReconnecting EventType = "input.reconnecting" // transient error, retrying
 	EventInputDegraded     EventType = "input.degraded"     // error detected by manager
 	EventInputFailed       EventType = "input.failed"       // worker exited / non-retriable
-	EventInputFailover     EventType = "input.failover"     // switched to lower-priority input
+	EventInputFailover     EventType = "input.failover"     // switched to a different input
+	EventInputRecovered    EventType = "input.recovered"    // previously degraded input is healthy again (auto or via failback probe)
 
 	// DVR recordings — published by dvr.Service.
 	EventRecordingStarted EventType = "recording.started"
 	EventRecordingStopped EventType = "recording.stopped"
 	EventRecordingFailed  EventType = "recording.failed"
 	EventSegmentWritten   EventType = "segment.written"
+	EventDVRSegmentPruned EventType = "dvr.segment_pruned" // retention loop deleted an aged-out segment
 
 	// Transcoder — published by transcoder.Service.
 	EventTranscoderStarted EventType = "transcoder.started"
 	EventTranscoderStopped EventType = "transcoder.stopped"
 	EventTranscoderError   EventType = "transcoder.error"
+
+	// Push out (RTMP/RTMPS) — published by publisher push_rtmp.go on each
+	// state transition. Lets operators alert on per-destination CDN drops
+	// without scraping runtime status.
+	EventPushStarted      EventType = "push.started"      // dialing target, pre-handshake
+	EventPushActive       EventType = "push.active"       // handshake ok; media flowing
+	EventPushReconnecting EventType = "push.reconnecting" // write fail or input discontinuity, retrying
+	EventPushFailed       EventType = "push.failed"       // dest.Limit exhausted or terminal error
+
+	// Server-config — published by config handler when GlobalConfig changes.
+	EventConfigChanged EventType = "config.changed"
+
+	// Watermark assets — published by watermarks service on REST CRUD.
+	EventWatermarkAssetCreated EventType = "watermark.asset_created"
+	EventWatermarkAssetDeleted EventType = "watermark.asset_deleted"
+
+	// Hooks — published by hooks service on REST CRUD (meta-events; useful
+	// for audit logs and inventory sync).
+	EventHookCreated EventType = "hook.created"
+	EventHookUpdated EventType = "hook.updated"
+	EventHookDeleted EventType = "hook.deleted"
 )
 
 // Event is an immutable fact describing a domain state change.

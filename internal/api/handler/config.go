@@ -7,6 +7,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/events"
 	"github.com/ntt0601zcoder/open-streamer/internal/hwdetect"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
@@ -65,6 +66,7 @@ type ConfigHandler struct {
 	vodRepo    store.VODMountRepository
 	vods       *vod.Registry
 	coord      streamLifecycle
+	bus        events.Bus
 }
 
 // NewConfigHandler creates a ConfigHandler from the DI injector.
@@ -77,6 +79,7 @@ func NewConfigHandler(i do.Injector) (*ConfigHandler, error) {
 		vodRepo:    do.MustInvoke[store.VODMountRepository](i),
 		vods:       do.MustInvoke[*vod.Registry](i),
 		coord:      do.MustInvoke[*coordinator.Coordinator](i),
+		bus:        do.MustInvoke[events.Bus](i),
 	}, nil
 }
 
@@ -208,6 +211,20 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if err := h.rtm.Apply(r.Context(), &merged); err != nil {
 		serverError(w, r, "APPLY_FAILED", "apply config", err)
 		return
+	}
+
+	// Audit hook for config drift — operators monitoring infrastructure
+	// inventory want to know when GlobalConfig changes (which downstream
+	// services were hot-restarted, which ports moved, …). Payload kept small
+	// (no full config dump) since the consumer can call GET /config to fetch
+	// the new state if needed; a fat payload here would only bloat hook
+	// queues for every config save. Nil-safe so tests that build the handler
+	// without DI don't NPE.
+	if h.bus != nil {
+		h.bus.Publish(r.Context(), domain.Event{
+			Type:    domain.EventConfigChanged,
+			Payload: map[string]any{"source": "post_config"},
+		})
 	}
 
 	// Return the freshly applied config.

@@ -90,6 +90,11 @@ type rtmpPushPackager struct {
 	// without leaking PushSession internals to the Service layer.
 	onPublishStart func()
 
+	// onBytesWritten observes the byte size of each RtmpMsg payload sent
+	// to the remote target. Used by the egress-cost dashboard. Nil-safe —
+	// tests build the packager without metrics.
+	onBytesWritten func(n int)
+
 	session *rtmp.PushSession
 	codec   *pushCodecAdapter
 
@@ -257,7 +262,18 @@ func (p *rtmpPushPackager) connect(ctx context.Context) error {
 	// so B-frames render correctly at the receiver — see push_codec.go for
 	// rationale (lal's high-level remuxer drops PTS).
 	p.codec = newPushCodecAdapter(func(msg base.RtmpMsg) error {
-		return p.session.WriteMsg(msg)
+		if err := p.session.WriteMsg(msg); err != nil {
+			return err
+		}
+		if p.onBytesWritten != nil {
+			// Counts FLV/RTMP payload bytes only — RTMP chunk header
+			// overhead (~12 B per message) is excluded because the
+			// metric is meant for "bytes seen by the receiver", not
+			// "bytes on the wire including framing". Operators sizing
+			// their CDN egress care about the former.
+			p.onBytesWritten(len(msg.Payload))
+		}
+		return nil
 	})
 
 	return nil
@@ -451,6 +467,7 @@ func (s *Service) runOnePushSession(
 		onPublishStart: func() {
 			s.setPushStatus(streamID, dest.URL, PushStatusActive)
 		},
+		onBytesWritten: s.pushBytesObserver(streamID, dest.URL),
 	}
 
 	sessionErr := p.run(ctx, sub)
