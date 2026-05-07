@@ -142,3 +142,87 @@ func TestSessionGetMissing(t *testing.T) {
 		t.Errorf("status=%d, want 404", rec.Code)
 	}
 }
+
+func TestSessionListInvalidStatus(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?status=ghost", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", rec.Code)
+	}
+}
+
+func TestSessionListInvalidLimit(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?limit=-1", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", rec.Code)
+	}
+}
+
+func TestSessionListLimitClampedToMax(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	// Limit above sessionListMaxLimit is silently clamped — handler should
+	// still succeed (no error), exercising the cap branch in parseSessionFilter.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?limit=99999", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d, want 200", rec.Code)
+	}
+}
+
+func TestSessionListWithStatusFilter(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?status=active", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d, want 200", rec.Code)
+	}
+}
+
+func TestSessionListWithProtoFilter(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	for _, p := range []string{"hls", "dash", "rtmp", "srt", "rtsp"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?proto="+p, nil)
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("proto=%s status=%d, want 200", p, rec.Code)
+		}
+	}
+}
+
+func TestSessionListWithStatusClosed(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?status=closed", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d, want 200", rec.Code)
+	}
+}
+
+func TestSessionListByStreamInvalidCode(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/streams/!!!/sessions", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", rec.Code)
+	}
+}
+
+func TestSessionListByStreamInvalidQuery(t *testing.T) {
+	r, _ := newSessionHandlerWithRouter(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/streams/live/sessions?proto=bogus", nil)
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", rec.Code)
+	}
+}

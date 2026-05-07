@@ -13,8 +13,18 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/hooks"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 )
+
+// stubHookTester is a controllable hookTester for the Test() handler tests.
+type stubHookTester struct {
+	err error
+}
+
+func (s *stubHookTester) DeliverTestEvent(_ context.Context, _ domain.HookID) error {
+	return s.err
+}
 
 const (
 	hooksPath  = "/hooks"
@@ -273,6 +283,56 @@ func TestHookDeleteError(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.Delete(w, req)
 	if w.Code != http.StatusInternalServerError {
+		t.Fatalf(statusFmt, w.Code)
+	}
+}
+
+// ─── Test (synthetic delivery) ───────────────────────────────────────────────
+
+func TestHookTest_HappyPath(t *testing.T) {
+	repo := newFakeHookRepo()
+	h := &HookHandler{hookRepo: repo, hooks: &stubHookTester{}}
+
+	req := withHookID(newReq(t, http.MethodPost, "/hooks/x/test", nil), hookIDX)
+	w := httptest.NewRecorder()
+	h.Test(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHookTest_NotFound(t *testing.T) {
+	repo := newFakeHookRepo()
+	h := &HookHandler{hookRepo: repo, hooks: &stubHookTester{err: store.ErrNotFound}}
+
+	req := withHookID(newReq(t, http.MethodPost, "/hooks/missing/test", nil), missingHid)
+	w := httptest.NewRecorder()
+	h.Test(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf(statusFmt, w.Code)
+	}
+}
+
+func TestHookTest_Unsupported(t *testing.T) {
+	repo := newFakeHookRepo()
+	h := &HookHandler{hookRepo: repo, hooks: &stubHookTester{err: hooks.ErrHookTestUnsupported}}
+
+	req := withHookID(newReq(t, http.MethodPost, "/hooks/x/test", nil), hookIDX)
+	w := httptest.NewRecorder()
+	h.Test(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf(statusFmt, w.Code)
+	}
+}
+
+func TestHookTest_DeliveryFailed(t *testing.T) {
+	repo := newFakeHookRepo()
+	h := &HookHandler{hookRepo: repo, hooks: &stubHookTester{err: errors.New("connection refused")}}
+
+	req := withHookID(newReq(t, http.MethodPost, "/hooks/x/test", nil), hookIDX)
+	w := httptest.NewRecorder()
+	h.Test(w, req)
+	if w.Code != http.StatusBadGateway {
 		t.Fatalf(statusFmt, w.Code)
 	}
 }

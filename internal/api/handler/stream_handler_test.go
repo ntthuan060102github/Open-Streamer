@@ -478,6 +478,58 @@ func TestStreamHandler_Delete_MissingIsIdempotent(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, w.Code)
 }
 
+func TestStreamHandler_Delete_RepoErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h, repo, _, _, _ := newStreamHandlerForTest(t)
+	repo.delErr = errors.New("disk down")
+	req := chiReq(t, http.MethodDelete, "/streams/x", nil, map[string]string{"code": "x"})
+	w := httptest.NewRecorder()
+	h.Delete(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestStreamHandler_Put_StartCoordinatorErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h, _, co, _, _ := newStreamHandlerForTest(t)
+	co.startErr = errors.New("buffer full")
+	body := domain.Stream{Inputs: []domain.Input{{URL: "rtmp://x"}}}
+	raw, _ := json.Marshal(body)
+	req := chiReq(t, http.MethodPost, "/streams/y", raw, map[string]string{"code": "y"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestStreamHandler_Put_UpdateExistingRunningCallsUpdate(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "live", Inputs: []domain.Input{{URL: "rtmp://a"}}})
+	co.runningByCode["live"] = true
+
+	body := domain.Stream{Code: "live", Inputs: []domain.Input{{URL: "rtmp://b"}}}
+	raw, _ := json.Marshal(body)
+	req := chiReq(t, http.MethodPut, "/streams/live", raw, map[string]string{"code": "live"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, co.updatedCodes, domain.StreamCode("live"))
+}
+
+func TestStreamHandler_Put_UpdateRunningCoordinatorErrorReturns500(t *testing.T) {
+	t.Parallel()
+	h, repo, co, _, _ := newStreamHandlerForTest(t)
+	repo.seed(&domain.Stream{Code: "live", Inputs: []domain.Input{{URL: "rtmp://a"}}})
+	co.runningByCode["live"] = true
+	co.updateErr = errors.New("transcoder reload failed")
+
+	body := domain.Stream{Code: "live", Inputs: []domain.Input{{URL: "rtmp://b"}}}
+	raw, _ := json.Marshal(body)
+	req := chiReq(t, http.MethodPut, "/streams/live", raw, map[string]string{"code": "live"})
+	w := httptest.NewRecorder()
+	h.Put(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
 // ─── Restart ────────────────────────────────────────────────────────────────
 
 func TestStreamHandler_Restart_HappyPath(t *testing.T) {

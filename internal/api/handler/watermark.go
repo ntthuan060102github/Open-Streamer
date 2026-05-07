@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,11 +27,23 @@ const (
 	watermarkUploadMemoryBytes = 4 << 20  // 4 MiB before spilling to temp
 )
 
+// watermarkAssetService narrows *watermarks.Service to the methods this
+// handler uses, so tests can stub out the service without standing up a
+// real on-disk asset directory. *watermarks.Service satisfies implicitly.
+type watermarkAssetService interface {
+	List() []*domain.WatermarkAsset
+	Dir() string
+	Get(id domain.WatermarkAssetID) (*domain.WatermarkAsset, error)
+	ResolvePath(id domain.WatermarkAssetID) (string, error)
+	Save(displayName, originalFilename string, body io.Reader) (*domain.WatermarkAsset, error)
+	Delete(id domain.WatermarkAssetID) error
+}
+
 // WatermarkHandler exposes the asset library over REST. Mirrors the VOD
 // handler shape (list / upload / get / raw / delete) so the UI's file
 // management widgets can be reused with minimal adaptation.
 type WatermarkHandler struct {
-	svc *watermarks.Service
+	svc watermarkAssetService
 	bus events.Bus
 }
 

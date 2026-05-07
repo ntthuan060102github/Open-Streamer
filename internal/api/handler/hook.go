@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,10 +15,17 @@ import (
 	"github.com/samber/do/v2"
 )
 
+// hookTester narrows *hooks.Service to the test-delivery method this
+// handler uses, so tests can stub out the hooks service without standing
+// up the full delivery pipeline. *hooks.Service satisfies implicitly.
+type hookTester interface {
+	DeliverTestEvent(ctx context.Context, id domain.HookID) error
+}
+
 // HookHandler handles webhook and hook management REST endpoints.
 type HookHandler struct {
 	hookRepo store.HookRepository
-	hooks    *hooks.Service
+	hooks    hookTester
 	bus      events.Bus
 }
 

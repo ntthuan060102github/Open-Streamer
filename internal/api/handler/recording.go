@@ -16,9 +16,18 @@ import (
 	"github.com/samber/do/v2"
 )
 
+// dvrIndexReader narrows *dvr.Service to the on-disk-read methods this
+// handler uses, so tests can stub out the DVR service without wiring a
+// full buffer + bus + metrics graph behind it. *dvr.Service satisfies
+// implicitly.
+type dvrIndexReader interface {
+	LoadIndex(segDir string) (*domain.DVRIndex, error)
+	ParsePlaylist(segDir string) ([]dvr.SegmentMeta, error)
+}
+
 // RecordingHandler handles DVR recording and playback REST endpoints.
 type RecordingHandler struct {
-	dvr     *dvr.Service
+	dvr     dvrIndexReader
 	recRepo store.RecordingRepository
 }
 
