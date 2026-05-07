@@ -22,6 +22,21 @@ type ManagerConfig struct {
 type ServerConfig struct {
 	HTTPAddr string     `mapstructure:"http_addr" json:"http_addr" yaml:"http_addr"`
 	CORS     CORSConfig `mapstructure:"cors" json:"cors" yaml:"cors"`
+	// PprofAddr enables Go's net/http/pprof + runtime introspection
+	// endpoints on a SEPARATE listener. Default empty = disabled.
+	// Recommend "127.0.0.1:6060" so the listener stays loopback-only —
+	// pprof exposes goroutine stacks and heap layouts that should never
+	// be reachable from the public network. Reach it from a remote box
+	// via SSH tunnel: `ssh -L 6060:127.0.0.1:6060 host`.
+	//
+	// Endpoints exposed when set:
+	//   /debug/pprof/heap       — heap snapshot (live objects)
+	//   /debug/pprof/allocs     — cumulative alloc profile
+	//   /debug/pprof/goroutine  — goroutine stack dump (?debug=2 for text)
+	//   /debug/pprof/profile    — 30s CPU profile
+	//   /debug/pprof/block      — blocking profile (needs SetBlockProfileRate)
+	//   /debug/pprof/mutex      — mutex contention (needs SetMutexProfileFraction)
+	PprofAddr string `mapstructure:"pprof_addr" json:"pprof_addr,omitempty" yaml:"pprof_addr,omitempty"`
 }
 
 // CORSConfig controls Cross-Origin Resource Sharing for the HTTP API and

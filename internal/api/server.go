@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof" // registers /debug/pprof/* on a dedicated mux when PprofAddr is set
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -314,6 +316,14 @@ func (s *Server) StartWithConfig(ctx context.Context, cfg *config.ServerConfig) 
 		Handler: s.router,
 	}
 
+	// Optional pprof listener on a separate addr (typically 127.0.0.1:6060)
+	// so heap / goroutine / CPU profiles are reachable for memory-leak
+	// triage without exposing them on the public API port. Spawned on its
+	// own goroutine — startup of the main HTTP server is the fail-fast
+	// path; pprof failures are logged and ignored so a port collision on
+	// 6060 doesn't take the whole API down.
+	startPprofListener(ctx, strings.TrimSpace(cfg.PprofAddr))
+
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -328,6 +338,62 @@ func (s *Server) StartWithConfig(ctx context.Context, cfg *config.ServerConfig) 
 		return fmt.Errorf("api: server: %w", err)
 	}
 	return nil
+}
+
+// startPprofListener brings up a dedicated http.Server bound to addr that
+// serves Go's net/http/pprof endpoints under /debug/pprof/*. No-op when
+// addr is empty. Block + mutex profilers are also enabled so the captured
+// snapshots cover the full diagnostic surface — both come with measurable
+// overhead at high contention rates so the rates are tuned conservatively
+// (block every 10ms; 1 in 100 mutex events).
+//
+// Security note: the endpoints expose goroutine stacks and full heap
+// layouts. Bind to 127.0.0.1 (or a private interface fronted by a firewall)
+// — never to 0.0.0.0 in production. The default sample config ships with
+// PprofAddr empty so the listener is opt-in.
+func startPprofListener(ctx context.Context, addr string) {
+	if addr == "" {
+		return
+	}
+
+	mux := http.NewServeMux()
+	// Enumerate explicitly rather than relying on the side-effect mount
+	// onto http.DefaultServeMux — keeps pprof off any other listener that
+	// might inherit DefaultServeMux later, and surfaces the route set in
+	// the source for grep'ability.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	// Block / mutex profilers default to disabled (rate=0). Turn them on
+	// here so the captured profile actually contains samples — operators
+	// chasing a leak won't think to set these manually before triggering
+	// the snapshot. Rates are conservative trade-offs: high enough to see
+	// real contention, low enough to not perturb the production hot path.
+	runtime.SetBlockProfileRate(int(10 * time.Millisecond))
+	runtime.SetMutexProfileFraction(100)
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	go func() {
+		slog.Info("api: pprof listener started", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Warn("api: pprof listener failed", "addr", addr, "err", err)
+		}
+	}()
 }
 
 // healthz liveness probe.

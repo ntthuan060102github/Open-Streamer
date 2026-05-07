@@ -2385,6 +2385,10 @@ const docTemplate = `{
                 },
                 "http_addr": {
                     "type": "string"
+                },
+                "pprof_addr": {
+                    "description": "PprofAddr enables Go's net/http/pprof + runtime introspection\nendpoints on a SEPARATE listener. Default empty = disabled.\nRecommend \"127.0.0.1:6060\" so the listener stays loopback-only —\npprof exposes goroutine stacks and heap layouts that should never\nbe reachable from the public network. Reach it from a remote box\nvia SSH tunnel: ` + "`" + `ssh -L 6060:127.0.0.1:6060 host` + "`" + `.\n\nEndpoints exposed when set:\n  /debug/pprof/heap       — heap snapshot (live objects)\n  /debug/pprof/allocs     — cumulative alloc profile\n  /debug/pprof/goroutine  — goroutine stack dump (?debug=2 for text)\n  /debug/pprof/profile    — 30s CPU profile\n  /debug/pprof/block      — blocking profile (needs SetBlockProfileRate)\n  /debug/pprof/mutex      — mutex contention (needs SetMutexProfileFraction)",
+                    "type": "string"
                 }
             }
         },
@@ -2516,6 +2520,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.started",
                 "stream.stopped",
@@ -2531,9 +2537,7 @@ const docTemplate = `{
                 "segment.written",
                 "transcoder.started",
                 "transcoder.stopped",
-                "transcoder.error",
-                "session.opened",
-                "session.closed"
+                "transcoder.error"
             ],
             "x-enum-comments": {
                 "EventInputConnected": "source connected successfully",
@@ -2543,6 +2547,8 @@ const docTemplate = `{
                 "EventInputReconnecting": "transient error, retrying"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "",
                 "",
@@ -2558,11 +2564,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamStarted",
                 "EventStreamStopped",
@@ -2578,9 +2584,7 @@ const docTemplate = `{
                 "EventSegmentWritten",
                 "EventTranscoderStarted",
                 "EventTranscoderStopped",
-                "EventTranscoderError",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTranscoderError"
             ]
         },
         "domain.GlobalConfig": {

@@ -505,6 +505,23 @@ definitions:
         $ref: '#/definitions/config.CORSConfig'
       http_addr:
         type: string
+      pprof_addr:
+        description: |-
+          PprofAddr enables Go's net/http/pprof + runtime introspection
+          endpoints on a SEPARATE listener. Default empty = disabled.
+          Recommend "127.0.0.1:6060" so the listener stays loopback-only —
+          pprof exposes goroutine stacks and heap layouts that should never
+          be reachable from the public network. Reach it from a remote box
+          via SSH tunnel: `ssh -L 6060:127.0.0.1:6060 host`.
+
+          Endpoints exposed when set:
+            /debug/pprof/heap       — heap snapshot (live objects)
+            /debug/pprof/allocs     — cumulative alloc profile
+            /debug/pprof/goroutine  — goroutine stack dump (?debug=2 for text)
+            /debug/pprof/profile    — 30s CPU profile
+            /debug/pprof/block      — blocking profile (needs SetBlockProfileRate)
+            /debug/pprof/mutex      — mutex contention (needs SetMutexProfileFraction)
+        type: string
     type: object
   config.SessionsConfig:
     properties:
@@ -621,6 +638,8 @@ definitions:
     type: object
   domain.EventType:
     enum:
+    - session.opened
+    - session.closed
     - stream.created
     - stream.started
     - stream.stopped
@@ -637,8 +656,6 @@ definitions:
     - transcoder.started
     - transcoder.stopped
     - transcoder.error
-    - session.opened
-    - session.closed
     type: string
     x-enum-comments:
       EventInputConnected: source connected successfully
@@ -647,6 +664,8 @@ definitions:
       EventInputFailover: switched to lower-priority input
       EventInputReconnecting: transient error, retrying
     x-enum-descriptions:
+    - ""
+    - ""
     - ""
     - ""
     - ""
@@ -663,9 +682,9 @@ definitions:
     - ""
     - ""
     - ""
-    - ""
-    - ""
     x-enum-varnames:
+    - EventSessionOpened
+    - EventSessionClosed
     - EventStreamCreated
     - EventStreamStarted
     - EventStreamStopped
@@ -682,8 +701,6 @@ definitions:
     - EventTranscoderStarted
     - EventTranscoderStopped
     - EventTranscoderError
-    - EventSessionOpened
-    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
