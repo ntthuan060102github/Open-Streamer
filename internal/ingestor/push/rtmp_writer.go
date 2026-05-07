@@ -48,9 +48,11 @@ package push
 //   4. NALU / raw audio (CSIDs 7/6) at their actual DTS.
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 
+	eyevinnaac "github.com/Eyevinn/mp4ff/aac"
 	"github.com/q191201771/lal/pkg/aac"
 	"github.com/q191201771/lal/pkg/avc"
 	"github.com/q191201771/lal/pkg/base"
@@ -290,8 +292,22 @@ func buildAvccSliceOnly(annexB []byte) (avccPayload []byte, isKey bool, hasSlice
 	return out, isKey, hasSlice
 }
 
-// writeAAC sends a single AAC access unit (ADTS-prefixed). Emits the AAC
-// sequence header tag once at timestamp 0 before the first raw frame tag.
+// writeAAC sends one RTMP audio tag PER ADTS frame contained in `adts`.
+// Emits the AAC sequence header tag once at timestamp 0 before the first
+// raw frame tag.
+//
+// gomedia's TSDemuxer delivers a complete PES payload via OnFrame, and a
+// single PES often carries 4-8 concatenated ADTS frames (encoders bundle
+// for efficiency — at 48 kHz, 8 frames = 170 ms of audio per delivery).
+// RTMP convention is one raw AAC access unit per audio tag, so we must
+// split the bundle and emit per-frame tags with monotonically increasing
+// DTS. Without splitting, the entire bundle ships as one tag, the receiver
+// (test5's RTMP pull → RTMPMsgConverter) treats it as a single AAC frame,
+// and downstream consumers see the audio sample-count under-counted by
+// the bundling factor — which surfaces in DASH as ~0.5 s audio segments
+// (declared duration 24 × 1024 ticks) covering 4 s of actual audio data,
+// and in HLS as audio that drifts then stutters because the TS muxer
+// stamps the bundle with one PES PTS instead of per-frame PTSes.
 func (w *RTMPFrameWriter) writeAAC(adts []byte, dts uint32) error {
 	if len(adts) < adtsHeaderLength {
 		return nil
@@ -307,12 +323,57 @@ func (w *RTMPFrameWriter) writeAAC(adts []byte, dts uint32) error {
 		}
 		w.aacSeqSent = true
 	}
-	rawAAC := adts[adtsHeaderLength:]
-	if len(rawAAC) == 0 {
+
+	return w.sendAACBundle(adts, dts)
+}
+
+// sendAACBundle iterates concatenated ADTS frames in `adts` and emits one
+// RTMP raw-frame tag per ADTS frame, with each tag's DTS offset by
+// frameIndex × 1024 / sampleRate (in ms) against the bundle's base DTS.
+// Returns nil when adts has no parseable frames.
+func (w *RTMPFrameWriter) sendAACBundle(adts []byte, baseDts uint32) error {
+	pos := 0
+	frameIndex := 0
+	var sampleRate int
+	for pos+adtsHeaderLength <= len(adts) {
+		hdr, _, err := eyevinnaac.DecodeADTSHeader(bytes.NewReader(adts[pos:]))
+		if err != nil {
+			// Misaligned byte — advance one and try to resync.
+			pos++
+			continue
+		}
+		hLen := int(hdr.HeaderLength)
+		pLen := int(hdr.PayloadLength)
+		if hLen <= 0 || pLen <= 0 || pos+hLen+pLen > len(adts) {
+			break
+		}
+		if sampleRate == 0 {
+			sampleRate = int(hdr.Frequency())
+		}
+		if err := w.sendOneAACFrame(adts[pos+hLen:pos+hLen+pLen], baseDts, frameIndex, sampleRate); err != nil {
+			return err
+		}
+		pos += hLen + pLen
+		frameIndex++
+	}
+	return nil
+}
+
+// sendOneAACFrame ships one raw AAC access unit as an RTMP audio tag with
+// DTS = baseDts + frameIndex × 1024 × 1000 / sampleRate. Skips empty or
+// rate-less frames silently — the next frame in the bundle picks up the
+// timeline correctly because the offset is computed from frameIndex, not
+// a cumulative counter.
+func (w *RTMPFrameWriter) sendOneAACFrame(rawAAC []byte, baseDts uint32, frameIndex, sampleRate int) error {
+	if len(rawAAC) == 0 || sampleRate <= 0 {
 		return nil
 	}
-	rawTag := buildFLVAacTag(1, rawAAC)
-	return w.send(base.RtmpTypeIdAudio, dts, rawTag)
+	// Per-frame DTS in ms: each AAC-LC frame is 1024 samples; integer
+	// arithmetic against frameIndex avoids accumulating per-frame
+	// rounding error that a running ms counter would introduce.
+	offsetMs := uint32(frameIndex * 1024 * 1000 / sampleRate)
+	tag := buildFLVAacTag(1, rawAAC)
+	return w.send(base.RtmpTypeIdAudio, baseDts+offsetMs, tag)
 }
 
 // send wraps payload in an RTMP message header and writes it to the

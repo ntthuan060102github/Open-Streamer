@@ -195,6 +195,16 @@ type hlsSegmenter struct {
 	// falls back to wall-clock force-flush (acceptable for transcoder output
 	// because that path is GOP-aligned by ffmpeg).
 	scanner *tsKeyframeScanner
+
+	// discardUntilIDR is set after a wall-clock force-flush on the AV path:
+	// the segment we just flushed did NOT end on an IDR boundary, so any
+	// non-keyframe AV packets that follow would land at the head of the
+	// next segment with no SPS/PPS in scope and decoders cannot start
+	// playback there. We drop those packets until the next AVPacket with
+	// KeyFrame=true arrives, then resume. Only meaningful for AV path
+	// (scanner == nil); raw-TS path uses tryFlushAtIDRLocked which always
+	// splits at a keyframe.
+	discardUntilIDR bool
 }
 
 func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
@@ -202,7 +212,25 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 	var avMux *tsmux.FromAV
 
 	segDur := time.Duration(p.segSec) * time.Second
-	maxDur := segDur * 3 / 2 // force-flush deadline for TS path
+	// maxDur is the safety deadline after which we force-flush even when no
+	// IDR has arrived. The 4× multiplier is a deliberate choice over the
+	// "tight" 1.5× we used before:
+	//   - Live encoders commonly run GOPs of 2–3× target segment duration
+	//     (e.g. 8–12s GOP for a 4s target). 1.5×segDur force-flushes every
+	//     such segment mid-GOP, which then needs an EXT-X-DISCONTINUITY +
+	//     a wait-for-next-IDR drop window — that drop window starves audio
+	//     for several seconds (audible stutter) and the per-segment
+	//     discontinuity makes browsers reset their decoder on every fetch
+	//     (additional clicks/glitches).
+	//   - 4×segDur tolerates GOPs up to that bound, so well-formed long-GOP
+	//     sources never trip the safety net and segments end cleanly at
+	//     IDR boundaries via handleAVPacket. Truly stuck streams (no IDR
+	//     for ≥4×segDur) still trigger the force-flush + discardUntilIDR
+	//     recovery path, but that becomes the rare edge case it's meant to
+	//     be rather than the every-segment hot path.
+	// Sized as a multiplier (not a constant) so it scales with operator-
+	// chosen segDur — segSec=2 → 8s; segSec=4 → 16s; segSec=6 → 24s.
+	maxDur := segDur * 4
 
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
@@ -236,6 +264,12 @@ func (p *hlsSegmenter) handleIncoming(
 	tsCarry *[]byte,
 ) {
 	if pkt.AV != nil {
+		// After a non-keyframe-aligned force-flush, drop AV packets until
+		// the next IDR so the next segment starts at a clean keyframe.
+		// See hlsSegmenter.discardUntilIDR.
+		if p.shouldDropAVPacket(pkt.AV) {
+			return
+		}
 		p.handleAVPacket(pkt.AV, segDur)
 		// On source switch, discard stale muxer state so the new source
 		// gets fresh PAT/PMT tables and clean continuity counters.
@@ -252,6 +286,36 @@ func (p *hlsSegmenter) handleIncoming(
 			return true
 		})
 	})
+}
+
+// shouldDropAVPacket returns true when the packet must be silently
+// discarded because we are waiting for the next IDR after a force-flush.
+// Clears the discard flag (and logs the resume) when an IDR arrives.
+//
+// Only video packets are subject to the drop window — audio packets pass
+// through unconditionally. Without this carve-out, the 3-4s gap between
+// force-flush and the next IDR would also drop every audio frame in
+// that window, producing audible stutter on long-GOP sources (test5
+// incident: maxDur=6s, source GOP ~9-10s, audio missing in every
+// segment between successive IDRs). KeyFrame is set only on video
+// keyframes in this codebase, so audio frames would all "look like"
+// non-keyframes and be dropped without this guard.
+func (p *hlsSegmenter) shouldDropAVPacket(av *domain.AVPacket) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.discardUntilIDR {
+		return false
+	}
+	if !av.Codec.IsVideo() {
+		return false
+	}
+	if av.KeyFrame {
+		p.discardUntilIDR = false
+		slog.Info("publisher: HLS resumed at IDR after force-flush",
+			"stream_code", p.streamID)
+		return false
+	}
+	return true
 }
 
 // appendSegment188 appends one TS packet to the active segment buffer and,
@@ -338,6 +402,20 @@ func (p *hlsSegmenter) tickFlush(maxDur, segDur time.Duration) {
 		// source — better one bad segment than indefinite buffering) or an
 		// AV path without a keyframe for 1.5 × segSec.
 		p.flushLocked()
+		// AV path: the segment we just emitted does NOT end at an IDR, so
+		// the next segment would start mid-GOP with no SPS/PPS reachable.
+		// Discard subsequent AV packets until the next keyframe so every
+		// emitted segment begins at a clean IDR boundary. Raw-TS path uses
+		// scanner-driven splitting and never lands here without an IDR.
+		if p.scanner == nil {
+			p.discardUntilIDR = true
+			p.discNext = true // mark gap for downstream players
+			slog.Info("publisher: HLS force-flush without IDR, dropping until next keyframe",
+				"stream_code", p.streamID,
+				"elapsed_ms", elapsed.Milliseconds(),
+				"max_dur_ms", maxDur.Milliseconds(),
+			)
+		}
 	}
 }
 

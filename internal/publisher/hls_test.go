@@ -210,6 +210,66 @@ func TestRunHLSSegmenter_FlushesOnContextCancel(t *testing.T) {
 	}
 }
 
+// ---- discardUntilIDR --------------------------------------------------------
+
+// After a force-flush on the AV path the segmenter must DROP non-keyframe
+// AVPackets until the next keyframe arrives — otherwise the next segment
+// would start mid-GOP without SPS/PPS in scope and downstream players
+// can't decode it. This was the root cause of test5's HLS not playing
+// when the source GOP exceeded HLS maxDur (1.5×segSec).
+func TestHLSSegmenter_ShouldDropAVPacket_DropsAfterForceFlush(t *testing.T) {
+	t.Parallel()
+	p := &hlsSegmenter{streamID: "test"}
+	p.discardUntilIDR = true
+
+	pNonKey := &domain.AVPacket{Codec: domain.AVCodecH264, KeyFrame: false}
+	require.True(t, p.shouldDropAVPacket(pNonKey),
+		"non-keyframe must be dropped while discardUntilIDR is set")
+	require.True(t, p.discardUntilIDR,
+		"flag must remain set across non-keyframe packets")
+}
+
+// shouldDropAVPacket clears the flag and admits the keyframe packet so the
+// next segment starts cleanly at the IDR.
+func TestHLSSegmenter_ShouldDropAVPacket_ClearsAtKeyframe(t *testing.T) {
+	t.Parallel()
+	p := &hlsSegmenter{streamID: "test"}
+	p.discardUntilIDR = true
+
+	pKey := &domain.AVPacket{Codec: domain.AVCodecH264, KeyFrame: true}
+	require.False(t, p.shouldDropAVPacket(pKey),
+		"keyframe must NOT be dropped — it starts the next segment")
+	require.False(t, p.discardUntilIDR,
+		"flag must be cleared on first keyframe")
+}
+
+// When the flag is unset (normal operation) the segmenter must admit every
+// packet, keyframe or not.
+func TestHLSSegmenter_ShouldDropAVPacket_NoOpWhenNotDiscarding(t *testing.T) {
+	t.Parallel()
+	p := &hlsSegmenter{streamID: "test"}
+
+	require.False(t, p.shouldDropAVPacket(&domain.AVPacket{KeyFrame: false}))
+	require.False(t, p.shouldDropAVPacket(&domain.AVPacket{KeyFrame: true}))
+}
+
+// Audio packets must NEVER be dropped during the discard window — they
+// would otherwise cause audible stutter for the 3-4s gap between
+// force-flush and the next video IDR. KeyFrame is unset on audio in
+// this codebase so the flag-only check would mis-classify them as
+// "non-keyframes" worth dropping.
+func TestHLSSegmenter_ShouldDropAVPacket_AudioPassesThroughDiscard(t *testing.T) {
+	t.Parallel()
+	p := &hlsSegmenter{streamID: "test"}
+	p.discardUntilIDR = true
+
+	audio := &domain.AVPacket{Codec: domain.AVCodecAAC, KeyFrame: false}
+	require.False(t, p.shouldDropAVPacket(audio),
+		"audio packet must never be dropped, even while waiting for video IDR")
+	require.True(t, p.discardUntilIDR,
+		"discardUntilIDR must remain set — only a video keyframe clears it")
+}
+
 // ---- hlsCodecString ---------------------------------------------------------
 
 // hlsCodecString must include "mp4a.40.2" when the rendition has audio.
