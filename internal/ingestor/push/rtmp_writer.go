@@ -49,6 +49,7 @@ package push
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/q191201771/lal/pkg/aac"
 	"github.com/q191201771/lal/pkg/avc"
@@ -108,7 +109,13 @@ func NewRTMPFrameWriter(session *rtmp.ServerSession) *RTMPFrameWriter {
 //
 // Idempotent: subsequent calls are no-ops once avcSeqSent is true.
 func (w *RTMPFrameWriter) PreloadAvcSeqHeader(sps, pps []byte) error {
-	if w.avcSeqSent || len(sps) == 0 || len(pps) == 0 {
+	if w.avcSeqSent {
+		slog.Debug("rtmp writer: PreloadAvcSeqHeader skipped (seq already sent)")
+		return nil
+	}
+	if len(sps) == 0 || len(pps) == 0 {
+		slog.Debug("rtmp writer: PreloadAvcSeqHeader skipped (empty SPS/PPS)",
+			"sps_size", len(sps), "pps_size", len(pps))
 		return nil
 	}
 	var ctx avc.Context
@@ -126,6 +133,10 @@ func (w *RTMPFrameWriter) PreloadAvcSeqHeader(sps, pps []byte) error {
 		return err
 	}
 	w.avcSeqSent = true
+	slog.Info("rtmp writer: AVC seq header sent via preload",
+		"sps_size", len(sps), "pps_size", len(pps),
+		"width", w.width, "height", w.height,
+		"tag_size", len(seqTag))
 	return nil
 }
 

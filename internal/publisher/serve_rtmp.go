@@ -149,8 +149,14 @@ func runRTMPPlayPipeline(
 						}
 						if cachedSPS != nil && cachedPPS != nil && preloadSeq != nil {
 							if err := preloadSeq(cachedSPS, cachedPPS); err != nil {
-								slog.Warn("publisher: RTMP preload seq header failed",
-									"stream_code", streamCode, "err", err)
+								slog.Warn("publisher: RTMP preload seq header FAILED",
+									"stream_code", streamCode, "err", err,
+									"sps_size", len(cachedSPS), "pps_size", len(cachedPPS))
+							} else {
+								slog.Info("publisher: RTMP seq header PRELOADED from raw TS",
+									"stream_code", streamCode,
+									"sps_size", len(cachedSPS),
+									"pps_size", len(cachedPPS))
 							}
 							cachedSeqSent = true
 						}
