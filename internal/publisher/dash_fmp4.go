@@ -1117,15 +1117,24 @@ type tsBuffer struct {
 	buf         []byte
 	done        bool
 	streamID    domain.StreamCode // for log context on drop; "" in tests
+	maxBytes    int               // overflow threshold; 0 = no cap (rare; tests only)
 	dropCount   int64             // cumulative drop events (not bytes) — for metrics later if needed
 	droppedSize int64             // cumulative bytes dropped on overflow
 }
 
 // newTSBuffer creates a tsBuffer tagged with streamID for log context on
-// overflow drops. Pass empty string from tests / call sites where the
-// stream code is not meaningful.
+// overflow drops. The cap is fixed at tsBufferMaxBytes for production —
+// tests override per-instance via newTSBufferWithCap to keep allocations
+// small under -race without affecting concurrent tests.
 func newTSBuffer(streamID domain.StreamCode) *tsBuffer {
-	b := &tsBuffer{streamID: streamID}
+	return newTSBufferWithCap(streamID, tsBufferMaxBytes)
+}
+
+// newTSBufferWithCap is the testable constructor. Production code uses
+// newTSBuffer; tests use this to verify the overflow branch with KiB-
+// scale buffers instead of allocating real MiB.
+func newTSBufferWithCap(streamID domain.StreamCode, maxBytes int) *tsBuffer {
+	b := &tsBuffer{streamID: streamID, maxBytes: maxBytes}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
@@ -1142,7 +1151,7 @@ func (b *tsBuffer) Write(p []byte) (int, error) {
 		b.mu.Unlock()
 		return 0, io.ErrClosedPipe
 	}
-	if len(b.buf)+len(p) > tsBufferMaxBytes && len(b.buf) > 0 {
+	if b.maxBytes > 0 && len(b.buf)+len(p) > b.maxBytes && len(b.buf) > 0 {
 		dropped := len(b.buf)
 		b.buf = nil
 		b.dropCount++
@@ -1153,7 +1162,7 @@ func (b *tsBuffer) Write(p []byte) (int, error) {
 			"stream_code", string(b.streamID),
 			"dropped_bytes", dropped,
 			"incoming_bytes", len(p),
-			"cap_bytes", tsBufferMaxBytes,
+			"cap_bytes", b.maxBytes,
 			"drop_count", b.dropCount,
 			"dropped_total_bytes", b.droppedSize,
 		)

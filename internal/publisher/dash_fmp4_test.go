@@ -162,24 +162,31 @@ func TestSeedersPreserveAudioVideoOffset(t *testing.T) {
 //
 // These tests pin the fix behaviour so future refactors don't regress.
 
+// testTSBufferCap is the cap used by tsBuffer overflow tests. KiB-scale
+// keeps allocations small under -race so these tests don't starve the
+// scheduler and flake unrelated time-sensitive tests in this package.
+// Per-instance via newTSBufferWithCap so concurrent Parallel tests don't
+// share state.
+const testTSBufferCap = 8192
+
 // Read on a fully-drained buffer must release the underlying array, not
-// just advance the slice header. Without this, a one-off Write of N MiB
-// retains N MiB across the buffer's lifetime.
+// just advance the slice header. Without this, a one-off Write of N bytes
+// retains N bytes across the buffer's lifetime.
 func TestTSBufferReadReleasesUnderlyingArrayWhenDrained(t *testing.T) {
 	t.Parallel()
 	b := newTSBuffer("")
 
-	big := make([]byte, 4<<20) // 4 MiB
+	big := make([]byte, 4096)
 	_, err := b.Write(big)
 	require.NoError(t, err)
-	require.Equal(t, 4<<20, cap(b.buf), "underlying array should hold the burst")
+	require.Equal(t, 4096, cap(b.buf), "underlying array should hold the burst")
 
-	out := make([]byte, 4<<20)
+	out := make([]byte, 4096)
 	n, err := b.Read(out)
 	require.NoError(t, err)
-	require.Equal(t, 4<<20, n)
+	require.Equal(t, 4096, n)
 	require.Nil(t, b.buf,
-		"after fully draining, buf must be reset to nil so the 4 MiB array is GC-eligible — slicing alone keeps the array pinned")
+		"after fully draining, buf must be reset to nil so the array is GC-eligible — slicing alone keeps the array pinned")
 }
 
 // Write past the cap must drop the existing backlog (not just truncate it
@@ -188,10 +195,10 @@ func TestTSBufferReadReleasesUnderlyingArrayWhenDrained(t *testing.T) {
 // confuse it more than a clean reset.
 func TestTSBufferWriteDropsBacklogOnOverflow(t *testing.T) {
 	t.Parallel()
-	b := newTSBuffer("test-stream")
+	b := newTSBufferWithCap("test-stream", testTSBufferCap)
 
 	// Fill to just under the cap.
-	first := make([]byte, tsBufferMaxBytes-1024)
+	first := make([]byte, testTSBufferCap-1024)
 	_, err := b.Write(first)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), b.dropCount, "no overflow yet")
@@ -202,7 +209,7 @@ func TestTSBufferWriteDropsBacklogOnOverflow(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2048, n, "Write must report success even on the drop path")
 	require.Equal(t, int64(1), b.dropCount, "exactly one drop event")
-	require.Equal(t, int64(tsBufferMaxBytes-1024), b.droppedSize,
+	require.Equal(t, int64(testTSBufferCap-1024), b.droppedSize,
 		"droppedSize must reflect the discarded backlog")
 	require.Equal(t, 2048, len(b.buf),
 		"after drop, buf holds only the fresh chunk (the demuxer needs SOMETHING to resync from)")
@@ -212,9 +219,9 @@ func TestTSBufferWriteDropsBacklogOnOverflow(t *testing.T) {
 // overflow in metrics, not just the most recent event.
 func TestTSBufferWriteAccumulatesDropCounters(t *testing.T) {
 	t.Parallel()
-	b := newTSBuffer("")
+	b := newTSBufferWithCap("", testTSBufferCap)
 
-	chunk := make([]byte, tsBufferMaxBytes)
+	chunk := make([]byte, testTSBufferCap)
 	// First write fills exactly to cap.
 	_, _ = b.Write(chunk)
 	// Each subsequent write triggers a drop.
@@ -222,7 +229,7 @@ func TestTSBufferWriteAccumulatesDropCounters(t *testing.T) {
 	_, _ = b.Write(chunk)
 
 	require.Equal(t, int64(2), b.dropCount, "two overflow events")
-	require.Equal(t, int64(2*tsBufferMaxBytes), b.droppedSize,
+	require.Equal(t, int64(2*testTSBufferCap), b.droppedSize,
 		"each drop discards a full cap's worth")
 }
 
@@ -230,16 +237,16 @@ func TestTSBufferWriteAccumulatesDropCounters(t *testing.T) {
 // or many small chunks — the cap is on backlog size, not per-call.
 func TestTSBufferWriteCapsAcrossSmallChunks(t *testing.T) {
 	t.Parallel()
-	b := newTSBuffer("")
+	b := newTSBufferWithCap("", testTSBufferCap)
 
-	chunk := make([]byte, 1<<20) // 1 MiB chunks
+	chunk := make([]byte, 512)
 	for range 16 {
 		_, _ = b.Write(chunk)
 	}
-	require.Equal(t, 16<<20, len(b.buf), "exactly at cap")
+	require.Equal(t, testTSBufferCap, len(b.buf), "exactly at cap")
 	require.Equal(t, int64(0), b.dropCount, "no drops yet — exactly at cap")
 
-	_, _ = b.Write(chunk) // one more MiB → drop
+	_, _ = b.Write(chunk) // one more chunk → drop
 	require.Equal(t, int64(1), b.dropCount)
 }
 
