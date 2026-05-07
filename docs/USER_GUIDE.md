@@ -18,7 +18,7 @@ Latest release ships pre-built archives + Linux installer:
 ```bash
 # Linux/systemd installer — downloads + verifies + installs as a service.
 # Idempotent: re-running with a new tag uninstalls cleanly first.
-sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-streamer/main/build/reinstall.sh) v0.0.31
+sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-streamer/main/build/reinstall.sh) v1.0.0
 ```
 
 This installs the binary to `/usr/local/bin/open-streamer`, a systemd unit
@@ -736,7 +736,7 @@ in the runtime snapshot means.
 
 ```bash
 # Use the provided installer for atomic upgrades on systemd hosts:
-sudo bash build/reinstall.sh v0.0.32
+sudo bash build/reinstall.sh v1.0.1
 ```
 
 Stops the service, swaps the binary + systemd unit, restarts. Data

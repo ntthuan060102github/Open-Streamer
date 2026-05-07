@@ -167,6 +167,78 @@ only for H.264 (AVC SPS) and H.265 (HEVC SPS). MPEG-2 Video (sequence
 header) and AV1 (sequence header OBU) would each need ~80–150 lines.
 Audio codecs have no concept of resolution.
 
+### 5.5 RTMP codec-config delivery
+
+RTMP delivers codec configuration (`AVCDecoderConfigurationRecord` for
+H.264, equivalent for H.265, `AudioSpecificConfig` for AAC) **out of
+band** as separate "sequence header" tags, not in the per-frame data.
+That makes the moment-of-arrival of the first sequence-header tag the
+only window for downstream muxers to learn the parameters they need to
+build init segments / generate decodable PES. The RTMP pull and push
+paths both ride
+[`internal/ingestor/pull/rtmp_msg_converter.go`](../internal/ingestor/pull/rtmp_msg_converter.go)
+and the same invariant applies to both.
+
+#### Pull side — IDR access units must always carry param sets
+
+`RTMPMsgConverter.ensureKeyFrameHasParamSets` evaluates a 3-tier
+resolution order on every key NALU message:
+
+1. **Inline scan** — the IDR's Annex-B is scanned for SPS/PPS NALUs
+   (NAL types 7/8 for AVC; 32/33/34 for HEVC). Found ⇒ cache as the
+   prefix and emit `annexB` unchanged. This handles encoders that emit
+   parameter sets in-band on every IDR (most modern x264/x265 with
+   `repeat_headers=1`, NVENC's default).
+2. **Cached prefix** — if `captureVideoSeqHeader` populated the prefix
+   from a prior `AVCPacketType=0` tag, prepend it to the slice-only
+   IDR. This handles encoders that send param sets only via the
+   sequence-header tag (FFmpeg `-bsf:v dump_extra=freq=keyframe`
+   disabled, OBS default).
+3. **Drop** — neither found ⇒ return `nil` so the buffer hub never
+   sees an IDR without init params. Without this drop, the IDR would
+   land in the buffer hub, every downstream HLS/DASH muxer would queue
+   an undecodable access unit, and DASH's `videoPSGiveUp` cap (4 MiB)
+   would eventually latch the stream into permanent audio-only.
+
+The bug fix that made this reliable: lal's `SpsPpsSeqHeader2Annexb`
+expects the FULL FLV tag payload (5-byte header + AVCDecoderConfig)
+and verifies `payload[:5] == {0x17, 0, 0, 0, 0}` internally; passing
+`msg.Payload[5:]` cuts off the FLV header and the function silently
+fails. `captureVideoSeqHeader` now passes `msg.Payload` unmodified.
+
+#### Push side (RTMP play out) — slice-only NALU tags + bundle-split AAC
+
+`internal/ingestor/push/rtmp_writer.go` strips SPS/PPS/AUD/SEI NALUs
+from per-frame video tags via `buildAvccSliceOnly` because strict
+players (Flussonic, JW Player) reject NALU tags that contain non-slice
+NALUs — those belong in the AVCDecoderConfigurationRecord. Sequence
+headers ride either:
+
+- the inline-extract path in `writeH264` (first IDR with in-band SPS/PPS), or
+- the explicit `PreloadAvcSeqHeader` call from
+  [`publisher/serve_rtmp.go`](../internal/publisher/serve_rtmp.go) after
+  the producer goroutine scans raw TS bytes for SPS/PPS — needed when
+  gomedia's TSDemuxer drops standalone parameter-set NAL units before
+  invoking `OnFrame`.
+
+For AAC, gomedia delivers the **whole PES payload** through `OnFrame`
+and a single PES often carries 4–8 concatenated ADTS frames (encoders
+bundle for efficiency — at 48 kHz, 8 frames = 170 ms per delivery).
+RTMP convention is one raw AAC access unit per audio tag, so
+`RTMPFrameWriter.writeAAC` splits the bundle and emits per-frame tags
+with monotonically increasing DTS:
+
+```text
+frame_dts_ms = base_dts_ms + frame_index × 1024 × 1000 / sample_rate
+```
+
+Without splitting, downstream pull-RTMP consumers receive one tag
+containing N frames, treat it as a single frame with `Dur=1024`, and
+audio sample counts collapse by the bundling factor. Symptoms: DASH
+audio segments declare `~24576/48000 ≈ 0.5 s` while the file actually
+contains ~4 s of data, MPD timeline grows ~8× slower than wallclock,
+and players report A/V drift or refuse to load the manifest.
+
 ---
 
 ## 6. Limitations & workarounds
@@ -382,5 +454,7 @@ Add only when a concrete use case lands. The current set covers DVB IPTV
 | TS demux (gompeg2-based, frame-level) | [internal/ingestor/pull/tsdemux_packet_reader.go](../internal/ingestor/pull/tsdemux_packet_reader.go) |
 | PMT scanner (custom, codec-only) | [internal/ingestor/pull/stats_pmt_scanner.go](../internal/ingestor/pull/stats_pmt_scanner.go) |
 | TS muxing (AV → wire) | [internal/tsmux/fromav.go](../internal/tsmux/fromav.go) |
+| RTMP message → AVPacket (pull side, codec-config invariant) | [internal/ingestor/pull/rtmp_msg_converter.go](../internal/ingestor/pull/rtmp_msg_converter.go) |
+| RTMP play out (slice-only video, ADTS-bundle-split audio) | [internal/ingestor/push/rtmp_writer.go](../internal/ingestor/push/rtmp_writer.go) |
 | FFmpeg capability probe | [internal/transcoder/probe.go](../internal/transcoder/probe.go) |
 | Per-codec runtime track stats | [internal/manager/tracks.go](../internal/manager/tracks.go) |

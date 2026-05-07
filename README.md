@@ -78,7 +78,7 @@ flowchart LR
 
 ```bash
 # 1. Install via the systemd installer (Linux)
-sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-streamer/main/build/reinstall.sh) v0.0.31
+sudo bash <(curl -sL https://raw.githubusercontent.com/ntt0601zcoder/open-streamer/main/build/reinstall.sh) v1.0.0
 
 # 2. Or build from source
 git clone https://github.com/ntt0601zcoder/open-streamer.git

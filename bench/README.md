@@ -76,12 +76,12 @@ The sweep name is auto-composed:
 
 | Part | Source | Example |
 | --- | --- | --- |
-| tag | `git describe --tags --exact-match HEAD` → `git describe --tags` → `dev` | `v0.0.31`, `v0.0.31-3-g869cb6c`, `dev` |
+| tag | `git describe --tags --exact-match HEAD` → `git describe --tags` → `dev` | `v1.0.0`, `v1.0.0-3-g869cb6c`, `dev` |
 | date | `date +%Y-%m-%d` | `2026-04-27` |
 | note | first positional arg, or `$NOTE` (skipped if empty) | `baseline`, `stress` |
 
 Examples of fully-resolved names:
-`v0.0.31-2026-04-27`, `v0.0.31-2026-04-27-baseline`, `v0.0.31-3-g869cb6c-2026-04-27-fix-X`,
+`v1.0.0-2026-04-27`, `v1.0.0-2026-04-27-baseline`, `v1.0.0-3-g869cb6c-2026-04-27-fix-X`,
 `dev-2026-04-27-baseline`.
 
 What it does:
@@ -182,13 +182,13 @@ GitHub Personal Access Token for one push):
 
 ```bash
 bench/scripts/push-report.sh                       # prompts token, latest sweep
-bench/scripts/push-report.sh v0.0.41-...           # specific sweep
-bench/scripts/push-report.sh v0.0.41-... my-branch # override branch name
+bench/scripts/push-report.sh v1.0.0-...           # specific sweep
+bench/scripts/push-report.sh v1.0.0-... my-branch # override branch name
 ```
 
 Default branch is `bench/<sweep>` — one branch per sweep so each is easy
 to review and PR independently. Examples:
-`bench/v0.0.41-2026-04-27-baseline`, `bench/v0.0.42-2026-05-01-after-fix`.
+`bench/v1.0.0-2026-04-27-baseline`, `bench/v1.0.1-2026-05-01-after-fix`.
 
 Token resolution order: `$GH_TOKEN` env var (if set) → silent interactive
 prompt (`read -rsp`, characters not echoed). The script uses a temporary

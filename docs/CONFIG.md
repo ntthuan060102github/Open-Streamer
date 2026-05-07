@@ -117,6 +117,8 @@ publisher:
 
 **`dir` is required** when the corresponding format is enabled — empty path disables that format silently and logs an error per stream.
 
+**Sizing `live_segment_sec`**: pick a value that comfortably exceeds **¼ of your source's keyframe interval**. Open Streamer ends every HLS segment at a video keyframe; if no keyframe arrives for `4 × live_segment_sec` (the safety deadline) the segmenter cuts mid-GOP and a player may briefly glitch at that boundary. For example, a source with a 10 s GOP needs `live_segment_sec ≥ 3` (default 2 will trip the safety net every segment). When in doubt, raise this value rather than lower — segments end at keyframes regardless, so a higher target just delays the safety deadline without lengthening typical segments.
+
 ### 2.5 listeners
 
 Each protocol shares ONE port serving both ingest and playback:

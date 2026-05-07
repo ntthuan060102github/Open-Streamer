@@ -377,7 +377,16 @@ Reads from Buffer Hub subscriber, segments into output formats:
 
 - **HLS** ([hls.go](../internal/publisher/hls.go)): processes
   `sub.Recv()` directly in main loop — no intermediate goroutine, no
-  blocking, packets never dropped at this layer
+  blocking. AV-path segmenting is keyframe-aligned: `handleAVPacket`
+  flushes the current segment before writing an IDR once `segDur` has
+  elapsed. The wallclock safety net at `maxDur = 4 × segDur` only fires
+  for pathological long-GOP sources (source GOP > 4 × segDur); when it
+  does, the segmenter latches `discardUntilIDR` so subsequent **video**
+  packets are dropped until the next keyframe — guaranteeing every
+  emitted segment starts at a clean IDR boundary. **Audio is exempt**
+  from the discard window (`Codec.IsVideo() == false`); dropping audio
+  during the 3–4 s wait would produce audible stutter at every force-
+  flush, so audio elementary stream stays continuous through the gap.
 - **DASH** ([dash_fmp4.go](../internal/publisher/dash_fmp4.go)): uses
   `tsBuffer` (buffered pipe) → `mpeg2.TSDemuxer` → fMP4 segments.
   `tsBuffer.Write` never blocks (replaced `io.Pipe` which caused packet
@@ -387,7 +396,20 @@ Reads from Buffer Hub subscriber, segments into output formats:
   preserved as-is rather than being collapsed into "both tracks start
   at 0".
 - **RTMP / SRT** ([listen.go](../internal/publisher/listen.go)):
-  shared listeners; per-client subscribes to the playback buffer
+  shared listeners; per-client subscribes to the playback buffer.
+  RTMP play out
+  ([serve_rtmp.go](../internal/publisher/serve_rtmp.go) →
+  [push/rtmp_writer.go](../internal/ingestor/push/rtmp_writer.go))
+  preloads the AVCDecoderConfigurationRecord once per session by
+  scanning raw TS for SPS/PPS (gomedia's TSDemuxer often drops
+  standalone parameter-set NALUs before invoking `OnFrame`), strips
+  SPS/PPS/AUD/SEI from per-frame video tags via `buildAvccSliceOnly`
+  for strict-player compatibility (Flussonic / JW Player reject NALU
+  tags that contain non-slice NALUs), and **splits gomedia-bundled
+  AAC PES into one RTMP audio tag per ADTS frame** with monotonic
+  per-frame DTS — without splitting, a downstream pull-RTMP consumer
+  collapses 4–8 frames into a single AVPacket and audio sample counts
+  on the receiver under-report by the bundling factor.
 - **RTSP** ([serve_rtsp.go](../internal/publisher/serve_rtsp.go)):
   shared listener (gortsplib v5). The pipeline holds each AV packet
   until its target wallclock arrives before `WritePacketRTP` so bursty
@@ -745,6 +767,9 @@ Circular deps are broken via post-construction setters
 | Stream status reflects all degradation sources | `streamDegradation` reconciliation | UI green badge must mean "actually working" |
 | Sessions tracker survives config edits | `atomic.Pointer[runtimeConfig]` + `UpdateConfig` | Toggling `enabled` / `idle_timeout` must not lose in-flight session state |
 | Watermark assets are coordinator-resolved | `transcoderConfigWithWatermark` clones tc | Persisted Stream.Watermark stays untouched; transcoder never sees AssetID |
+| RTMP/RTSP IDR access units carry SPS/PPS into the buffer hub | `RTMPMsgConverter.ensureKeyFrameHasParamSets` | Downstream HLS/DASH muxers can't initialise their decoder otherwise; un-init-able IDRs are dropped, never emitted |
+| RTMP play emits one AAC access unit per audio tag | `RTMPFrameWriter.writeAAC` (bundle-split) | gomedia delivers PES with 4–8 ADTS frames bundled; a single tag would collapse audio sample counts on the receiver by the bundling factor |
+| HLS audio bypasses the post-force-flush discard window | `hlsSegmenter.shouldDropAVPacket` (codec gate) | Long-GOP sources (>4×segDur) trigger `discardUntilIDR`; dropping audio in that 3–4 s gap produces audible stutter |
 
 ---
 
