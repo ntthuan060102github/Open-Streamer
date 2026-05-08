@@ -68,6 +68,15 @@ const (
 	numTracks
 )
 
+// crossTrackSnapMs is the arrival-skew (ms) above which a track's
+// output anchor snaps to the already-seeded other track instead of
+// preserving the skew. RTSP / RTMP same-source A/V interleave within
+// tens of ms, so the typical 100 ms intrinsic offset survives. Mixer-
+// style multi-source feeds where audio first arrives seconds after
+// video (or vice versa) snap into sync, eliminating the multi-second
+// A/V gap that otherwise breaks hls.js playback.
+const crossTrackSnapMs int64 = 1000
+
 // trackState is the per-(stream, track) anchor.
 //
 //   - inputOrigin: input DTS at this track's first observed packet.
@@ -156,14 +165,32 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 	actualNowMs := now.Sub(r.wallOrigin).Milliseconds()
 
 	if !track.seeded {
-		// First packet of this track — anchor its output at the
-		// current elapsed wallclock so V and A retain whatever
-		// startup arrival offset the source produced.
+		// First packet of this track. Default anchor = current elapsed
+		// wallclock so V and A retain any small intrinsic offset the
+		// source produced (RTSP audio leading video by ~100 ms, RTMP
+		// codec-config pre-roll, etc.).
+		anchor := actualNowMs
+
+		// Mixer-style sources (mixer://, copy:// from a non-AV upstream)
+		// can deliver V and A from independent producers whose first
+		// packets arrive seconds apart. Preserving that arrival skew
+		// bakes a multi-second A/V offset into the output, which
+		// downstream HLS / DASH packagers can't compensate for and
+		// players (hls.js especially) refuse to sync. When the other
+		// track is already seeded AND its arrival was more than
+		// crossTrackSnapMs ago, snap THIS track's anchor to where the
+		// other track is now — so both streams start in lockstep
+		// regardless of the source-side delay.
+		otherTrack := &r.tracks[numTracks-1-tk]
+		if otherTrack.seeded && actualNowMs-otherTrack.outputAnchor > crossTrackSnapMs {
+			anchor = otherTrack.lastOutputDts
+		}
+
 		track.seeded = true
 		track.inputOrigin = inDts
-		track.outputAnchor = actualNowMs
-		track.lastOutputDts = actualNowMs
-		assignTimes(p, actualNowMs, cto)
+		track.outputAnchor = anchor
+		track.lastOutputDts = anchor
+		assignTimes(p, anchor, cto)
 		return
 	}
 

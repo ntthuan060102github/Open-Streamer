@@ -8,6 +8,7 @@ package publisher
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Eyevinn/mp4ff/mp4"
 	"github.com/stretchr/testify/require"
@@ -480,4 +481,61 @@ func TestOnTSFrameForwardJumpFlushesQueue(t *testing.T) {
 	p.onTSFrame(mpeg2.TS_STREAM_H264, nonKey, 201_040, 201_040)
 	require.Equal(t, []uint64{201_040}, p.vDTS,
 		"forward jump past dashSourceSwitchJumpMs must flush queue, leaving only the jumped frame")
+}
+
+func TestShouldSkipVideoLocked_NoSkipBeforeAvailabilityStart(t *testing.T) {
+	t.Parallel()
+	// Without availabilityStart set, we have no reference for "ahead of
+	// wallclock" — drift cap must NOT engage prematurely.
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4}
+	require.False(t, p.shouldSkipVideoLocked([]byte{0, 0, 0, 1, 0x41}, 0),
+		"non-IDR frame before availabilityStart must pass through")
+}
+
+func TestShouldSkipVideoLocked_EngagesLatchOnDriftAndDropsNonIDR(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4}
+	p.availabilityStart = time.Now().Add(-1 * time.Second) // 1s elapsed
+	// videoNextDecode = 10s in 90 kHz ticks. Threshold = 1s + segSec(4s) =
+	// 5s of elapsed-tolerance — projected (10s) exceeds it ⇒ engage latch.
+	p.videoNextDecode = 10 * dashVideoTimescale
+
+	nonKey := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x88, 0x80}
+	require.True(t, p.shouldSkipVideoLocked(nonKey, 0),
+		"non-IDR frame past drift threshold must skip")
+	require.True(t, p.videoSkipUntilIDR, "latch must engage")
+	// Subsequent non-IDR also drops while latched.
+	require.True(t, p.shouldSkipVideoLocked(nonKey, 0))
+}
+
+func TestShouldSkipVideoLocked_IDRClearsLatchAndReanchorsToWallclock(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4}
+	p.availabilityStart = time.Now().Add(-2 * time.Second) // 2s elapsed
+	p.videoNextDecode = 10 * dashVideoTimescale            // 10s ahead in tfdt
+	// Pre-populate queue to confirm it gets cleared when latch fires.
+	p.vAnnex = [][]byte{{0xff}, {0xfe}}
+	p.vDTS = []uint64{1, 2}
+	p.vPTS = []uint64{1, 2}
+	p.videoSkipUntilIDR = true
+
+	idr := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x80} // NAL type 5 = IDR
+	require.False(t, p.shouldSkipVideoLocked(idr, 0),
+		"IDR while latched must pass (after queue clear)")
+	require.False(t, p.videoSkipUntilIDR, "latch must clear on IDR")
+	require.Empty(t, p.vAnnex, "queue must be cleared")
+	require.Empty(t, p.vDTS)
+	require.Empty(t, p.vPTS)
+}
+
+func TestShouldSkipVideoLocked_SteadyStateDoesNotEngage(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4}
+	p.availabilityStart = time.Now().Add(-10 * time.Second) // 10s elapsed
+	p.videoNextDecode = 9 * dashVideoTimescale              // tfdt only ~9s — within tolerance
+
+	nonKey := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x88, 0x80}
+	require.False(t, p.shouldSkipVideoLocked(nonKey, 0),
+		"steady-state non-IDR (tfdt within elapsed + segSec) must pass through")
+	require.False(t, p.videoSkipUntilIDR, "latch must stay off")
 }

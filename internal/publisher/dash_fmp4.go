@@ -201,6 +201,21 @@ type dashFMP4Packager struct {
 	videoFirstDTSmsSet bool // true once videoNextDecode has been seeded
 	audioFirstDTSmsSet bool // true once audioNextDecode has been seeded
 
+	// videoSkipUntilIDR latches when projected segment timeline races
+	// further than 1 segment ahead of wallclock — typically when the
+	// upstream pipeline (HLS playlist arrival, RTMP republish flush,
+	// mixer drain) bursts a chunk of frames into the buffer hub. While
+	// latched, non-IDR video frames are dropped; the next IDR clears
+	// the queue and the latch, so the next segment starts at a clean
+	// keyframe boundary aligned with current wallclock.
+	//
+	// Without this, the manifest's tfdt grows at input-PTS rate while
+	// publishTime grows at wallclock rate; over time gap_first crosses
+	// zero (segments dated in the FUTURE of publishTime) and strict
+	// DASH players (dashjs) refuse to play because (now − AST) − liveDelay
+	// lands before any available segment.
+	videoSkipUntilIDR bool
+
 	// Sliding-window state for MPD generation.
 	onDiskV    []string // filenames of written video segments
 	onDiskA    []string // filenames of written audio segments
@@ -430,6 +445,71 @@ func timestampJumpFromLast(queue []uint64, ts uint64) bool {
 	return delta < -dashSourceSwitchJumpMs || delta > dashSourceSwitchJumpMs
 }
 
+// shouldSkipVideoLocked decides whether the incoming video frame must be
+// dropped to keep the segment timeline anchored to wallclock. It returns
+// true when:
+//   - the skip-until-IDR latch is already on and the new frame isn't an IDR
+//     (so the latch persists until a clean keyframe arrives), OR
+//   - the latch is off but the projected end of this frame's segment
+//     would land more than one segment-duration ahead of wallclock-since-AST,
+//     in which case we engage the latch and drop until the next IDR.
+//
+// On IDR arrival while the latch is engaged the queue is cleared so the
+// next segment starts at a fresh keyframe boundary aligned with wallclock,
+// the latch is cleared, and the IDR is accepted.
+//
+// Caller must hold p.mu and have already validated the frame is non-empty.
+func (p *dashFMP4Packager) shouldSkipVideoLocked(frame []byte, dts uint64) bool {
+	isIDR := isKeyFrameAnnexB(frame, p.isHEVC)
+
+	if p.videoSkipUntilIDR {
+		if !isIDR {
+			return true
+		}
+		// IDR — flush stale queue contents and accept this frame.
+		p.vAnnex = p.vAnnex[:0]
+		p.vDTS = p.vDTS[:0]
+		p.vPTS = p.vPTS[:0]
+		p.videoSkipUntilIDR = false
+		return false
+	}
+
+	if p.availabilityStart.IsZero() {
+		return false
+	}
+	elapsedTicks := uint64(time.Since(p.availabilityStart).Seconds() * dashVideoTimescale)
+	queuedSpan := totalQueuedVideoDur90k(p.vDTS)
+	// Account for THIS frame's contribution if it would join an existing
+	// queue: roughly one inter-frame delta. Approximation is fine — we
+	// only need an order-of-magnitude check.
+	if len(p.vDTS) > 0 {
+		if delta := int64(dts) - int64(p.vDTS[len(p.vDTS)-1]); delta > 0 { //nolint:gosec // upstream timebase
+			queuedSpan += uint64(delta * 90) //nolint:gosec // delta > 0 above
+		}
+	}
+	projectedEnd := p.videoNextDecode + queuedSpan
+	threshold := elapsedTicks + uint64(p.segSec)*dashVideoTimescale //nolint:gosec // p.segSec > 0
+	if projectedEnd <= threshold {
+		return false
+	}
+	// Engage the latch. If THIS frame is already an IDR we let it
+	// through (after clearing the queue) so the next segment starts
+	// immediately at a clean keyframe.
+	p.vAnnex = p.vAnnex[:0]
+	p.vDTS = p.vDTS[:0]
+	p.vPTS = p.vPTS[:0]
+	if isIDR {
+		// Re-anchor videoNextDecode to wallclock so emitted tfdt no
+		// longer advertises future content.
+		if elapsedTicks > p.videoNextDecode {
+			p.videoNextDecode = elapsedTicks
+		}
+		return false
+	}
+	p.videoSkipUntilIDR = true
+	return true
+}
+
 // onTSFrame is the TSDemuxer callback; it runs in the demuxer goroutine.
 // Init segment file writes are deferred to outside the mutex to avoid blocking
 // the flush ticker during expensive I/O.
@@ -445,6 +525,13 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 
 	case mpeg2.TS_STREAM_H264:
 		if len(frame) == 0 {
+			p.mu.Unlock()
+			return
+		}
+		// Drift cap: drop video frames whose accumulated timeline would
+		// race more than one segment-duration ahead of wallclock-since-
+		// AST, until the next IDR. See shouldSkipVideoLocked for details.
+		if p.shouldSkipVideoLocked(frame, dts) {
 			p.mu.Unlock()
 			return
 		}
@@ -483,7 +570,11 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
-		// Same forward+backward jump guard as the H264 case — see above.
+		// Same drift cap and forward/backward jump guard as H264.
+		if p.shouldSkipVideoLocked(frame, dts) {
+			p.mu.Unlock()
+			return
+		}
 		if timestampJumpFromLast(p.vDTS, dts) {
 			_ = p.flushSegmentLocked()
 		}
