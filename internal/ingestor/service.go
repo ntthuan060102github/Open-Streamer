@@ -501,6 +501,7 @@ func (s *Service) rebaserConfig() ptsrebaser.Config {
 	return ptsrebaser.Config{
 		Enabled:         true,
 		JumpThresholdMs: domain.DefaultPTSJumpThresholdMs,
+		MaxAheadMs:      domain.DefaultPTSMaxAheadMs,
 	}
 }
 

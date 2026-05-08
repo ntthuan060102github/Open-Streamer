@@ -396,10 +396,12 @@ func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
 		}
 		// Anchor PTS/DTS to local wallclock; no-op when the rebaser is
 		// disabled. Push-mode encoders are normally already wallclock-
-		// aligned, so this is mostly defensive — but it also kicks in
-		// after a reconnect where the encoder's session clock restarts
-		// at zero while ours has not.
-		p.rebaser.Apply(cl, time.Now())
+		// aligned, so the drift cap rarely fires here — but skip the
+		// buffer write when the rebaser drops a packet (sustained burst,
+		// see ptsrebaser.Apply).
+		if !p.rebaser.Apply(cl, time.Now()) {
+			continue
+		}
 		if err := p.buf.Write(p.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
 			slog.Debug("rtmp server: buffer write failed",
 				"key", p.key, "err", err)

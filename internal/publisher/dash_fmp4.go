@@ -510,6 +510,53 @@ func (p *dashFMP4Packager) shouldSkipVideoLocked(frame []byte, dts uint64) bool 
 	return true
 }
 
+// shouldSkipAudioLocked decides whether the incoming audio PES must be
+// dropped to keep audioNextDecode anchored near wallclock. AAC frames
+// are self-contained (no IDR concept) and 1024 samples each, so when
+// drift exceeds tolerance we drop frames AND clear the in-flight queue
+// so the next accepted frame starts a clean segment boundary aligned
+// with current wallclock.
+//
+// Without this, audio's input-rate accumulator races ahead during burst
+// delivery (mixer drain, RTMP republish flush) while video's
+// shouldSkipVideoLocked holds video at wallclock pace, producing the
+// multi-second A/V offset reported as "test_mixer HLS unplayable" /
+// "DASH stutters on every stream that has burst-style upstream".
+//
+// Caller must hold p.mu.
+func (p *dashFMP4Packager) shouldSkipAudioLocked(pts uint64) bool {
+	if p.availabilityStart.IsZero() || p.audioSR == 0 {
+		return false
+	}
+	elapsedTicks := uint64(time.Since(p.availabilityStart).Seconds() * float64(p.audioSR))
+	queuedSpan := uint64(0)
+	if len(p.aPTS) >= 2 {
+		first := p.aPTS[0]
+		last := p.aPTS[len(p.aPTS)-1]
+		if last > first {
+			queuedSpan = (last - first) * uint64(p.audioSR) / 1000
+		}
+	}
+	if len(p.aPTS) > 0 {
+		if delta := int64(pts) - int64(p.aPTS[len(p.aPTS)-1]); delta > 0 { //nolint:gosec // upstream timebase
+			queuedSpan += uint64(delta) * uint64(p.audioSR) / 1000
+		}
+	}
+	projectedEnd := p.audioNextDecode + queuedSpan
+	threshold := elapsedTicks + uint64(p.segSec)*uint64(p.audioSR) //nolint:gosec // p.segSec > 0
+	if projectedEnd <= threshold {
+		return false
+	}
+	// Drop this frame and reset queue so the next accepted frame starts
+	// a fresh segment boundary aligned with current wallclock.
+	p.aRaw = p.aRaw[:0]
+	p.aPTS = p.aPTS[:0]
+	if elapsedTicks > p.audioNextDecode {
+		p.audioNextDecode = elapsedTicks
+	}
+	return true
+}
+
 // onTSFrame is the TSDemuxer callback; it runs in the demuxer goroutine.
 // Init segment file writes are deferred to outside the mutex to avoid blocking
 // the flush ticker during expensive I/O.
@@ -600,13 +647,20 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
+		// Drift cap, parallel to the video path. Without this, audio's
+		// sample-count-locked accumulator (1024 samples per frame at
+		// fixed sample rate) advances at input arrival rate. When the
+		// upstream pipeline bursts (mixer drain, RTMP republish flush)
+		// audio's tfdt races ahead while video's drift cap holds it at
+		// wallclock — the result is multi-second A/V offset in the
+		// emitted MPD that breaks player sync (visible as test_mixer
+		// HLS unable to play, DASH stuttering on every other stream).
+		if p.shouldSkipAudioLocked(pts) {
+			p.mu.Unlock()
+			return
+		}
 		// Same forward+backward jump guard as for video: flush before
 		// mixing frames from two different sources in the audio queue.
-		// Audio's own dur math is sample-count-locked (1024/frame) so
-		// the per-sample amplification described in the H264 comment
-		// doesn't apply, but a source switch still wants to land on
-		// a clean segment boundary so the player sees one seamless
-		// audio elementary stream per Period.
 		if timestampJumpFromLast(p.aPTS, pts) {
 			_ = p.flushSegmentLocked()
 		}

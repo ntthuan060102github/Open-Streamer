@@ -342,9 +342,13 @@ func writeOnePacket(wctx writeContext, p *domain.AVPacket, isFirst bool) error {
 		cl.Discontinuity = true
 	}
 	// Anchor PTS/DTS to local wallclock so upstream clock drift never
-	// reaches the buffer hub. No-op when the rebaser is disabled or the
-	// clone carries the raw-TS marker codec (Apply skips that).
-	wctx.rebaser.Apply(cl, time.Now())
+	// reaches the buffer hub. Returns false when the rebaser dropped
+	// the packet (input running ahead of wallclock past MaxAheadMs);
+	// in that case skip the buffer write so downstream consumers see
+	// a wallclock-paced stream.
+	if !wctx.rebaser.Apply(cl, time.Now()) {
+		return nil
+	}
 	if err := wctx.buf.Write(wctx.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
 		slog.Error("ingestor: buffer write failed",
 			"stream_code", wctx.streamID,

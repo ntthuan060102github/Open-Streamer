@@ -40,16 +40,39 @@ import (
 // Config knobs the rebaser. Zero value disables the feature; Apply is
 // then a no-op so wiring it in is safe before any caller is ready.
 type Config struct {
-	// Enabled gates the whole feature. False ⇒ Apply is a no-op.
+	// Enabled gates the whole feature. False ⇒ Apply is a pass-through.
 	Enabled bool
 
-	// JumpThresholdMs caps how far an output PTS may stray from
-	// (now − wallOrigin) before we hard-re-anchor and flag a
-	// Discontinuity. Drift below this band passes through untouched.
+	// JumpThresholdMs caps the burst-tolerant drift (output PTS minus
+	// max(actualNow, lastOutputDts)) before we hard-re-anchor and flag
+	// a Discontinuity. Catches large input PTS jumps while letting
+	// short bursts pass through (the bursty-delivery test_mixer/test5
+	// case from real RTMP republishes).
 	JumpThresholdMs int64
+
+	// MaxAheadMs caps how far the OUTPUT timeline may sit ahead of
+	// (now − wallOrigin) before incoming packets are dropped. Unlike
+	// JumpThresholdMs (which compares against the per-track running
+	// position), this compares against real wallclock — so sustained
+	// "input bursting faster than realtime" cases (mixer drain, slow-
+	// consumer catch-up at startup) get throttled instead of letting
+	// the segment timeline race indefinitely ahead of publishTime and
+	// breaking downstream HLS / DASH liveness math.
+	MaxAheadMs int64
 }
 
-// DefaultConfig returns the recommended steady-state settings.
+// DefaultConfig returns the recommended steady-state settings. MaxAheadMs
+// is intentionally left at 0 (disabled): the drop semantics create a stuck
+// state when sustained drift exceeds the cap (drift never decreases for
+// real-time input → every subsequent packet drops indefinitely), which
+// breaks downstream consumers fed from a drifted buffer hub (mixer://,
+// republish RTSP/RTMP). The DASH packager keeps its own per-track drift
+// cap (shouldSkipVideoLocked / shouldSkipAudioLocked) which fires at the
+// PACKAGER boundary instead of the ingest boundary — that one re-anchors
+// videoNextDecode to wallclock at IDR boundary, so manifest tfdt stays
+// healthy without forcing zero V on consumers that subscribe to the
+// upstream's main buffer directly. Operators / tests that want the
+// stricter ingest cap can set MaxAheadMs explicitly.
 func DefaultConfig() Config {
 	return Config{
 		Enabled:         true,
@@ -126,22 +149,31 @@ func (r *Rebaser) Reset() {
 	r.mu.Unlock()
 }
 
-// Apply rewrites p.PTSms / p.DTSms in place. May set p.Discontinuity =
-// true on hard re-anchor; existing Discontinuity flags are preserved.
+// Apply rewrites p.PTSms / p.DTSms in place and returns whether the
+// caller should keep the packet. A false return means the rebaser
+// chose to drop this frame — typically because emitting it would
+// push the output timeline more than MaxAheadMs ahead of wallclock
+// (sustained input burst that downstream packagers cannot honour
+// without violating live-edge math). The caller must NOT write a
+// dropped packet into the buffer hub.
 //
-// Returns immediately if disabled, the packet is nil, the codec is the
-// AVCodecRawTSChunk marker, or the codec doesn't classify as V or A.
-func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
+// Returns true (pass through, no rewrite) when the rebaser is
+// disabled, the packet is nil, the codec is the AVCodecRawTSChunk
+// marker, or the codec doesn't classify as V or A.
+//
+// May set p.Discontinuity = true on hard re-anchor; existing
+// Discontinuity flags are preserved.
+func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) bool {
 	if r == nil || !r.cfg.Enabled || p == nil {
-		return
+		return true
 	}
 	if p.Codec == domain.AVCodecRawTSChunk {
-		return
+		return true
 	}
 
 	tk, ok := trackKeyFor(p.Codec)
 	if !ok {
-		return
+		return true
 	}
 
 	r.mu.Lock()
@@ -165,47 +197,33 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 	actualNowMs := now.Sub(r.wallOrigin).Milliseconds()
 
 	if !track.seeded {
-		// First packet of this track. Default anchor = current elapsed
-		// wallclock so V and A retain any small intrinsic offset the
-		// source produced (RTSP audio leading video by ~100 ms, RTMP
-		// codec-config pre-roll, etc.).
-		anchor := actualNowMs
-
-		// Mixer-style sources (mixer://, copy:// from a non-AV upstream)
-		// can deliver V and A from independent producers whose first
-		// packets arrive seconds apart. Preserving that arrival skew
-		// bakes a multi-second A/V offset into the output, which
-		// downstream HLS / DASH packagers can't compensate for and
-		// players (hls.js especially) refuse to sync. When the other
-		// track is already seeded AND its arrival was more than
-		// crossTrackSnapMs ago, snap THIS track's anchor to where the
-		// other track is now — so both streams start in lockstep
-		// regardless of the source-side delay.
-		otherTrack := &r.tracks[numTracks-1-tk]
-		if otherTrack.seeded && actualNowMs-otherTrack.outputAnchor > crossTrackSnapMs {
-			anchor = otherTrack.lastOutputDts
-		}
-
-		track.seeded = true
-		track.inputOrigin = inDts
-		track.outputAnchor = anchor
-		track.lastOutputDts = anchor
-		assignTimes(p, anchor, cto)
-		return
+		r.seedTrackLocked(track, tk, inDts, actualNowMs, cto, p)
+		return true
 	}
 
 	inputDelta := inDts - track.inputOrigin
 	expectedDts := track.outputAnchor + inputDelta
 
-	// Drift is the gap between where input pacing wants this packet to
-	// land and where wallclock-since-anchor says we are. Compare against
-	// max(actualNow, lastOutputDts) so a bursty source — RTMP/SRT often
-	// ship a batch of packets in a few wallclock ms each spaced 40 ms
-	// in DTS — doesn't manufacture a fake "drift" against the slow-
-	// growing actualNow inside the burst. Once the output timeline runs
-	// ahead of wallclock (which it can with bursty delivery) we measure
-	// drift against the output's own pace; only a real input jump that
-	// overshoots even that floor is a re-anchor signal.
+	// Real drift = how far the proposed output PTS would sit ahead of
+	// wallclock-since-wallOrigin. When a single producer sustains an
+	// above-realtime pace (mixer drain, slow-consumer catch-up at
+	// startup) drift accumulates indefinitely; cap it by DROPPING the
+	// frame when it would push us past MaxAheadMs. State is left
+	// untouched so subsequent frames keep getting evaluated against
+	// the same anchor — wallclock catches up, drift falls below the
+	// cap, and frames pass through again. Net result: output PTS
+	// rate ≈ wallclock rate (with a small bounded burst-tolerance
+	// window), which is what the segmenters and players need.
+	if r.cfg.MaxAheadMs > 0 && expectedDts-actualNowMs > r.cfg.MaxAheadMs {
+		return false
+	}
+
+	// Burst-tolerant drift uses max(actualNow, lastOutputDts) so a
+	// short burst — RTMP/SRT often ship a batch of packets in a few
+	// wallclock ms each spaced 40 ms in DTS — doesn't manufacture a
+	// fake drift against the slow-growing actualNow inside the burst.
+	// Only a real input jump that overshoots even the running output
+	// position is a re-anchor signal.
 	effActualNow := actualNowMs
 	if effActualNow < track.lastOutputDts {
 		effActualNow = track.lastOutputDts
@@ -213,7 +231,7 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 	drift := expectedDts - effActualNow
 
 	// Hard re-anchor when:
-	//   - drift exceeds threshold (input PTS jumped past where any
+	//   - |drift| exceeds threshold (input PTS jumped past where any
 	//     reasonable smoothing would expect), OR
 	//   - the proposed output would regress past the monotonicity
 	//     floor (downstream dur math is uint64 — never let it
@@ -230,11 +248,42 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 		track.lastOutputDts = target
 		assignTimes(p, target, cto)
 		p.Discontinuity = true
-		return
+		return true
 	}
 
 	track.lastOutputDts = expectedDts
 	assignTimes(p, expectedDts, cto)
+	return true
+}
+
+// seedTrackLocked installs the per-track anchor on a track's first
+// observed packet. Default anchor is current elapsed wallclock — this
+// preserves any small intrinsic A/V offset the source produced
+// (RTSP audio leading video by ~100 ms, RTMP codec-config pre-roll).
+//
+// Mixer-style sources (mixer://, copy:// from a non-AV upstream) can
+// deliver V and A from independent producers whose first packets
+// arrive seconds apart. Preserving that arrival skew bakes a multi-
+// second A/V offset into the output, which downstream HLS / DASH
+// packagers can't compensate for and hls.js refuses to sync. When the
+// OTHER track is already seeded AND its arrival was more than
+// crossTrackSnapMs ago, snap this track's anchor to where the other
+// track is now so both streams start in lockstep.
+//
+// Caller must hold r.mu.
+func (r *Rebaser) seedTrackLocked(
+	track *trackState, tk trackKey, inDts, actualNowMs, cto int64, p *domain.AVPacket,
+) {
+	anchor := actualNowMs
+	otherTrack := &r.tracks[numTracks-1-tk]
+	if otherTrack.seeded && actualNowMs-otherTrack.outputAnchor > crossTrackSnapMs {
+		anchor = otherTrack.lastOutputDts
+	}
+	track.seeded = true
+	track.inputOrigin = inDts
+	track.outputAnchor = anchor
+	track.lastOutputDts = anchor
+	assignTimes(p, anchor, cto)
 }
 
 // trackKeyFor maps AVCodec to its V / A slot. Returns ok=false for

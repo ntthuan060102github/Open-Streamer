@@ -539,3 +539,37 @@ func TestShouldSkipVideoLocked_SteadyStateDoesNotEngage(t *testing.T) {
 		"steady-state non-IDR (tfdt within elapsed + segSec) must pass through")
 	require.False(t, p.videoSkipUntilIDR, "latch must stay off")
 }
+
+func TestShouldSkipAudioLocked_NoSkipBeforeAvailabilityStart(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4, audioSR: 48000}
+	require.False(t, p.shouldSkipAudioLocked(0),
+		"audio frame before availabilityStart must pass through")
+}
+
+func TestShouldSkipAudioLocked_DropsFutureFrameAndReanchors(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4, audioSR: 48000}
+	p.availabilityStart = time.Now().Add(-1 * time.Second) // 1 s elapsed
+	// audioNextDecode = 10 s in 48 kHz ticks. Threshold = (1+4) × 48000.
+	// Projected (10 × 48000) > threshold ⇒ drop.
+	p.audioNextDecode = 10 * 48000
+	p.aRaw = [][]byte{{0xff}, {0xfe}}
+	p.aPTS = []uint64{1, 2}
+	require.True(t, p.shouldSkipAudioLocked(3),
+		"audio frame past drift threshold must skip")
+	require.Empty(t, p.aRaw, "queue must be cleared on drop")
+	require.Empty(t, p.aPTS)
+	// Re-anchored to elapsed wallclock (= ~1 s in 48 kHz ticks).
+	require.GreaterOrEqual(t, p.audioNextDecode, uint64(48000),
+		"audioNextDecode re-anchored to wallclock")
+}
+
+func TestShouldSkipAudioLocked_SteadyStateDoesNotDrop(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4, audioSR: 48000}
+	p.availabilityStart = time.Now().Add(-10 * time.Second)
+	p.audioNextDecode = 9 * 48000 // tfdt 9 s, elapsed ~10 s, in tolerance.
+	require.False(t, p.shouldSkipAudioLocked(0),
+		"steady-state audio must pass through")
+}

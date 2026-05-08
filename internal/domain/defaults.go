@@ -102,6 +102,21 @@ const (
 	// to operators.
 	DefaultPTSJumpThresholdMs int64 = 2000
 
+	// DefaultPTSMaxAheadMs is intentionally 0 (disabled). When non-zero
+	// the AV-path PTS rebaser drops incoming packets whose proposed
+	// output PTS sits more than this far ahead of (now − wallOrigin).
+	// The drop has a stuck-state pathology: once drift exceeds the cap
+	// it never decreases for real-time input (input rate == wallclock
+	// rate keeps drift constant), so every subsequent packet drops
+	// indefinitely — observed empirically on consumers fed from a
+	// drifted upstream main buffer (mixer://, republish RTSP/RTMP)
+	// where it zeroed out the video track. The DASH packager keeps a
+	// per-track drift cap that re-anchors at IDR boundary instead of
+	// dropping; that's the durable defense against MPDs racing ahead
+	// of publishTime. This knob stays in the codebase for tests and
+	// for operators willing to accept the trade-off explicitly.
+	DefaultPTSMaxAheadMs int64 = 0
+
 	// DefaultSRTLatencyMS is the SRT ARQ latency window (milliseconds) when
 	// SRTListenerConfig.LatencyMS is zero. 120ms matches Haivision's
 	// reference for low-latency contribution links.

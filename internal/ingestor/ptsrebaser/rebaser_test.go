@@ -273,4 +273,56 @@ func TestDefaultConfig(t *testing.T) {
 	if c.JumpThresholdMs <= 0 {
 		t.Fatalf("default JumpThresholdMs must be > 0, got %d", c.JumpThresholdMs)
 	}
+	// MaxAheadMs is intentionally 0 by default — see rebaser.go DefaultConfig
+	// rationale (drop semantics create a stuck state on real-time input).
+	if c.MaxAheadMs != 0 {
+		t.Fatalf("default MaxAheadMs must be 0 (disabled), got %d", c.MaxAheadMs)
+	}
+}
+
+func TestApply_DropsFrameWhenSustainedAhead(t *testing.T) {
+	// MaxAheadMs cap fires when output PTS would land >cap ahead of
+	// wallclock-since-anchor. Distinguishes a brief burst (ok, passes)
+	// from a sustained "input runs faster than realtime" producer
+	// (mixer drain, transcoder catch-up). Caller must drop on false.
+	r := New(Config{Enabled: true, JumpThresholdMs: 10_000, MaxAheadMs: 2000})
+	start := time.Unix(1_700_000_000, 0)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 0, DTSms: 0}, start)
+
+	// 100 frames spaced 40 ms in PTS but only 1 ms wallclock each →
+	// expected drift after frame 100 ≈ 4000 − 100 = 3900 ms ⇒ above cap.
+	dropped := 0
+	for i := 1; i <= 100; i++ {
+		p := &domain.AVPacket{
+			Codec: domain.AVCodecH264,
+			PTSms: uint64(i) * 40, //nolint:gosec
+			DTSms: uint64(i) * 40, //nolint:gosec
+		}
+		keep := r.Apply(p, start.Add(time.Duration(i)*time.Millisecond))
+		if !keep {
+			dropped++
+		}
+	}
+	if dropped == 0 {
+		t.Fatal("expected drop signals once sustained drift exceeds MaxAheadMs")
+	}
+}
+
+func TestApply_DropDoesNotMutateOutput(t *testing.T) {
+	// When a frame is dropped, the caller skips the buffer write — but
+	// the packet's fields shouldn't be silently rewritten in a way
+	// that hides the drop, because the original PTS is still useful for
+	// metrics / debug. (We don't strictly require pristine fields, but
+	// guarantee no Discontinuity is set on a drop.)
+	r := New(Config{Enabled: true, JumpThresholdMs: 10_000, MaxAheadMs: 100})
+	start := time.Unix(1_700_000_000, 0)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 0, DTSms: 0}, start)
+
+	p := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 5000, DTSms: 5000}
+	if keep := r.Apply(p, start.Add(10*time.Millisecond)); keep {
+		t.Fatal("expected drop on huge sustained drift")
+	}
+	if p.Discontinuity {
+		t.Fatal("dropped packet must not be flagged as Discontinuity")
+	}
 }
