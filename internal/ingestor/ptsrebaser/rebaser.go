@@ -169,10 +169,25 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 
 	inputDelta := inDts - track.inputOrigin
 	expectedDts := track.outputAnchor + inputDelta
-	drift := expectedDts - actualNowMs
+
+	// Drift is the gap between where input pacing wants this packet to
+	// land and where wallclock-since-anchor says we are. Compare against
+	// max(actualNow, lastOutputDts) so a bursty source — RTMP/SRT often
+	// ship a batch of packets in a few wallclock ms each spaced 40 ms
+	// in DTS — doesn't manufacture a fake "drift" against the slow-
+	// growing actualNow inside the burst. Once the output timeline runs
+	// ahead of wallclock (which it can with bursty delivery) we measure
+	// drift against the output's own pace; only a real input jump that
+	// overshoots even that floor is a re-anchor signal.
+	effActualNow := actualNowMs
+	if effActualNow < track.lastOutputDts {
+		effActualNow = track.lastOutputDts
+	}
+	drift := expectedDts - effActualNow
 
 	// Hard re-anchor when:
-	//   - drift exceeds threshold (upstream PTS jumped or rolled over), OR
+	//   - drift exceeds threshold (input PTS jumped past where any
+	//     reasonable smoothing would expect), OR
 	//   - the proposed output would regress past the monotonicity
 	//     floor (downstream dur math is uint64 — never let it
 	//     underflow, no matter what the input did).

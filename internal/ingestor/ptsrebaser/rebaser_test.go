@@ -151,6 +151,39 @@ func TestApply_HardResetWhenForwardJumpExceedsThreshold(t *testing.T) {
 	}
 }
 
+func TestApply_BurstyDeliveryDoesNotPingPongReset(t *testing.T) {
+	// RTMP / SRT pulls often deliver a batch of frames within a few
+	// wallclock ms, each spaced ~frame-cadence in DTS. A drift check
+	// against instantaneous wallclock would manufacture a "drift"
+	// against actualNow inside the burst, trip the threshold, push
+	// output past wallclock via the monotonicity floor, then trip the
+	// threshold again on every subsequent packet — emitting a stream
+	// of Discontinuity-flagged packets and microsecond-sized HLS
+	// segments. Confirmed empirically against the staging test5 RTMP
+	// pull: every video packet was flagged as a discontinuity boundary
+	// pre-fix.
+	r := New(Config{Enabled: true, JumpThresholdMs: 2000})
+	start := time.Unix(1_700_000_000, 0)
+
+	discontinuities := 0
+	for i := 0; i < 60; i++ {
+		p := &domain.AVPacket{
+			Codec: domain.AVCodecH264,
+			PTSms: 1000 + uint64(i)*40, //nolint:gosec
+			DTSms: 1000 + uint64(i)*40, //nolint:gosec
+		}
+		// Pack 60 frames into ~5 ms of wallclock — the worst-case
+		// burst the rebaser must absorb without flagging every packet.
+		r.Apply(p, start.Add(time.Duration(i)*83*time.Microsecond))
+		if p.Discontinuity {
+			discontinuities++
+		}
+	}
+	if discontinuities != 0 {
+		t.Fatalf("bursty delivery flagged %d packets as Discontinuity (want 0)", discontinuities)
+	}
+}
+
 func TestApply_DriftBelowThresholdPassesThrough(t *testing.T) {
 	r := New(Config{Enabled: true, JumpThresholdMs: 2000})
 	start := time.Unix(1_700_000_000, 0)
