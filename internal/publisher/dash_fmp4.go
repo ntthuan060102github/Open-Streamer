@@ -879,17 +879,32 @@ func (p *dashFMP4Packager) writeVideoSegmentLocked() error {
 		}
 
 		// Sample duration in 90 kHz ticks from inter-frame DTS delta.
+		// Use signed arithmetic: vDTS is uint64, so an inter-frame
+		// regression (vDTS[i+1] < vDTS[i] — possible when the rebaser
+		// hard-re-anchors mid-batch, or when an upstream source mixes
+		// sub-second backward jumps below the dashSourceSwitchJumpMs
+		// guard) underflows to ~2^64 in unsigned subtraction and casts
+		// to a uint32 close to its max, baking ~47.7 seconds of phantom
+		// duration into videoNextDecode (root cause of "DASH timeline
+		// runs N seconds ahead of wallclock" reports).
 		var dur uint32
 		if i+1 < len(p.vDTS) {
-			if d := p.vDTS[i+1] - p.vDTS[i]; d > 0 {
-				dur = uint32(d * 90)
+			delta := int64(p.vDTS[i+1]) - int64(p.vDTS[i]) //nolint:gosec // bounded by upstream timebase
+			// Cap at uint32 max to also defuse pathological forward jumps
+			// the source-switch guard somehow let through.
+			if delta > 0 && delta*90 < int64(^uint32(0)) {
+				dur = uint32(delta * 90) //nolint:gosec // bounded by branch above
 			}
 		}
 		if dur == 0 {
-			// Fallback: spread total queued duration evenly.
+			// Fallback: spread total queued duration evenly. Total uses
+			// signed math too — same uint64-underflow rationale.
 			if len(p.vDTS) >= 2 {
-				total := (p.vDTS[len(p.vDTS)-1] - p.vDTS[0]) * 90
-				dur = uint32(total / uint64(len(p.vAnnex)))
+				totalDelta := int64(p.vDTS[len(p.vDTS)-1]) - int64(p.vDTS[0]) //nolint:gosec // bounded by upstream timebase
+				if totalDelta > 0 {
+					total := uint64(totalDelta * 90) //nolint:gosec // totalDelta > 0 above
+					dur = uint32(total / uint64(len(p.vAnnex)))
+				}
 			}
 			if dur == 0 {
 				dur = uint32(p.segSec) * dashVideoTimescale / uint32(len(p.vAnnex))

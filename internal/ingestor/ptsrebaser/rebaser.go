@@ -13,13 +13,21 @@
 // The rebaser sits between the PacketReader and the buffer.Service write
 // step on the AV path. It rewrites each packet's PTSms / DTSms so the
 // emitted timeline tracks wallclock since the first packet of the
-// stream. Inter-frame deltas (frame rate, A/V composition offset) are
-// preserved; the only thing dropped is the upstream's drift relative
-// to the host.
+// stream. Inter-frame deltas (frame rate) are preserved per track, A/V
+// offset relationships at startup are preserved, the only thing
+// dropped is the upstream's drift relative to the host.
 //
-// Scope: AV-path packets only. Raw-TS chunks (UDP / HLS / HTTP-TS / SRT
-// / file pull) carry PTS inside PES headers and need PES rewriting,
-// which is a follow-up — they're not handled here.
+// State is kept PER TRACK (video and audio independently) — this is
+// load-bearing. RTSP / RTMP carry V and A on different timebases (RTP
+// SSRCs, FLV channel timestamps); a single shared origin would see
+// every audio packet as a huge delta from the last video origin and
+// vice versa, ping-ponging the anchor on every other frame and
+// emitting a non-monotonic PTS sequence that downstream uint64 dur
+// math would amplify into many-second sample durations.
+//
+// Scope: AV-path packets only. Raw-TS chunks (UDP / HLS / HTTP-TS /
+// SRT / file pull) carry PTS inside PES headers and need PES
+// rewriting, which is a follow-up — they're not handled here.
 package ptsrebaser
 
 import (
@@ -29,20 +37,15 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
-// Config knobs the rebaser. Zero-value is a permissive default: feature
-// disabled (Apply is a no-op), so wiring it in is safe even before
-// operators flip the global config switch.
+// Config knobs the rebaser. Zero value disables the feature; Apply is
+// then a no-op so wiring it in is safe before any caller is ready.
 type Config struct {
 	// Enabled gates the whole feature. False ⇒ Apply is a no-op.
 	Enabled bool
 
-	// JumpThresholdMs is the maximum drift (output PTS minus wallclock,
-	// in ms) tolerated before we hard-reset the anchor and flag a
-	// Discontinuity. Drift accumulates linearly at the upstream's
-	// clock-skew rate; with the default 2000ms and a typical 0.28%
-	// skew, hard reset fires roughly every 12 minutes. Larger values
-	// space resets out at the cost of letting the timeline lead
-	// wallclock further before correcting.
+	// JumpThresholdMs caps how far an output PTS may stray from
+	// (now − wallOrigin) before we hard-re-anchor and flag a
+	// Discontinuity. Drift below this band passes through untouched.
 	JumpThresholdMs int64
 }
 
@@ -54,45 +57,71 @@ func DefaultConfig() Config {
 	}
 }
 
-// Rebaser is per-stream PTS anchor state. Safe for concurrent Apply calls
-// — the typical caller is a single readLoop goroutine, but push servers
+// trackKey buckets AVCodec into the V / A slot used for per-track
+// anchor state. Codecs that classify as neither (the raw-TS marker,
+// AVCodecUnknown) are skipped at the call site.
+type trackKey int
+
+const (
+	trackVideo trackKey = iota
+	trackAudio
+	numTracks
+)
+
+// trackState is the per-(stream, track) anchor.
+//
+//   - inputOrigin: input DTS at this track's first observed packet.
+//   - outputAnchor: output DTS to emit for that first packet — equal
+//     to elapsed ms since wallOrigin at the time it arrived. Subsequent
+//     packets emit outputAnchor + (input - inputOrigin), preserving the
+//     track's frame cadence.
+//   - lastOutputDts: monotonicity floor for this track. After a hard
+//     re-anchor we always emit ≥ lastOutputDts + 1 so downstream uint64
+//     dur math (vDTS[i+1] − vDTS[i]) can never underflow.
+type trackState struct {
+	seeded        bool
+	inputOrigin   int64
+	outputAnchor  int64
+	lastOutputDts int64
+}
+
+// Rebaser is per-stream PTS anchor state. Safe for concurrent Apply
+// calls — pull workers use a single goroutine, but push servers can
 // fan out to multiple writer goroutines so the lock is necessary.
 type Rebaser struct {
 	cfg Config
 
-	mu          sync.Mutex
-	seeded      bool
-	wallOrigin  time.Time
-	inputOrigin int64 // first packet's DTSms (signed for safe arithmetic)
+	mu         sync.Mutex
+	wallOrigin time.Time
+	wallSeeded bool
+	tracks     [numTracks]trackState
 }
 
-// New returns a Rebaser configured with cfg. A nil-equivalent (Enabled=false)
-// rebaser is a perfectly valid object — Apply will pass packets through
-// untouched.
+// New returns a Rebaser configured with cfg. An Enabled=false rebaser
+// is valid; Apply will pass packets through untouched.
 func New(cfg Config) *Rebaser {
 	return &Rebaser{cfg: cfg}
 }
 
 // Reset clears all anchoring state. Call when the source has provably
-// torn down (failover, manual restart) so the next packet re-seeds
-// against the new wallclock. Safe to call before any Apply.
+// torn down so the next packet re-seeds against the new wallclock.
+// Safe to call before any Apply or on a nil receiver.
 func (r *Rebaser) Reset() {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
-	r.seeded = false
+	r.wallSeeded = false
 	r.wallOrigin = time.Time{}
-	r.inputOrigin = 0
+	r.tracks = [numTracks]trackState{}
 	r.mu.Unlock()
 }
 
-// Apply rewrites p.PTSms / p.DTSms in place to be wallclock-anchored.
-// It may set p.Discontinuity = true when a hard reset fires; existing
-// Discontinuity flags are preserved (OR-ed in).
+// Apply rewrites p.PTSms / p.DTSms in place. May set p.Discontinuity =
+// true on hard re-anchor; existing Discontinuity flags are preserved.
 //
-// Returns immediately if disabled, the packet is nil, or it is the
-// AVCodecRawTSChunk marker — those are out of scope for this layer.
+// Returns immediately if disabled, the packet is nil, the codec is the
+// AVCodecRawTSChunk marker, or the codec doesn't classify as V or A.
 func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 	if r == nil || !r.cfg.Enabled || p == nil {
 		return
@@ -101,43 +130,82 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) {
 		return
 	}
 
+	tk, ok := trackKeyFor(p.Codec)
+	if !ok {
+		return
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if !r.wallSeeded {
+		r.wallOrigin = now
+		r.wallSeeded = true
+	}
 
 	inDts := int64(p.DTSms) //nolint:gosec // bounded by upstream timebase
 	inPts := int64(p.PTSms) //nolint:gosec // bounded by upstream timebase
 	cto := inPts - inDts
 	if cto < 0 {
-		// Should never happen on well-formed streams (PTS >= DTS), but
-		// don't propagate a value that would underflow downstream.
+		// Well-formed streams have PTS >= DTS; clamp rather than
+		// propagate a value that would invert the offset downstream.
 		cto = 0
 	}
 
-	if !r.seeded {
-		r.wallOrigin = now
-		r.inputOrigin = inDts
-		r.seeded = true
-		assignTimes(p, 0, cto)
+	track := &r.tracks[tk]
+	actualNowMs := now.Sub(r.wallOrigin).Milliseconds()
+
+	if !track.seeded {
+		// First packet of this track — anchor its output at the
+		// current elapsed wallclock so V and A retain whatever
+		// startup arrival offset the source produced.
+		track.seeded = true
+		track.inputOrigin = inDts
+		track.outputAnchor = actualNowMs
+		track.lastOutputDts = actualNowMs
+		assignTimes(p, actualNowMs, cto)
 		return
 	}
 
-	inputDelta := inDts - r.inputOrigin
-	actualNowMs := now.Sub(r.wallOrigin).Milliseconds()
-	expectedDts := inputDelta
+	inputDelta := inDts - track.inputOrigin
+	expectedDts := track.outputAnchor + inputDelta
 	drift := expectedDts - actualNowMs
 
-	if absInt64(drift) > r.cfg.JumpThresholdMs {
-		// Hard re-anchor: pin THIS packet at the current wallclock and
-		// resume accumulating from there. Downstream consumers see the
-		// jump as a Discontinuity and reset their muxer / demuxer carry.
-		r.wallOrigin = now
-		r.inputOrigin = inDts
-		assignTimes(p, 0, cto)
+	// Hard re-anchor when:
+	//   - drift exceeds threshold (upstream PTS jumped or rolled over), OR
+	//   - the proposed output would regress past the monotonicity
+	//     floor (downstream dur math is uint64 — never let it
+	//     underflow, no matter what the input did).
+	if absInt64(drift) > r.cfg.JumpThresholdMs || expectedDts < track.lastOutputDts {
+		target := actualNowMs
+		if target <= track.lastOutputDts {
+			// Wallclock too close to (or behind) last emitted; nudge
+			// forward by 1 ms to preserve strict monotonicity.
+			target = track.lastOutputDts + 1
+		}
+		track.inputOrigin = inDts
+		track.outputAnchor = target
+		track.lastOutputDts = target
+		assignTimes(p, target, cto)
 		p.Discontinuity = true
 		return
 	}
 
+	track.lastOutputDts = expectedDts
 	assignTimes(p, expectedDts, cto)
+}
+
+// trackKeyFor maps AVCodec to its V / A slot. Returns ok=false for
+// codecs the rebaser doesn't classify (marker, unknown).
+func trackKeyFor(c domain.AVCodec) (trackKey, bool) {
+	switch {
+	case c.IsVideo():
+		return trackVideo, true
+	case c.IsAudio():
+		return trackAudio, true
+	default:
+		return 0, false
+	}
 }
 
 // assignTimes writes outDts (>= 0) and outDts + cto into the packet.
