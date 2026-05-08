@@ -91,13 +91,23 @@ const (
 	numTracks
 )
 
-// crossTrackSnapMs is the arrival-skew (ms) above which a track's
-// output anchor snaps to the already-seeded other track instead of
-// preserving the skew. RTSP / RTMP same-source A/V interleave within
-// tens of ms, so the typical 100 ms intrinsic offset survives. Mixer-
-// style multi-source feeds where audio first arrives seconds after
-// video (or vice versa) snap into sync, eliminating the multi-second
-// A/V gap that otherwise breaks hls.js playback.
+// crossTrackSnapMs is the cross-track progression gap (ms) above which
+// a newly-seeded track snaps its output anchor onto the already-seeded
+// other track instead of starting from current wallclock-elapsed.
+//
+// We compare against the OTHER track's CONTENT progression, not its
+// wallclock arrival time, because mixer-style sources (mixer://,
+// copy:// of a busy buffer) can drain a multi-second burst of one
+// track's frames into the rebaser within microseconds — wallclock-
+// based snap would never fire (both tracks "arrived within 1 ms")
+// while the late-seeding track is content-wise seconds behind. The
+// progression check sees the burst directly and snaps the anchor
+// accordingly so V and A play in lockstep regardless of how the
+// upstream chose to deliver them.
+//
+// RTSP / RTMP same-source A/V interleave within tens of ms — neither
+// has time to progress past 1 s before the other seeds — so the
+// typical sub-second intrinsic A/V offset still survives.
 const crossTrackSnapMs int64 = 1000
 
 // trackState is the per-(stream, track) anchor.
@@ -276,8 +286,15 @@ func (r *Rebaser) seedTrackLocked(
 ) {
 	anchor := actualNowMs
 	otherTrack := &r.tracks[numTracks-1-tk]
-	if otherTrack.seeded && actualNowMs-otherTrack.outputAnchor > crossTrackSnapMs {
-		anchor = otherTrack.lastOutputDts
+	if otherTrack.seeded {
+		// Progression-based snap: how far the other track has already
+		// moved its output PTS since its own seed. Catches both
+		// "arrived seconds late" (RTSP A behind V) and "drained burst"
+		// (mixer V emitted seconds of frames before A's first packet).
+		otherProgression := otherTrack.lastOutputDts - otherTrack.outputAnchor
+		if otherProgression > crossTrackSnapMs {
+			anchor = otherTrack.lastOutputDts
+		}
 	}
 	track.seeded = true
 	track.inputOrigin = inDts

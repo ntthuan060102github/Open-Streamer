@@ -54,6 +54,44 @@ func TestApply_FirstPacketAnchorsAtZero(t *testing.T) {
 	}
 }
 
+func TestApply_CrossTrackSnap_OnBurstProgression(t *testing.T) {
+	// Mixer-style scenario: V drains a multi-second burst of frames
+	// into the rebaser within milliseconds of wallclock (mixer reads
+	// buffered upstream content at startup), THEN A seeds. Without a
+	// progression-based snap, A would anchor at current wallclock
+	// elapsed (~1 ms) while V's lastOutputDts is already seconds
+	// ahead — emitted output would carry a multi-second A/V gap that
+	// downstream HLS / DASH cannot reconcile (test_mixer hls.js refusal
+	// to play, observed empirically).
+	r := New(DefaultConfig())
+	start := time.Unix(1_700_000_000, 0)
+
+	// Burst: 100 V frames spaced 40 ms in PTS arriving in <1 ms wall.
+	for i := 0; i < 100; i++ {
+		v := &domain.AVPacket{
+			Codec: domain.AVCodecH264,
+			PTSms: uint64(i) * 40, //nolint:gosec
+			DTSms: uint64(i) * 40, //nolint:gosec
+		}
+		r.Apply(v, start.Add(time.Duration(i)*5*time.Microsecond))
+	}
+	// V's last emitted output should be ≈ 99 × 40 = 3960 ms.
+
+	// A's first packet arrives 600 µs after the V burst ends — wallclock-
+	// only snap (`actualNow - V.outputAnchor > 1 s`) would NOT fire
+	// because only ~1 ms elapsed. Progression-based snap MUST fire
+	// because V's content has moved 3960 ms.
+	a := &domain.AVPacket{Codec: domain.AVCodecAAC, PTSms: 0, DTSms: 0}
+	r.Apply(a, start.Add(600*time.Microsecond))
+
+	// A must anchor at V's lastOutputDts so subsequent A frames sit
+	// alongside V on the output timeline. Allow 1 ms tolerance for the
+	// final V packet's wallclock-floor adjustment.
+	if a.DTSms < 3900 {
+		t.Fatalf("A.first output must snap onto V's progression (≈3960ms), got %d", a.DTSms)
+	}
+}
+
 func TestApply_VideoAndAudioTracksAreIndependent(t *testing.T) {
 	// RTSP/RTMP-style scenario: V and A on entirely different timebases
 	// (e.g. RTP per-track timestamps). Pre-fix this caused every packet
