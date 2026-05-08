@@ -1,6 +1,6 @@
 module github.com/ntt0601zcoder/open-streamer
 
-go 1.25.9
+go 1.25.10
 
 require (
 	github.com/Eyevinn/mp4ff v0.51.0
