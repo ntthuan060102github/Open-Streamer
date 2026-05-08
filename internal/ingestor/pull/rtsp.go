@@ -205,8 +205,15 @@ func (r *RTSPReader) registerH264Callback(
 		return
 	}
 
-	// Build Annex-B SPS+PPS prefix from SDP parameters.
-	spsPrefix := buildH264SPSPrefix(forma.SPS, forma.PPS)
+	// Codec-config cache. Seeded from SDP `sprop-parameter-sets`; refreshed
+	// every time the source emits inline SPS/PPS in an IDR. Mirrors the
+	// RTMP guard (RTMPMsgConverter.ensureKeyFrameHasParamSets) so IDRs
+	// without inline params still reach the buffer hub init-able, and
+	// IDRs with neither inline NOR cached params get dropped instead of
+	// poisoning downstream muxers with un-decodable keyframes.
+	cachedSPS := append([]byte(nil), forma.SPS...)
+	cachedPPS := append([]byte(nil), forma.PPS...)
+	var droppedCount int
 
 	var dtsEx mch264.DTSExtractor
 	dtsEx.Initialize()
@@ -227,15 +234,47 @@ func (r *RTSPReader) registerH264Callback(
 		}
 
 		isIDR := mch264.IsRandomAccess(au)
-
 		dts, err := dtsEx.Extract(au, pts)
 		if err != nil {
 			return
 		}
 
-		// Convert [][]byte NAL units to Annex-B byte stream.
+		// Refresh cache on inline SPS/PPS — handles upstream resolution
+		// changes that update the param sets mid-stream.
+		inlineSPS, inlinePPS := findH264SPSPPSInNALUs(au)
+		if len(inlineSPS) > 0 {
+			cachedSPS = append(cachedSPS[:0], inlineSPS...)
+		}
+		if len(inlinePPS) > 0 {
+			cachedPPS = append(cachedPPS[:0], inlinePPS...)
+		}
+
 		annexB := nalusToAnnexB(au)
-		data := h264AccessUnitForTS(isIDR, spsPrefix, annexB)
+		var data []byte
+		switch {
+		case !isIDR:
+			data = annexB
+		case len(inlineSPS) > 0 && len(inlinePPS) > 0:
+			// IDR carries its own SPS+PPS — emit as-is, no double prefix.
+			data = annexB
+		case len(cachedSPS) > 0 && len(cachedPPS) > 0:
+			// IDR is slice-only; prepend cached prefix so the muxer sees
+			// a self-contained init-able keyframe.
+			prefix := buildH264SPSPrefix(cachedSPS, cachedPPS)
+			data = make([]byte, 0, len(prefix)+len(annexB))
+			data = append(data, prefix...)
+			data = append(data, annexB...)
+		default:
+			// No inline SPS/PPS and no cached prefix — emitting this IDR
+			// would poison downstream muxers with an un-init-able
+			// keyframe. Drop and wait for a usable IDR.
+			droppedCount++
+			if droppedCount == 1 || droppedCount%50 == 0 {
+				slog.Warn("rtsp reader: dropping H264 IDR — no inline SPS/PPS and no cached prefix",
+					"url", r.input.URL, "dropped_count", droppedCount)
+			}
+			return
+		}
 		if len(data) == 0 {
 			return
 		}
@@ -271,9 +310,12 @@ func (r *RTSPReader) registerH265Callback(
 		return
 	}
 
-	vps := forma.VPS
-	sps := forma.SPS
-	pps := forma.PPS
+	// Codec-config cache. Same rationale as the H264 path — see comment
+	// in registerH264Callback. H.265 needs VPS as well as SPS+PPS.
+	cachedVPS := append([]byte(nil), forma.VPS...)
+	cachedSPS := append([]byte(nil), forma.SPS...)
+	cachedPPS := append([]byte(nil), forma.PPS...)
+	var droppedCount int
 
 	var dtsEx mch265.DTSExtractor
 	dtsEx.Initialize()
@@ -294,15 +336,38 @@ func (r *RTSPReader) registerH265Callback(
 		}
 
 		isIDR := mch265.IsRandomAccess(au)
-
 		dts, err := dtsEx.Extract(au, pts)
 		if err != nil {
 			return
 		}
 
-		// Prepend VPS/SPS/PPS on IDR so decoders can initialise without SDP.
-		if isIDR && len(vps) > 0 && len(sps) > 0 && len(pps) > 0 {
-			au = append([][]byte{vps, sps, pps}, au...)
+		// Refresh cache on inline VPS/SPS/PPS.
+		inlineVPS, inlineSPS, inlinePPS := findH265VPSSPSPPSInNALUs(au)
+		if len(inlineVPS) > 0 {
+			cachedVPS = append(cachedVPS[:0], inlineVPS...)
+		}
+		if len(inlineSPS) > 0 {
+			cachedSPS = append(cachedSPS[:0], inlineSPS...)
+		}
+		if len(inlinePPS) > 0 {
+			cachedPPS = append(cachedPPS[:0], inlinePPS...)
+		}
+
+		switch {
+		case !isIDR:
+			// pass through
+		case len(inlineVPS) > 0 && len(inlineSPS) > 0 && len(inlinePPS) > 0:
+			// IDR carries its own VPS+SPS+PPS — keep AU as-is.
+		case len(cachedVPS) > 0 && len(cachedSPS) > 0 && len(cachedPPS) > 0:
+			// IDR is slice-only — prepend cached params.
+			au = append([][]byte{cachedVPS, cachedSPS, cachedPPS}, au...)
+		default:
+			droppedCount++
+			if droppedCount == 1 || droppedCount%50 == 0 {
+				slog.Warn("rtsp reader: dropping H265 IDR — no inline VPS/SPS/PPS and no cached prefix",
+					"url", r.input.URL, "dropped_count", droppedCount)
+			}
+			return
 		}
 
 		data := nalusToAnnexB(au)

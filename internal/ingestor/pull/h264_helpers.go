@@ -87,3 +87,59 @@ func avccAccessUnitToAnnexB(src []byte) []byte {
 	}
 	return out
 }
+
+// findH264SPSPPSInNALUs scans the slice of separated NAL units (no
+// start-codes; the shape gortsplib's RTP decoder produces) and returns
+// the first SPS (NAL type 7) and PPS (NAL type 8) it finds. Empty
+// slices when the access unit lacks them — typical for non-IDR frames
+// and for IDRs whose source emits parameter-sets out-of-band only.
+//
+// Used by RTSP / RTMP boundaries to keep a running cache of the most
+// recent codec config NALUs so IDRs that ship without inline params
+// can still be made decodable downstream (mirrors the RTMP guard's
+// captureVideoSeqHeader / ensureKeyFrameHasParamSets pattern).
+func findH264SPSPPSInNALUs(au [][]byte) (sps, pps []byte) {
+	for _, nalu := range au {
+		if len(nalu) == 0 {
+			continue
+		}
+		switch nalu[0] & 0x1F {
+		case 7:
+			if len(sps) == 0 {
+				sps = nalu
+			}
+		case 8:
+			if len(pps) == 0 {
+				pps = nalu
+			}
+		}
+	}
+	return sps, pps
+}
+
+// findH265VPSSPSPPSInNALUs is the H.265 counterpart of
+// findH264SPSPPSInNALUs — H.265 NAL types 32 / 33 / 34 carry
+// VPS / SPS / PPS respectively (HEVC NAL header layout: type is bits
+// 1..6 of the first header byte).
+func findH265VPSSPSPPSInNALUs(au [][]byte) (vps, sps, pps []byte) {
+	for _, nalu := range au {
+		if len(nalu) == 0 {
+			continue
+		}
+		switch (nalu[0] >> 1) & 0x3F {
+		case 32:
+			if len(vps) == 0 {
+				vps = nalu
+			}
+		case 33:
+			if len(sps) == 0 {
+				sps = nalu
+			}
+		case 34:
+			if len(pps) == 0 {
+				pps = nalu
+			}
+		}
+	}
+	return vps, sps, pps
+}
