@@ -38,12 +38,14 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/ptsrebaser"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 )
 
@@ -95,8 +97,9 @@ type StreamCallbacks struct {
 // against the push Registry, and writes decoded AVPackets into the Buffer
 // Hub. External RTMP play clients are served via the optional PlayFunc.
 type RTMPServer struct {
-	addr     string
-	registry Registry
+	addr       string
+	registry   Registry
+	rebaserCfg ptsrebaser.Config
 
 	mu       sync.Mutex
 	pubs     map[*rtmp.ServerSession]*pubState
@@ -125,6 +128,7 @@ type pubState struct {
 	cb StreamCallbacks
 
 	converter   *pull.RTMPMsgConverter
+	rebaser     *ptsrebaser.Rebaser
 	firstPacket bool
 }
 
@@ -136,12 +140,15 @@ type subState struct {
 
 // NewRTMPServer creates an RTMPServer. `addr` is the TCP bind address
 // (e.g. ":1935"). `registry` resolves push keys to buffer hub targets.
-func NewRTMPServer(addr string, registry Registry) (*RTMPServer, error) {
+// `rebaserCfg` controls AV-path PTS normalisation; pass the zero value
+// (Enabled=false) to leave incoming PTS untouched.
+func NewRTMPServer(addr string, registry Registry, rebaserCfg ptsrebaser.Config) (*RTMPServer, error) {
 	return &RTMPServer{
-		addr:     addr,
-		registry: registry,
-		pubs:     make(map[*rtmp.ServerSession]*pubState),
-		subs:     make(map[*rtmp.ServerSession]*subState),
+		addr:       addr,
+		registry:   registry,
+		rebaserCfg: rebaserCfg,
+		pubs:       make(map[*rtmp.ServerSession]*pubState),
+		subs:       make(map[*rtmp.ServerSession]*subState),
 	}, nil
 }
 
@@ -264,6 +271,7 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 		buf:           buf,
 		cb:            cb,
 		converter:     pull.NewRTMPMsgConverter(),
+		rebaser:       ptsrebaser.New(s.rebaserCfg),
 		firstPacket:   true,
 	}
 	session.SetPubSessionObserver(state)
@@ -386,6 +394,12 @@ func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
 			cl.Discontinuity = true
 			p.firstPacket = false
 		}
+		// Anchor PTS/DTS to local wallclock; no-op when the rebaser is
+		// disabled. Push-mode encoders are normally already wallclock-
+		// aligned, so this is mostly defensive — but it also kicks in
+		// after a reconnect where the encoder's session clock restarts
+		// at zero while ours has not.
+		p.rebaser.Apply(cl, time.Now())
 		if err := p.buf.Write(p.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
 			slog.Debug("rtmp server: buffer write failed",
 				"key", p.key, "err", err)

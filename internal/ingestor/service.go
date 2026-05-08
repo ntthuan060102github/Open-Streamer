@@ -23,6 +23,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/ptsrebaser"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/push"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
@@ -177,6 +178,7 @@ func (s *Service) Run(ctx context.Context) error {
 		rtmpSrv, err := push.NewRTMPServer(
 			rtmpListenAddr(listeners.RTMP),
 			s.registry,
+			s.rebaserConfig(),
 		)
 		if err != nil {
 			return fmt.Errorf("ingestor: create rtmp server: %w", err)
@@ -425,6 +427,7 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 					prevCancel()
 				}
 			},
+			rebaserCfg: s.rebaserConfig(),
 		}
 		s.mu.Unlock()
 		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, cb)
@@ -486,6 +489,19 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 		errObserver(streamID, input.Priority, errNoPusherConnected)
 	}
 	return nil
+}
+
+// rebaserConfig returns the AV-path PTS rebaser settings used by both the
+// pull worker (per readLoop) and the push server (at construction).
+// PTS normalisation is a server-level invariant — operators don't tune it,
+// the server always anchors timestamps to local wallclock so upstream
+// clock skew can never poison the buffer hub. Threshold is a fixed
+// domain default; if it ever needs to change, change the constant.
+func (s *Service) rebaserConfig() ptsrebaser.Config {
+	return ptsrebaser.Config{
+		Enabled:         true,
+		JumpThresholdMs: domain.DefaultPTSJumpThresholdMs,
+	}
 }
 
 // pushStreamKey returns the routing key that encoders must use when connecting.

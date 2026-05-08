@@ -12,6 +12,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/ptsrebaser"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 )
 
@@ -36,6 +37,11 @@ type pullWorkerCallbacks struct {
 	// It is used by startPullWorker to cancel the previous source worker only after
 	// the new source has connected — eliminating the buffer gap during source transitions.
 	onHandoff func()
+
+	// rebaserCfg controls AV-path PTS normalisation. A fresh Rebaser is
+	// constructed per readLoop invocation (i.e. per source connection),
+	// so reconnects naturally re-anchor to the new wallclock.
+	rebaserCfg ptsrebaser.Config
 }
 
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.
@@ -241,6 +247,16 @@ func readLoop(
 			stats.Close()
 		}
 	}()
+	// Per-connection rebaser: a reconnect drops this readLoop and a new
+	// one builds a fresh anchor against the new wallclock — that's the
+	// right invariant for live, since a reconnect implies the source
+	// clock relationship to ours has just changed. cb may be nil in
+	// tests; default to a disabled rebaser then.
+	var rebaserCfg ptsrebaser.Config
+	if cb != nil {
+		rebaserCfg = cb.rebaserCfg
+	}
+	rebaser := ptsrebaser.New(rebaserCfg)
 	for {
 		batch, err := r.ReadPackets(ctx)
 		if err != nil {
@@ -260,6 +276,7 @@ func readLoop(
 				buf:           buf,
 				cb:            cb,
 				stats:         stats,
+				rebaser:       rebaser,
 			}
 			if writeErr := writeOnePacket(wctx, &p, isFirst); writeErr != nil {
 				return writeErr
@@ -304,6 +321,7 @@ type writeContext struct {
 	buf           *buffer.Service
 	cb            *pullWorkerCallbacks
 	stats         *pull.StatsDemuxer
+	rebaser       *ptsrebaser.Rebaser // nil-safe; only acts on AV path
 }
 
 // writeOnePacket forwards one source packet into the buffer, dispatching on
@@ -323,6 +341,10 @@ func writeOnePacket(wctx writeContext, p *domain.AVPacket, isFirst bool) error {
 	if isFirst {
 		cl.Discontinuity = true
 	}
+	// Anchor PTS/DTS to local wallclock so upstream clock drift never
+	// reaches the buffer hub. No-op when the rebaser is disabled or the
+	// clone carries the raw-TS marker codec (Apply skips that).
+	wctx.rebaser.Apply(cl, time.Now())
 	if err := wctx.buf.Write(wctx.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
 		slog.Error("ingestor: buffer write failed",
 			"stream_code", wctx.streamID,

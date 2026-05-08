@@ -58,6 +58,15 @@ const dashVideoTimescale = 90000
 const (
 	dashVideoMediaPattern = `seg_v_$Number%05d$.m4s`
 	dashAudioMediaPattern = `seg_a_$Number%05d$.m4s`
+
+	// dashSourceSwitchJumpMs is the max tolerated inter-frame DTS/PTS
+	// step (ms) before onTSFrame flushes the current segment. Protects
+	// writeVideoSegmentLocked's per-sample `dur = (vDTS[i+1]-vDTS[i])*90`
+	// math from amplifying a single discontinuity into a giant sample
+	// (and a permanent +N seconds bump in videoNextDecode / tfdt).
+	// Symmetric: backward step ⇒ source switch / wrap, forward step ⇒
+	// CDN playlist resync, NVENC stall recovery, transcoder restart.
+	dashSourceSwitchJumpMs = 1000
 )
 
 // dashRunOpts carries per-rendition ABR metadata.  nil = single-rendition mode.
@@ -408,6 +417,19 @@ type pendingInitWrite struct {
 	filename string // e.g. "init_v.mp4"
 }
 
+// timestampJumpFromLast reports whether ts has stepped past
+// dashSourceSwitchJumpMs in either direction relative to the queue tail.
+// Returns false for an empty queue (first frame). Shared by H264 / H265 /
+// AAC paths in onTSFrame so the threshold and direction logic stay in
+// one place.
+func timestampJumpFromLast(queue []uint64, ts uint64) bool {
+	if len(queue) == 0 {
+		return false
+	}
+	delta := int64(ts) - int64(queue[len(queue)-1]) //nolint:gosec // bounded by upstream timebase
+	return delta < -dashSourceSwitchJumpMs || delta > dashSourceSwitchJumpMs
+}
+
 // onTSFrame is the TSDemuxer callback; it runs in the demuxer goroutine.
 // Init segment file writes are deferred to outside the mutex to avoid blocking
 // the flush ticker during expensive I/O.
@@ -426,12 +448,18 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
-		// Detect source switch: timestamps should be monotonically increasing.
-		// A backward jump of more than 1 second means a new source started.
-		// Flush accumulated frames from the old source before mixing in new ones;
-		// this prevents uint64 underflow in duration computation inside
-		// writeVideoSegmentLocked that would produce astronomically large samples.
-		if len(p.vDTS) > 0 && int64(dts)-int64(p.vDTS[len(p.vDTS)-1]) < -1000 {
+		// Detect source-edge or upstream resync: timestamps should advance
+		// roughly at frame cadence. A jump in either direction past
+		// dashSourceSwitchJumpMs indicates one of:
+		//   - backward: source switch / failover, PTS wrap-around — would
+		//     underflow (vDTS[i+1]-vDTS[i]) and produce 2^64-ish sample dur.
+		//   - forward: CDN HLS playlist resync, NVENC stall recovery,
+		//     transcoder restart — would compute one giant sample dur and
+		//     bake a permanent +N s offset into videoNextDecode / tfdt
+		//     (root cause of "DASH live edge runs N seconds ahead of
+		//     wallclock" reports). Flush before appending so the jump
+		//     becomes a segment boundary, not an inter-sample dur.
+		if timestampJumpFromLast(p.vDTS, dts) {
 			_ = p.flushSegmentLocked()
 		}
 		p.recordOriginDTSLocked(dts)
@@ -455,7 +483,8 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
-		if len(p.vDTS) > 0 && int64(dts)-int64(p.vDTS[len(p.vDTS)-1]) < -1000 {
+		// Same forward+backward jump guard as the H264 case — see above.
+		if timestampJumpFromLast(p.vDTS, dts) {
 			_ = p.flushSegmentLocked()
 		}
 		p.recordOriginDTSLocked(dts)
@@ -480,9 +509,14 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
-		// Same backward-jump guard as for video: flush before mixing frames
-		// from two different sources in the audio queue.
-		if len(p.aPTS) > 0 && int64(pts)-int64(p.aPTS[len(p.aPTS)-1]) < -1000 {
+		// Same forward+backward jump guard as for video: flush before
+		// mixing frames from two different sources in the audio queue.
+		// Audio's own dur math is sample-count-locked (1024/frame) so
+		// the per-sample amplification described in the H264 comment
+		// doesn't apply, but a source switch still wants to land on
+		// a clean segment boundary so the player sees one seamless
+		// audio elementary stream per Period.
+		if timestampJumpFromLast(p.aPTS, pts) {
 			_ = p.flushSegmentLocked()
 		}
 		p.recordOriginDTSLocked(dts)

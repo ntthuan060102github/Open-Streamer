@@ -91,6 +91,17 @@ const (
 	// memory per stream when IngestorConfig.HLSMaxSegmentBuffer is zero.
 	DefaultHLSMaxSegmentBuffer = 8
 
+	// DefaultPTSJumpThresholdMs is the AV-path PTS rebaser's jump cap
+	// (ms). When the gap between an output PTS and local wallclock
+	// exceeds this, the rebaser re-anchors and emits a Discontinuity
+	// so downstream HLS / DASH segmenters land the boundary cleanly.
+	// 2 s tolerates frame-cadence jitter and minor encoder drift while
+	// catching the multi-second forward jumps (CDN playlist resync,
+	// transcoder restart) that otherwise bake permanent offsets into
+	// segment timelines. This is a server-level invariant — not exposed
+	// to operators.
+	DefaultPTSJumpThresholdMs int64 = 2000
+
 	// DefaultSRTLatencyMS is the SRT ARQ latency window (milliseconds) when
 	// SRTListenerConfig.LatencyMS is zero. 120ms matches Haivision's
 	// reference for low-latency contribution links.

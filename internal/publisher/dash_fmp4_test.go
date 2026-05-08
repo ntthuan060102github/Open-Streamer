@@ -416,3 +416,68 @@ func TestOnTSFrameBuildsVideoInitFromAVAnnexBKeyframe(t *testing.T) {
 		"once init is built, videoPS is cleared — keeps the bypass loop allocation-free for the rest of the session")
 	require.False(t, p.videoPSGiveUp, "give-up flag must NOT be latched on the success path")
 }
+
+func TestTimestampJumpFromLast(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		queue []uint64
+		ts    uint64
+		want  bool
+	}{
+		{name: "empty queue is never a jump", queue: nil, ts: 1000, want: false},
+		{name: "tiny forward step within frame cadence", queue: []uint64{1000}, ts: 1040, want: false},
+		{name: "tiny backward step within tolerance", queue: []uint64{1000}, ts: 960, want: false},
+		{name: "exact threshold backward is not a jump", queue: []uint64{2000}, ts: 1000, want: false},
+		{name: "exact threshold forward is not a jump", queue: []uint64{1000}, ts: 2000, want: false},
+		{name: "1ms past threshold backward triggers", queue: []uint64{2001}, ts: 1000, want: true},
+		{name: "1ms past threshold forward triggers", queue: []uint64{1000}, ts: 2001, want: true},
+		// Real-world: bac_ninh CDN playlist resync skips ~200s ahead
+		// of last queued DTS — pre-fix this baked +200s into tfdt.
+		{name: "200s forward jump (CDN resync) triggers", queue: []uint64{50_000}, ts: 250_000, want: true},
+		// Real-world: source failover where new source DTS resets
+		// near zero. Pre-fix this also worked, kept as regression test.
+		{name: "source-switch backward jump triggers", queue: []uint64{1_000_000}, ts: 5_000, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := timestampJumpFromLast(tc.queue, tc.ts)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestOnTSFrameForwardJumpFlushesQueue verifies the forward-jump guard
+// added to onTSFrame: a single forward DTS jump >> dashSourceSwitchJumpMs
+// must flush the in-flight segment so the jump becomes a segment boundary
+// instead of one giant per-sample dur (which was baking +N seconds into
+// the SegmentTimeline's tfdt and breaking DASH live edge math).
+func TestOnTSFrameForwardJumpFlushesQueue(t *testing.T) {
+	t.Parallel()
+
+	// Synthetic non-keyframe NALU — onTSFrame doesn't decode the slice,
+	// only inspects NAL types. We're exercising the queue-management path
+	// (vDTS append, pre-append flush), not init-segment generation, so
+	// no SPS/PPS is needed and videoInit can stay nil.
+	nonKey := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x88, 0x80, 0x40, 0x00, 0x00}
+
+	p := &dashFMP4Packager{streamDir: t.TempDir()}
+
+	// Frame 1: anchor.
+	p.onTSFrame(mpeg2.TS_STREAM_H264, nonKey, 1000, 1000)
+	require.Equal(t, []uint64{1000}, p.vDTS, "first frame seeds vDTS")
+
+	// Frame 2: a frame-cadence step (40ms @ 25fps) — must NOT trigger
+	// flush. vDTS grows, no spurious boundary.
+	p.onTSFrame(mpeg2.TS_STREAM_H264, nonKey, 1040, 1040)
+	require.Equal(t, []uint64{1000, 1040}, p.vDTS, "frame-cadence step appends without flush")
+
+	// Frame 3: a 200s forward jump — must trigger flushSegmentLocked
+	// before the new DTS is appended. flushSegmentLocked clears vDTS
+	// (see line 804) regardless of whether segment writing succeeds, so
+	// after the call vDTS holds ONLY the post-jump frame.
+	p.onTSFrame(mpeg2.TS_STREAM_H264, nonKey, 201_040, 201_040)
+	require.Equal(t, []uint64{201_040}, p.vDTS,
+		"forward jump past dashSourceSwitchJumpMs must flush queue, leaving only the jumped frame")
+}
