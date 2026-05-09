@@ -524,6 +524,8 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 | `ingestor.rtsp_timeout_sec` | 10 | — |
 | `ingestor.hls_playlist_timeout_sec` | 15 | — |
 | `ingestor.hls_segment_timeout_sec` | 60 | — |
+| `ptsrebaser.JumpThresholdMs` (server-internal) | 2000 | server-level invariant; not exposed in YAML/API. Drift gap (output PTS vs `max(actualNow, lastOutputDts)`) above which the rebaser hard re-anchors a track and emits Discontinuity |
+| `ptsrebaser.MaxAheadMs` (server-internal) | 0 | **0 = drop semantics disabled.** Setting >0 makes the rebaser drop incoming AV packets whose proposed output PTS sits more than `N` ms ahead of `now − wallOrigin`. Disabled by default because the drop has a stuck-state pathology when sustained drift exceeds the cap (drift never decreases for real-time input → every subsequent packet drops). DASH packager's per-track drift cap (`shouldSkipVideoLocked`/`shouldSkipAudioLocked`) re-anchors at IDR boundary instead of dropping — that's the durable defense |
 | `transcoder.ffmpeg_path` | "ffmpeg" | $PATH lookup |
 | `transcoder.multi_output` | false | — |
 | `transcoder.video.bitrate_k` | 2500 | — |

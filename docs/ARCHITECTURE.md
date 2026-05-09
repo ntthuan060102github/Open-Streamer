@@ -220,7 +220,7 @@ protocol selection via `pull.PacketReader` factory:
 | `file://` | FileReader | stdlib os.File + paced playback |
 | `s3://` | S3Reader | `aws-sdk-go-v2` |
 | `copy://` | CopyReader | in-process buffer subscription |
-| `mixer://video,audio` | MixerReader | in-process video+audio mix; rebases each track's PTS / DTS to a 0-relative origin so unrelated upstream clocks land on a shared axis |
+| `mixer://video,audio` | MixerReader | in-process video+audio mix; each track's PTS is locally normalised to a 0-relative origin (videoPTSBase / audioPTSBase) so unrelated upstream clocks don't poison the per-track delta math. Cross-track sync (V and A landing on the same wallclock axis) is delegated to the PTS anchoring layer below. |
 
 **Push ingest** (RTMP listen `:1935`, SRT listen `:9999`) shares a
 single server per protocol. Incoming connection → registry lookup
@@ -232,6 +232,79 @@ codec normalisation as pulls, no special-casing.
 **Reconnect** is automatic — pull readers retry with their own internal
 strategies (`gortsplib`, `lal`, etc.). The manager's per-input
 `packet_timeout` is the safety net.
+
+### PTS Anchoring Layer (`internal/ingestor/ptsrebaser`)
+
+Sits between every AV-path `PacketReader` and the buffer-hub write. Without
+it, the upstream encoder's clock chooses the timeline that ends up in HLS /
+DASH manifests — and live encoders out in the wild routinely run a fraction
+of a percent off NTP, sudden-jump on CDN HLS playlist resync, or restart with
+a fresh PTS origin. Any of those produce a segment timeline whose media-time
+runs ahead of `publishTime`, which strict DASH players (dashjs / shaka) then
+refuse to play because `(now − AST) − liveDelay` lands before the earliest
+available segment.
+
+The rebaser solves it by anchoring each track to **local wallclock** at first
+packet, then preserving inter-frame deltas as long as they don't drift past
+the configured threshold:
+
+```mermaid
+flowchart LR
+    Reader["PacketReader<br/>(RTSP / RTMP / copy / mixer)"] --> Rebaser
+    Rebaser["ptsrebaser.Apply<br/>(per-track anchor)"] -->|"PTS rewritten<br/>monotonic"| Hub["Buffer Hub"]
+```
+
+State is **per track** (video / audio independently). On the first packet of
+a track:
+
+- `outputAnchor = (now − wallOrigin)` ms — current elapsed wallclock since
+  the FIRST observed packet of any track. Preserves any small intrinsic A/V
+  offset (RTSP audio leading video by ~100 ms, RTMP codec-config pre-roll).
+- `inputOrigin = packet.DTSms` — anchor for delta math going forward.
+- **Cross-track snap**: if the OTHER track has already moved more than
+  `crossTrackSnapMs` (1 s) of output PTS by the time this track seeds —
+  typical for `mixer://` where one source bursts in milliseconds while the
+  other delivers steadily — this track's `outputAnchor` is snapped onto the
+  other track's `lastOutputDts` so V and A start in lockstep.
+
+For every subsequent packet:
+
+```text
+expected = outputAnchor + (packet.DTSms − inputOrigin)
+```
+
+A re-anchor (with `Discontinuity=true`) fires when:
+
+- The proposed output regresses past `lastOutputDts` (input went backward —
+  source restart, PTS wrap, mid-burst monotonic violation), OR
+- Drift `expected − max(actualNow, lastOutputDts)` exceeds
+  `JumpThresholdMs` (2 s): catches forward jumps from CDN playlist resync
+  / NVENC stall recovery / transcoder restart.
+
+The `max(actualNow, lastOutputDts)` floor is load-bearing — bursty delivery
+(RTMP pulls regularly batch a GOP-worth of frames into one ms of wallclock)
+would otherwise manufacture a "drift" inside the burst and trip the
+re-anchor on every other frame. Comparing against the running output
+position absorbs the burst.
+
+Output is always monotonic: re-anchors use `target = max(actualNow,
+lastOutputDts + 1)` so downstream uint64 dur math (DASH packager, MSE
+source buffer) can never underflow.
+
+**Scope**: AV-path codecs only (RTSP / RTMP pull, RTMP push, `copy://`,
+`mixer://`). Raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) carry
+PTS inside PES headers and bypass the rebaser — they ride the dedicated
+raw-TS chunk path through the buffer hub. The DASH packager has its own
+per-track drift cap layered on top to catch the residual from raw-TS — see
+[Publisher / DASH](#publisher-internalpublisher) below.
+
+**Known limitation**: `mixer://` combining two clock-independent sources
+(e.g. live HLS video + file-paced audio) accumulates A/V drift mid-stream
+that the seed-time cross-track snap can't fix. The bursty source's GOP-by-
+GOP delivery keeps producing micro-drift that compounds over time. HLS
+players load slowly (waiting for V/A to align in their buffer) but
+eventually play. Documented as a known limitation; production mixer usage
+should pair clock-coherent sources.
 
 ### Stream Manager (`internal/manager`)
 
@@ -395,6 +468,28 @@ Reads from Buffer Hub subscriber, segments into output formats:
   encoder pre-roll, edit lists, HLS feeds where audio leads video) is
   preserved as-is rather than being collapsed into "both tracks start
   at 0".
+  Two layered safeguards keep the SegmentTimeline anchored to wallclock
+  for raw-TS-path streams (HLS pull, mixer reading transcoded TS) that
+  bypass the AV-path rebaser:
+  1. **Bidirectional inter-frame jump guard** (`timestampJumpFromLast`
+     checking ±`dashSourceSwitchJumpMs`=1 s): on detecting a >1 s step
+     in either direction between consecutive frame timestamps, flush
+     the current segment before appending. Catches CDN playlist
+     resyncs (forward jump bakes a giant per-sample dur into
+     `videoNextDecode`) and source switches (backward jump underflows
+     uint64 dur math).
+  2. **Per-track drift cap** (`shouldSkipVideoLocked` /
+     `shouldSkipAudioLocked`): drops incoming frames when the
+     projected segment timeline would race more than one `segDur`
+     ahead of wallclock-since-AST. Video drops are IDR-aligned (the
+     `videoSkipUntilIDR` latch keeps dropping non-IDR frames until the
+     next keyframe arrives, then re-anchors `videoNextDecode = elapsed`
+     and accepts the IDR — clean segment boundary, no poisoned tfdt).
+     Audio drops freely (sample-count-locked, no IDR concept).
+     Per-sample dur uses signed int64 deltas with explicit `< uint32_max`
+     clamp so a sub-second backward step that slips past guard #1 still
+     falls to the spread-evenly fallback rather than baking a 47.7 s
+     phantom sample.
 - **RTMP / SRT** ([listen.go](../internal/publisher/listen.go)):
   shared listeners; per-client subscribes to the playback buffer.
   RTMP play out
@@ -767,9 +862,12 @@ Circular deps are broken via post-construction setters
 | Stream status reflects all degradation sources | `streamDegradation` reconciliation | UI green badge must mean "actually working" |
 | Sessions tracker survives config edits | `atomic.Pointer[runtimeConfig]` + `UpdateConfig` | Toggling `enabled` / `idle_timeout` must not lose in-flight session state |
 | Watermark assets are coordinator-resolved | `transcoderConfigWithWatermark` clones tc | Persisted Stream.Watermark stays untouched; transcoder never sees AssetID |
-| RTMP/RTSP IDR access units carry SPS/PPS into the buffer hub | `RTMPMsgConverter.ensureKeyFrameHasParamSets` | Downstream HLS/DASH muxers can't initialise their decoder otherwise; un-init-able IDRs are dropped, never emitted |
+| RTMP/RTSP IDR access units carry SPS/PPS into the buffer hub | RTMP: `RTMPMsgConverter.ensureKeyFrameHasParamSets`; RTSP: H264/H265 callbacks in `pull/rtsp.go` cache from SDP + inline-scan + drop fallback | Downstream HLS/DASH muxers can't initialise their decoder otherwise; un-init-able IDRs are dropped, never emitted |
 | RTMP play emits one AAC access unit per audio tag | `RTMPFrameWriter.writeAAC` (bundle-split) | gomedia delivers PES with 4–8 ADTS frames bundled; a single tag would collapse audio sample counts on the receiver by the bundling factor |
 | HLS audio bypasses the post-force-flush discard window | `hlsSegmenter.shouldDropAVPacket` (codec gate) | Long-GOP sources (>4×segDur) trigger `discardUntilIDR`; dropping audio in that 3–4 s gap produces audible stutter |
+| AV-path PTS reaching the buffer hub is wallclock-anchored | `ptsrebaser.Apply` (per-track origins, monotonic output, IDR-aligned re-anchors) | Upstream encoder clock skew / sudden jumps / multi-source mixer arrival skew would otherwise bake permanent offsets into HLS / DASH segment timelines and break live-edge math |
+| DASH segment timeline never advertises media in the future of `publishTime` | `shouldSkipVideoLocked` + `shouldSkipAudioLocked` (drift cap) + `timestampJumpFromLast` (jump guard) | Strict players (dashjs / shaka) compute live edge as `(now − AST) − liveDelay` and refuse to play when no segment exists at that media time |
+| DASH per-sample dur math is uint64-underflow-safe | int64 deltas with explicit `< uint32_max` clamp in `writeVideoSegmentLocked` | A sub-second backward step in `vDTS` underflowed to ~2^64 and cast to uint32 ≈ 47.7 s phantom dur, baking a permanent offset into `videoNextDecode` (test5 incident) |
 
 ---
 

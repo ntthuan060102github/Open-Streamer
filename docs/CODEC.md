@@ -206,6 +206,21 @@ and verifies `payload[:5] == {0x17, 0, 0, 0, 0}` internally; passing
 `msg.Payload[5:]` cuts off the FLV header and the function silently
 fails. `captureVideoSeqHeader` now passes `msg.Payload` unmodified.
 
+The RTSP pull side mirrors the same 3-tier resolution. The H264 and
+H265 callbacks in [`pull/rtsp.go`](../internal/ingestor/pull/rtsp.go)
+maintain a per-stream parameter-set cache seeded from the SDP
+`sprop-parameter-sets` (or `sprop-vps` / `sprop-sps` / `sprop-pps`
+for HEVC) and refreshed on every IDR whose NAL units include inline
+params (scanned via `findH264SPSPPSInNALUs` / `findH265VPSSPSPPSInNALUs`
+in [`pull/h264_helpers.go`](../internal/ingestor/pull/h264_helpers.go)).
+Slice-only IDRs get the cached prefix prepended; IDRs with neither
+inline nor cached params are dropped (with a rate-limited warn log).
+Required because some RTSP servers omit `sprop-parameter-sets` from
+SDP (relying on the encoder to repeat in-band) AND some encoders
+omit in-band SPS/PPS (relying on SDP) — without the dual-source
+cache + drop fallback the empty-intersection case poisoned downstream
+muxers with un-init-able keyframes.
+
 #### Push side (RTMP play out) — slice-only NALU tags + bundle-split AAC
 
 `internal/ingestor/push/rtmp_writer.go` strips SPS/PPS/AUD/SEI NALUs
