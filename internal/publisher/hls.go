@@ -504,7 +504,16 @@ func (p *hlsSegmenter) flushLocked() {
 	p.discNext = false
 
 	writeStart := time.Now()
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	// Atomic write (tmp + rename) — without this, a player that fetches
+	// the segment while we're partway through writing it gets a truncated
+	// file ("Invalid data found when processing input"). The manifest
+	// already references the segment by name as soon as we append to
+	// p.onDisk a few lines below, so the window between "playlist says
+	// the file exists" and "file is fully on disk" is observable. The
+	// DASH packager has used writeFileAtomic for the same reason since
+	// day one — HLS uses os.WriteFile here for legacy reasons that no
+	// longer apply.
+	if err := writeFileAtomic(path, data); err != nil {
 		slog.Warn("publisher: HLS write segment failed",
 			"stream_code", p.streamID, "segment", name, "err", err)
 		return
