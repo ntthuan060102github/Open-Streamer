@@ -1065,6 +1065,40 @@ const docTemplate = `{
                 }
             }
         },
+        "/streams/{code}/thumbnail.jpg": {
+            "get": {
+                "produces": [
+                    "image/jpeg"
+                ],
+                "tags": [
+                    "streams"
+                ],
+                "summary": "Get latest thumbnail",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Stream code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
         "/vod": {
             "get": {
                 "produces": [
@@ -2520,6 +2554,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.updated",
                 "stream.started",
@@ -2548,9 +2584,7 @@ const docTemplate = `{
                 "watermark.asset_deleted",
                 "hook.created",
                 "hook.updated",
-                "hook.deleted",
-                "session.opened",
-                "session.closed"
+                "hook.deleted"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2567,6 +2601,8 @@ const docTemplate = `{
                 "EventStreamUpdated": "PUT /streams/{code} on existing record"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "PUT /streams/{code} on existing record",
                 "",
@@ -2595,11 +2631,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamUpdated",
                 "EventStreamStarted",
@@ -2628,9 +2664,7 @@ const docTemplate = `{
                 "EventWatermarkAssetDeleted",
                 "EventHookCreated",
                 "EventHookUpdated",
-                "EventHookDeleted",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventHookDeleted"
             ]
         },
         "domain.GlobalConfig": {

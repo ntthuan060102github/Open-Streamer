@@ -638,6 +638,8 @@ definitions:
     type: object
   domain.EventType:
     enum:
+    - session.opened
+    - session.closed
     - stream.created
     - stream.updated
     - stream.started
@@ -667,8 +669,6 @@ definitions:
     - hook.created
     - hook.updated
     - hook.deleted
-    - session.opened
-    - session.closed
     type: string
     x-enum-comments:
       EventDVRSegmentPruned: retention loop deleted an aged-out segment
@@ -685,6 +685,8 @@ definitions:
       EventPushStarted: dialing target, pre-handshake
       EventStreamUpdated: PUT /streams/{code} on existing record
     x-enum-descriptions:
+    - ""
+    - ""
     - ""
     - PUT /streams/{code} on existing record
     - ""
@@ -714,9 +716,9 @@ definitions:
     - ""
     - ""
     - ""
-    - ""
-    - ""
     x-enum-varnames:
+    - EventSessionOpened
+    - EventSessionClosed
     - EventStreamCreated
     - EventStreamUpdated
     - EventStreamStarted
@@ -746,8 +748,6 @@ definitions:
     - EventHookCreated
     - EventHookUpdated
     - EventHookDeleted
-    - EventSessionOpened
-    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -2777,6 +2777,28 @@ paths:
       summary: List sessions for a stream
       tags:
       - sessions
+  /streams/{code}/thumbnail.jpg:
+    get:
+      parameters:
+      - description: Stream code
+        in: path
+        name: code
+        required: true
+        type: string
+      produces:
+      - image/jpeg
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Get latest thumbnail
+      tags:
+      - streams
   /vod:
     get:
       produces:

@@ -19,6 +19,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
+	"github.com/ntt0601zcoder/open-streamer/internal/thumbnail"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/internal/watermarks"
 	"github.com/samber/do/v2"
@@ -31,6 +32,7 @@ type Coordinator struct {
 	tc         tcDep
 	pub        pubDep
 	dvr        dvrDep
+	thumb      thumbDep // optional — nil = thumbnails disabled
 	bus        events.Bus
 	m          *metrics.Metrics
 	streamRepo store.StreamRepository
@@ -107,6 +109,13 @@ func New(i do.Injector) (*Coordinator, error) {
 	// (only direct ImagePath watermarks resolve). Tolerate "no provider".
 	if w, err := do.Invoke[*watermarks.Service](i); err == nil {
 		c.wmAssets = w
+	}
+	// Thumbnail service is optional — if not registered, streams with
+	// Thumbnail.Enabled=true silently skip thumbnail generation. The
+	// coordinator never errors on missing thumbnail provider so smaller
+	// embedded deployments can drop the dep.
+	if t, err := do.Invoke[*thumbnail.Service](i); err == nil {
+		c.thumb = t
 	}
 	c.mgr.SetExhaustedCallback(c.handleAllInputsExhausted)
 	c.mgr.SetRestoredCallback(c.handleInputRestored)
@@ -303,6 +312,13 @@ func (c *Coordinator) Start(ctx context.Context, stream *domain.Stream) error {
 		}
 	}
 
+	if c.thumb != nil && stream.Thumbnail != nil && stream.Thumbnail.Enabled {
+		thumbBuf := buffer.PlaybackBufferID(stream.Code, stream.Transcoder)
+		if err := c.thumb.Start(ctx, stream.Code, thumbBuf, stream.Thumbnail); err != nil {
+			slog.Warn("coordinator: thumbnail start failed", "stream_code", stream.Code, "err", err)
+		}
+	}
+
 	if c.m != nil {
 		c.m.StreamStartTimeSeconds.WithLabelValues(string(stream.Code)).Set(float64(time.Now().Unix()))
 	}
@@ -401,6 +417,9 @@ func (c *Coordinator) Stop(ctx context.Context, streamID domain.StreamCode) {
 		if err := c.dvr.StopRecording(ctx, streamID); err != nil {
 			slog.Warn("coordinator: dvr stop failed", "stream_code", streamID, "err", err)
 		}
+	}
+	if c.thumb != nil {
+		c.thumb.Stop(streamID)
 	}
 	c.pub.Stop(streamID)
 	c.tc.Stop(streamID)
@@ -518,6 +537,12 @@ func (c *Coordinator) Update(ctx context.Context, old, new *domain.Stream) error
 		c.reloadDVRIfBufferChanged(ctx, old, new)
 	}
 
+	// Thumbnail is restarted on every Update — small operator surface,
+	// cheap to rerun, and the diff engine doesn't yet track Thumbnail
+	// changes explicitly. The reload is no-op when both old and new
+	// have it disabled.
+	c.reloadThumbnail(ctx, new)
+
 	return nil
 }
 
@@ -593,6 +618,7 @@ func (c *Coordinator) reloadTranscoderFull(ctx context.Context, old, new *domain
 	}
 
 	c.reloadDVR(ctx, new)
+	c.reloadThumbnail(ctx, new)
 	return nil
 }
 
@@ -697,6 +723,23 @@ func (c *Coordinator) reloadDVR(ctx context.Context, new *domain.Stream) {
 		mediaBuf := buffer.PlaybackBufferID(new.Code, new.Transcoder)
 		if _, err := c.dvr.StartRecording(ctx, new.Code, mediaBuf, new.DVR); err != nil {
 			slog.Warn("coordinator: dvr start failed", "stream_code", new.Code, "err", err)
+		}
+	}
+}
+
+// reloadThumbnail stops any active thumbnail worker and starts a new
+// one when ThumbnailConfig.Enabled is true. Mirror of reloadDVR.
+// Caller orchestrates ordering relative to other Update steps so the
+// new worker subscribes to the post-update PlaybackBufferID.
+func (c *Coordinator) reloadThumbnail(ctx context.Context, new *domain.Stream) {
+	if c.thumb == nil {
+		return
+	}
+	c.thumb.Stop(new.Code)
+	if new.Thumbnail != nil && new.Thumbnail.Enabled {
+		thumbBuf := buffer.PlaybackBufferID(new.Code, new.Transcoder)
+		if err := c.thumb.Start(ctx, new.Code, thumbBuf, new.Thumbnail); err != nil {
+			slog.Warn("coordinator: thumbnail start failed", "stream_code", new.Code, "err", err)
 		}
 	}
 }
