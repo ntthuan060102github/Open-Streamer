@@ -216,6 +216,12 @@ type dashFMP4Packager struct {
 	// lands before any available segment.
 	videoSkipUntilIDR bool
 
+	// Drift-cap fire counters — diagnostic only. Throttle the warn log
+	// to first event + every 50th so a sustained pathology shows up
+	// without drowning steady-state logs.
+	videoDriftSkipCount int64
+	audioDriftSkipCount int64
+
 	// Sliding-window state for MPD generation.
 	onDiskV    []string // filenames of written video segments
 	onDiskA    []string // filenames of written audio segments
@@ -498,6 +504,23 @@ func (p *dashFMP4Packager) shouldSkipVideoLocked(frame []byte, dts uint64) bool 
 	p.vAnnex = p.vAnnex[:0]
 	p.vDTS = p.vDTS[:0]
 	p.vPTS = p.vPTS[:0]
+	p.videoDriftSkipCount++
+	if p.videoDriftSkipCount == 1 || p.videoDriftSkipCount%50 == 0 {
+		driftMs := int64(0)
+		if dashVideoTimescale > 0 {
+			driftMs = (int64(projectedEnd) - int64(elapsedTicks)) * 1000 / dashVideoTimescale
+		}
+		slog.Warn("diag: DASH video drift-cap fired",
+			"stream_code", p.streamID,
+			"count", p.videoDriftSkipCount,
+			"projected_end_ticks", projectedEnd,
+			"elapsed_ticks", elapsedTicks,
+			"drift_ms", driftMs,
+			"video_next_decode_ticks", p.videoNextDecode,
+			"is_idr", isIDR,
+			"seg_sec", p.segSec,
+		)
+	}
 	if isIDR {
 		// Re-anchor videoNextDecode to wallclock so emitted tfdt no
 		// longer advertises future content.
@@ -551,6 +574,22 @@ func (p *dashFMP4Packager) shouldSkipAudioLocked(pts uint64) bool {
 	// a fresh segment boundary aligned with current wallclock.
 	p.aRaw = p.aRaw[:0]
 	p.aPTS = p.aPTS[:0]
+	p.audioDriftSkipCount++
+	if p.audioDriftSkipCount == 1 || p.audioDriftSkipCount%50 == 0 {
+		driftMs := int64(0)
+		if p.audioSR > 0 {
+			driftMs = (int64(projectedEnd) - int64(elapsedTicks)) * 1000 / int64(p.audioSR) //nolint:gosec
+		}
+		slog.Warn("diag: DASH audio drift-cap fired",
+			"stream_code", p.streamID,
+			"count", p.audioDriftSkipCount,
+			"projected_end_ticks", projectedEnd,
+			"elapsed_ticks", elapsedTicks,
+			"drift_ms", driftMs,
+			"audio_next_decode_ticks", p.audioNextDecode,
+			"audio_sr", p.audioSR,
+		)
+	}
 	if elapsedTicks > p.audioNextDecode {
 		p.audioNextDecode = elapsedTicks
 	}
@@ -882,6 +921,10 @@ func (p *dashFMP4Packager) recordOriginDTSLocked(dts uint64) {
 	if !p.originDTSmsSet {
 		p.originDTSms = dts
 		p.originDTSmsSet = true
+		slog.Info("diag: DASH origin set",
+			"stream_code", p.streamID,
+			"origin_dts_ms", dts,
+		)
 	}
 }
 
@@ -900,6 +943,14 @@ func (p *dashFMP4Packager) seedVideoNextDecodeLocked() {
 	}
 	p.videoNextDecode = scaleOffset(p.vDTS[0], p.originDTSms, dashVideoTimescale)
 	p.videoFirstDTSmsSet = true
+	slog.Info("diag: DASH video seeded",
+		"stream_code", p.streamID,
+		"first_v_dts_ms", p.vDTS[0],
+		"origin_dts_ms", p.originDTSms,
+		"video_next_decode_ticks", p.videoNextDecode,
+		"video_tfdt_s", float64(p.videoNextDecode)/float64(dashVideoTimescale),
+		"v_queue_len", len(p.vDTS),
+	)
 }
 
 // seedAudioNextDecodeLocked is the audio counterpart of
@@ -912,6 +963,15 @@ func (p *dashFMP4Packager) seedAudioNextDecodeLocked(firstFrameDTSms uint64) {
 	}
 	p.audioNextDecode = scaleOffset(firstFrameDTSms, p.originDTSms, uint64(p.audioSR))
 	p.audioFirstDTSmsSet = true
+	slog.Info("diag: DASH audio seeded",
+		"stream_code", p.streamID,
+		"first_a_dts_ms", firstFrameDTSms,
+		"origin_dts_ms", p.originDTSms,
+		"audio_sr", p.audioSR,
+		"audio_next_decode_ticks", p.audioNextDecode,
+		"audio_tfdt_s", float64(p.audioNextDecode)/float64(p.audioSR),
+		"a_queue_len", len(p.aPTS),
+	)
 }
 
 // scaleOffset returns (firstDTSms - originDTSms) converted into `timescale`
@@ -1113,6 +1173,19 @@ func (p *dashFMP4Packager) writeVideoSegmentLocked() error {
 	p.vSegDurs = append(p.vSegDurs, segDur)
 	p.vSegStarts = append(p.vSegStarts, segStart)
 	p.videoNextDecode += segDur
+	if p.vSegN%100 == 0 && !p.availabilityStart.IsZero() {
+		elapsedTicks := uint64(time.Since(p.availabilityStart).Seconds() * dashVideoTimescale)
+		slog.Info("diag: DASH video segment counter",
+			"stream_code", p.streamID,
+			"v_seg_n", p.vSegN,
+			"video_next_decode_ticks", p.videoNextDecode,
+			"video_tfdt_s", float64(p.videoNextDecode)/float64(dashVideoTimescale),
+			"elapsed_ticks", elapsedTicks,
+			"elapsed_s", time.Since(p.availabilityStart).Seconds(),
+			"drift_ms", (int64(p.videoNextDecode)-int64(elapsedTicks))*1000/dashVideoTimescale,
+			"v_drift_skip_count", p.videoDriftSkipCount,
+		)
+	}
 	return nil
 }
 
@@ -1177,6 +1250,19 @@ func (p *dashFMP4Packager) writeAudioSegmentLocked() error {
 	p.aSegDurs = append(p.aSegDurs, segDur)
 	p.aSegStarts = append(p.aSegStarts, segStart)
 	p.audioNextDecode += segDur
+	if p.aSegN%100 == 0 && p.audioSR > 0 && !p.availabilityStart.IsZero() {
+		elapsedTicks := uint64(time.Since(p.availabilityStart).Seconds() * float64(p.audioSR))
+		slog.Info("diag: DASH audio segment counter",
+			"stream_code", p.streamID,
+			"a_seg_n", p.aSegN,
+			"audio_next_decode_ticks", p.audioNextDecode,
+			"audio_tfdt_s", float64(p.audioNextDecode)/float64(p.audioSR),
+			"elapsed_ticks", elapsedTicks,
+			"elapsed_s", time.Since(p.availabilityStart).Seconds(),
+			"drift_ms", (int64(p.audioNextDecode)-int64(elapsedTicks))*1000/int64(p.audioSR), //nolint:gosec
+			"a_drift_skip_count", p.audioDriftSkipCount,
+		)
+	}
 	return nil
 }
 
