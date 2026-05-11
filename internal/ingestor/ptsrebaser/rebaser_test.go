@@ -189,40 +189,6 @@ func TestApply_HardResetWhenForwardJumpExceedsThreshold(t *testing.T) {
 	}
 }
 
-// Verifies that re-anchors classify into "drift" vs "regression" counts
-// on the trackState — the per-reason counters are the throttle key for
-// the slog.Warn that drives test3-style live diagnosis.
-func TestApply_ReanchorCountersClassifyDriftVsRegression(t *testing.T) {
-	r := New(Config{Enabled: true, JumpThresholdMs: 500, StreamCode: "diag_stream"})
-	start := time.Unix(1_700_000_000, 0)
-
-	// Seed video.
-	p1 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1000, DTSms: 1000}
-	r.Apply(p1, start)
-
-	// Forward jump > threshold → "drift" reason.
-	p2 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 10000, DTSms: 10000}
-	r.Apply(p2, start.Add(50*time.Millisecond))
-	if got := r.tracks[trackVideo].reanchorsDrift; got != 1 {
-		t.Fatalf("forward jump should bump reanchorsDrift to 1; got %d", got)
-	}
-	if got := r.tracks[trackVideo].reanchorsRegression; got != 0 {
-		t.Fatalf("forward jump must not bump regression counter; got %d", got)
-	}
-
-	// Inject a regression — input DTS goes backward past lastOutputDts.
-	// p2 just re-anchored; lastOutputDts ≈ 50 ms (wallclock floor). Send a
-	// packet whose expectedDts would fall below that.
-	p3 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 0, DTSms: 0}
-	r.Apply(p3, start.Add(60*time.Millisecond))
-	if got := r.tracks[trackVideo].reanchorsRegression; got != 1 {
-		t.Fatalf("backward jump should bump reanchorsRegression to 1; got %d", got)
-	}
-	if got := r.tracks[trackVideo].reanchorsDrift; got != 1 {
-		t.Fatalf("regression must not double-count as drift; got %d", got)
-	}
-}
-
 func TestApply_BurstyDeliveryDoesNotPingPongReset(t *testing.T) {
 	// RTMP / SRT pulls often deliver a batch of frames within a few
 	// wallclock ms, each spaced ~frame-cadence in DTS. A drift check

@@ -256,7 +256,6 @@ func readLoop(
 	if cb != nil {
 		rebaserCfg = cb.rebaserCfg
 	}
-	rebaserCfg.StreamCode = streamID
 	rebaser := ptsrebaser.New(rebaserCfg)
 	for {
 		batch, err := r.ReadPackets(ctx)

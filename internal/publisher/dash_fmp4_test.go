@@ -152,55 +152,6 @@ func TestSeedersPreserveAudioVideoOffset(t *testing.T) {
 		"video starts 100ms past origin → 9000 ticks at 90 kHz")
 }
 
-// capSeedSkew is the safety valve that keeps pathological upstream skew
-// from baking a 30+ second A/V gap into tfdt. Pre-roll within
-// ±dashSeedPreserveSkewMs survives; anything beyond collapses to origin
-// so the late track lands at the same tfdt as the first one.
-func TestCapSeedSkew(t *testing.T) {
-	t.Parallel()
-
-	// Inside the window: preserved verbatim.
-	require.Equal(t, uint64(1000), capSeedSkew(1000, 1000), "exactly at origin")
-	require.Equal(t, uint64(1100), capSeedSkew(1100, 1000), "+100ms preserved")
-	require.Equal(t, uint64(900), capSeedSkew(900, 1000), "-100ms preserved")
-
-	// Boundary: exactly +/-cap is still preserved.
-	require.Equal(t, uint64(1000+dashSeedPreserveSkewMs),
-		capSeedSkew(1000+dashSeedPreserveSkewMs, 1000),
-		"+cap is the last value preserved")
-
-	// Outside the window: collapse to origin.
-	require.Equal(t, uint64(1000), capSeedSkew(1000+dashSeedPreserveSkewMs+1, 1000),
-		"+(cap+1)ms → collapse to origin")
-	require.Equal(t, uint64(5000), capSeedSkew(36000, 5000),
-		"upstream HLS with audio trailing video by 31s → collapse")
-	require.Equal(t, uint64(5000), capSeedSkew(0, 5000),
-		"-5000ms (audio leads by 5s, well past cap) → collapse, no underflow")
-}
-
-// End-to-end: a 31s upstream skew (the live.mediatech.vn pathology that
-// took out bac_ninh + every republisher of it) must collapse so V and A
-// share a single tfdt baseline instead of being baked 31s apart.
-func TestSeedersCollapsePathologicalSkew(t *testing.T) {
-	t.Parallel()
-	p := &dashFMP4Packager{}
-
-	// Video arrives first at DTS=5000 → sets origin.
-	p.recordOriginDTSLocked(5000)
-	p.videoInit = mp4.CreateEmptyInit()
-	p.vDTS = []uint64{5000}
-	p.seedVideoNextDecodeLocked()
-	require.Equal(t, uint64(0), p.videoNextDecode,
-		"video at origin → tfdt 0")
-
-	// Audio arrives 31s behind video PTS — upstream pathology.
-	p.audioInit = mp4.CreateEmptyInit()
-	p.audioSR = 48000
-	p.seedAudioNextDecodeLocked(36000)
-	require.Equal(t, uint64(0), p.audioNextDecode,
-		"31s skew exceeds cap → audio collapses to origin, tfdt 0")
-}
-
 // ─── tsBuffer leak guards ────────────────────────────────────────────────────
 //
 // Three production-observed leaks in the DASH packager paths:
