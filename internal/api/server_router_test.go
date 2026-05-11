@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -224,13 +223,20 @@ func TestHTTPDurationMiddleware_BypassesScraperPaths(t *testing.T) {
 
 // ─── slogAccessLogger ────────────────────────────────────────────────────────
 
+// NOTE: the two slog-access-logger tests below mutate the package-global
+// slog.Default(); any t.Parallel() sibling that exercises the router
+// (TestBuildRouter_Readyz / SwaggerIndex / StartWithConfig…) would then
+// fire the chi middleware chain into THIS test's strings.Builder,
+// triggering a race (CI-reproduced: -shuffle=1778518171305235108).
+// Run them serially — they each complete in <1 ms and the parallelism
+// gain wasn't load-bearing.
+
 func TestSlogAccessLogger_EmitsAtInfoLevel(t *testing.T) {
-	t.Parallel()
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	buf := &strings.Builder{}
-	slog.SetDefault(slog.New(slog.NewTextHandler(syncWriter(buf), &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	wrapped := slogAccessLogger(next)
@@ -244,12 +250,11 @@ func TestSlogAccessLogger_EmitsAtInfoLevel(t *testing.T) {
 }
 
 func TestSlogAccessLogger_SuppressedWhenBelowLevel(t *testing.T) {
-	t.Parallel()
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	buf := &strings.Builder{}
-	slog.SetDefault(slog.New(slog.NewTextHandler(syncWriter(buf), &slog.HandlerOptions{Level: slog.LevelError})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	called := false
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -263,11 +268,6 @@ func TestSlogAccessLogger_SuppressedWhenBelowLevel(t *testing.T) {
 	assert.True(t, called, "next must still run when logger is silenced")
 	assert.Empty(t, buf.String(), "no log lines should be emitted at ERROR level")
 }
-
-// syncWriter is a tiny adapter so strings.Builder satisfies io.Writer's
-// nominal interface (it already does — but we wrap it for parity with
-// other Write callers and to make intent explicit).
-func syncWriter(w io.Writer) io.Writer { return w }
 
 // reserveEphemeralAddr binds to ":0" to grab a free port, then closes
 // the listener and returns the address. Lint enforces context-aware
