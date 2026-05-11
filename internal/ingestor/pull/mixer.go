@@ -79,21 +79,14 @@ type MixerReader struct {
 	videoEOF  atomic.Bool
 	audioEOF  atomic.Bool
 
-	// PTS normalisation — each upstream sets its own PTS origin (HLS pull
-	// inherits whatever the source TS file used; mp4 file starts at 0; RTSP
-	// uses the camera clock; etc.). Without rebasing, the combined stream
-	// presents video and audio on incompatible timelines, which the
-	// downstream FFmpeg muxer surfaces as "Packets poorly interleaved,
-	// failed to avoid negative timestamp -7080 in stream 0" and the HLS
-	// segmenter emits segments where declared EXTINF (wallclock-derived)
-	// disagrees with content duration (PTS-derived) by many seconds.
-	// Subtracting the first observed DTS from each source rebases both
-	// onto a shared zero-rooted axis so the muxer can interleave correctly.
-	// State mutation is single-threaded — only ReadPackets writes.
-	videoPTSBase    uint64
-	videoPTSBaseSet bool
-	audioPTSBase    uint64
-	audioPTSBaseSet bool
+	// PTS normalisation is delegated to the ingestor's per-worker Normaliser
+	// (internal/timeline), which sees this reader's output and wallclock-
+	// anchors each track independently. The previous in-reader normaliser
+	// (per-track videoPTSBase / audioPTSBase, re-anchored on Discontinuity)
+	// was redundant once Phase 2 collapsed all timeline anchoring into a
+	// single owner — see docs/REFACTOR_PROPOSAL.md §4.5. Mixer-specific V/A
+	// pairing (snap onto the burst track when one upstream drains first) is
+	// also handled by the Normaliser's cross-track snap.
 
 	closed atomic.Bool
 }
@@ -279,7 +272,7 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if pkt.AV == nil || !pkt.AV.Codec.IsVideo() {
 			return nil, nil
 		}
-		return []domain.AVPacket{r.normalizeVideoPTS(*pkt.AV)}, nil
+		return []domain.AVPacket{*pkt.AV}, nil
 
 	case avp, ok := <-videoABRCh:
 		if !ok {
@@ -288,7 +281,7 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if !avp.Codec.IsVideo() {
 			return nil, nil
 		}
-		return []domain.AVPacket{r.normalizeVideoPTS(avp)}, nil
+		return []domain.AVPacket{avp}, nil
 
 	case pkt, ok := <-audioSubCh:
 		if !ok {
@@ -297,7 +290,7 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if pkt.AV == nil || !pkt.AV.Codec.IsAudio() {
 			return nil, nil
 		}
-		return []domain.AVPacket{r.normalizeAudioPTS(*pkt.AV)}, nil
+		return []domain.AVPacket{*pkt.AV}, nil
 
 	case avp, ok := <-audioABRCh:
 		if !ok {
@@ -306,51 +299,8 @@ func (r *MixerReader) ReadPackets(ctx context.Context) ([]domain.AVPacket, error
 		if !avp.Codec.IsAudio() {
 			return nil, nil
 		}
-		return []domain.AVPacket{r.normalizeAudioPTS(avp)}, nil
+		return []domain.AVPacket{avp}, nil
 	}
-}
-
-// normalizeVideoPTS rebases av's PTS / DTS so the video track starts at 0,
-// using the first observed DTS as the origin. Re-anchors on Discontinuity
-// so source resets (HLS loop-around, RTSP reconnect with a fresh clock)
-// never carry stale offsets forward. Returns av by value so callers do not
-// mutate buffer-hub-owned packets.
-//
-// See the (videoPTSBase, audioPTSBase) field comment for why this exists.
-func (r *MixerReader) normalizeVideoPTS(av domain.AVPacket) domain.AVPacket {
-	if !r.videoPTSBaseSet || av.Discontinuity {
-		r.videoPTSBase = av.DTSms
-		r.videoPTSBaseSet = true
-	}
-	av.PTSms = subOrZero(av.PTSms, r.videoPTSBase)
-	av.DTSms = subOrZero(av.DTSms, r.videoPTSBase)
-	return av
-}
-
-// normalizeAudioPTS is the audio counterpart of normalizeVideoPTS, kept as
-// a separate method so the two timelines can re-anchor independently —
-// audio Discontinuity (e.g. failover to a backup audio source) does not
-// invalidate the video anchor and vice versa.
-func (r *MixerReader) normalizeAudioPTS(av domain.AVPacket) domain.AVPacket {
-	if !r.audioPTSBaseSet || av.Discontinuity {
-		r.audioPTSBase = av.DTSms
-		r.audioPTSBaseSet = true
-	}
-	av.PTSms = subOrZero(av.PTSms, r.audioPTSBase)
-	av.DTSms = subOrZero(av.DTSms, r.audioPTSBase)
-	return av
-}
-
-// subOrZero returns a-b for unsigned ms timestamps, clamping to 0 instead
-// of underflowing when b > a. Underflow is unlikely in practice (DTS is
-// monotonic from the demuxer) but does happen on B-frame reorder where
-// PTS dips below the most recent DTS — in that case the "correct" answer
-// is "presentation time at the anchor", which is 0.
-func subOrZero(a, b uint64) uint64 {
-	if a < b {
-		return 0
-	}
-	return a - b
 }
 
 // videoOpen reports whether either video mode has been initialised.

@@ -45,8 +45,8 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
-	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/ptsrebaser"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
+	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
 
 // PlayFunc is invoked when an external play client connects to the RTMP
@@ -97,9 +97,9 @@ type StreamCallbacks struct {
 // against the push Registry, and writes decoded AVPackets into the Buffer
 // Hub. External RTMP play clients are served via the optional PlayFunc.
 type RTMPServer struct {
-	addr       string
-	registry   Registry
-	rebaserCfg ptsrebaser.Config
+	addr          string
+	registry      Registry
+	normaliserCfg timeline.Config
 
 	mu       sync.Mutex
 	pubs     map[*rtmp.ServerSession]*pubState
@@ -117,8 +117,10 @@ type RTMPServer struct {
 }
 
 // pubState is the per-publish-session bookkeeping: codec converter +
-// buffer hub target + Discontinuity flag for the first frame after a
-// reconnect.
+// buffer hub target + per-session Normaliser. A new pubState is built on
+// every fresh publisher connection (see OnNewRtmpPubSession), so the
+// Normaliser is naturally scoped to one session — OnSession is called
+// from there to align it with the SetSession on the buffer hub.
 type pubState struct {
 	key           string
 	bufferWriteID domain.StreamCode
@@ -127,9 +129,8 @@ type pubState struct {
 
 	cb StreamCallbacks
 
-	converter   *pull.RTMPMsgConverter
-	rebaser     *ptsrebaser.Rebaser
-	firstPacket bool
+	converter  *pull.RTMPMsgConverter
+	normaliser *timeline.Normaliser
 }
 
 // subState is the per-play-session bookkeeping: cancel func to stop the
@@ -140,15 +141,15 @@ type subState struct {
 
 // NewRTMPServer creates an RTMPServer. `addr` is the TCP bind address
 // (e.g. ":1935"). `registry` resolves push keys to buffer hub targets.
-// `rebaserCfg` controls AV-path PTS normalisation; pass the zero value
+// `normaliserCfg` controls AV-path PTS anchoring; pass the zero value
 // (Enabled=false) to leave incoming PTS untouched.
-func NewRTMPServer(addr string, registry Registry, rebaserCfg ptsrebaser.Config) (*RTMPServer, error) {
+func NewRTMPServer(addr string, registry Registry, normaliserCfg timeline.Config) (*RTMPServer, error) {
 	return &RTMPServer{
-		addr:       addr,
-		registry:   registry,
-		rebaserCfg: rebaserCfg,
-		pubs:       make(map[*rtmp.ServerSession]*pubState),
-		subs:       make(map[*rtmp.ServerSession]*subState),
+		addr:          addr,
+		registry:      registry,
+		normaliserCfg: normaliserCfg,
+		pubs:          make(map[*rtmp.ServerSession]*pubState),
+		subs:          make(map[*rtmp.ServerSession]*subState),
 	}, nil
 }
 
@@ -271,16 +272,15 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 		buf:           buf,
 		cb:            cb,
 		converter:     pull.NewRTMPMsgConverter(),
-		rebaser:       ptsrebaser.New(s.rebaserCfg),
-		firstPacket:   true,
+		normaliser:    timeline.New(s.normaliserCfg),
 	}
-	// Mint a new StreamSession on the target buffer. A pusher reconnecting
-	// is functionally equivalent to a pull reader's Reconnect — fresh PTS
-	// origin, fresh codec config — so we use that reason regardless of
-	// whether this is the very first publisher or a subsequent one. Phase 1
-	// consumers ignore the field; the future Timeline Normaliser will key
-	// off the SessionID to reset its per-track baselines.
-	_ = buf.SetSession(bufWriteID, domain.SessionStartReconnect, nil, nil)
+	// Mint a new StreamSession on the target buffer AND reset the
+	// Normaliser's per-track anchor state in lockstep. A pusher
+	// connecting is functionally equivalent to a pull reader's Reconnect
+	// — fresh PTS origin, fresh codec config — so we use that reason
+	// regardless of whether this is the very first publisher.
+	sess := buf.SetSession(bufWriteID, domain.SessionStartReconnect, nil, nil)
+	state.normaliser.OnSession(sess)
 	session.SetPubSessionObserver(state)
 
 	s.mu.Lock()
@@ -385,9 +385,11 @@ func (s *RTMPServer) OnDelRtmpSubSession(session *rtmp.ServerSession) {
 // stream as Exhausted forever — there is no loopback worker to surface
 // packets in Path B).
 //
-// The first AV packet after acquisition is marked Discontinuity=true so
-// downstream consumers (HLS / DASH segmenters) flush their accumulated
-// buffer and start fresh. Mirrors the pull-worker firstPacket logic.
+// The session-boundary cue (first packet after a fresh publish session)
+// is conveyed via the buffer hub's SessionStart=true marker on the next
+// Write — already latched by SetSession in OnNewRtmpPubSession. No
+// per-packet Discontinuity flag is set here; consumers read the session
+// boundary explicitly.
 func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
 	if p.cb.OnPacket != nil {
 		p.cb.OnPacket()
@@ -397,16 +399,11 @@ func (p *pubState) OnReadRtmpAvMsg(msg base.RtmpMsg) {
 	}
 	for _, av := range p.converter.Convert(msg) {
 		cl := av.Clone()
-		if p.firstPacket {
-			cl.Discontinuity = true
-			p.firstPacket = false
-		}
-		// Anchor PTS/DTS to local wallclock; no-op when the rebaser is
-		// disabled. Push-mode encoders are normally already wallclock-
-		// aligned, so the drift cap rarely fires here — but skip the
-		// buffer write when the rebaser drops a packet (sustained burst,
-		// see ptsrebaser.Apply).
-		if !p.rebaser.Apply(cl, time.Now()) {
+		// Anchor PTS/DTS via the Normaliser. Push-mode encoders are
+		// normally already wallclock-aligned, so the drift cap rarely
+		// fires — but skip the buffer write when the Normaliser drops a
+		// packet (sustained input ahead of wallclock past MaxAheadMs).
+		if !p.normaliser.Apply(cl, time.Now()) {
 			continue
 		}
 		if err := p.buf.Write(p.bufferWriteID, buffer.Packet{AV: cl}); err != nil {

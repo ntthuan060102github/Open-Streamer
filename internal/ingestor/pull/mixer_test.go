@@ -328,9 +328,14 @@ func readOne(t *testing.T, r *MixerReader, bs *buffer.Service, srcCode string, p
 	return got[0]
 }
 
-// First video packet anchors the video timeline at its DTS — it must be
-// rebased to PTS=DTS=0 (relative to itself).
-func TestMixerReader_VideoPTSAnchorsAtFirstPacket(t *testing.T) {
+// MixerReader.ReadPackets passes upstream PTS/DTS through unchanged.
+// Timeline anchoring (per-track wallclock anchor, V/A snap, monotonic
+// floor, drift cap) is the responsibility of the ingestor's per-worker
+// Normaliser, which sees this reader's output and applies anchoring once
+// at the buffer-write step. The Normaliser's contract is tested in
+// internal/timeline — duplicating those cases here would couple this
+// reader's tests to internal Normaliser semantics for no added coverage.
+func TestMixerReader_PassesPTSThrough(t *testing.T) {
 	t.Parallel()
 	bs := buffer.NewServiceForTesting(8)
 	bs.Create("cam")
@@ -343,115 +348,11 @@ func TestMixerReader_VideoPTSAnchorsAtFirstPacket(t *testing.T) {
 	require.NoError(t, r.Open(context.Background()))
 	defer r.Close()
 
-	// Source PTS=10000, DTS=10000 — anchor here. Output must be 0/0.
 	got := readOne(t, r, bs, "cam", videoPktTS(0xAA, 10000, 10000, false))
-	require.Equal(t, uint64(0), got.PTSms)
-	require.Equal(t, uint64(0), got.DTSms)
+	require.Equal(t, uint64(10000), got.PTSms, "ReadPackets must not rewrite PTS")
+	require.Equal(t, uint64(10000), got.DTSms, "ReadPackets must not rewrite DTS")
 
-	// Second packet 40ms later — must be 40/40, not 10040/10040.
-	got = readOne(t, r, bs, "cam", videoPktTS(0xAB, 10040, 10040, false))
-	require.Equal(t, uint64(40), got.PTSms)
-	require.Equal(t, uint64(40), got.DTSms)
-}
-
-// Audio normalisation is independent of video — they MUST use separate
-// anchors so a video Discontinuity does not silently re-base audio (and
-// vice versa). This is the core of the test_mixer bug: file mp4 audio
-// starts at PTS=0 while HLS pull video starts at PTS=N — without
-// per-track anchoring the two timelines never line up.
-func TestMixerReader_AudioAndVideoUseIndependentAnchors(t *testing.T) {
-	t.Parallel()
-	bs := buffer.NewServiceForTesting(8)
-	bs.Create("cam")
-	bs.Create("radio")
-	r, err := NewMixerReader(
-		domain.Input{URL: mixerCamRadioURL}, bs,
-		mkCamRadioLookup(),
-	)
-	require.NoError(t, err)
-	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
-
-	// Audio first at large PTS (e.g. mp4 file mid-playback).
-	got := readOne(t, r, bs, "radio", audioPktTS(0xB0, 5000, 5000, false))
-	require.Equal(t, uint64(0), got.DTSms, "audio anchored at its own DTS")
-
-	// Video first at a totally different PTS — must anchor independently.
-	got = readOne(t, r, bs, "cam", videoPktTS(0xA0, 200000, 200000, false))
-	require.Equal(t, uint64(0), got.DTSms, "video anchored at its own DTS")
-
-	// Subsequent audio: 100ms past audio anchor → 100, not 200000+x.
-	got = readOne(t, r, bs, "radio", audioPktTS(0xB1, 5100, 5100, false))
-	require.Equal(t, uint64(100), got.DTSms, "audio offset measured from audio anchor only")
-
-	// Subsequent video: 40ms past video anchor → 40.
-	got = readOne(t, r, bs, "cam", videoPktTS(0xA1, 200040, 200040, false))
-	require.Equal(t, uint64(40), got.DTSms, "video offset measured from video anchor only")
-}
-
-// Discontinuity flag re-anchors the affected track. Models source loop /
-// reconnect / failover where the upstream PTS jumps to a fresh origin —
-// continuing to subtract the old anchor would produce wildly incorrect
-// timestamps (or underflow into uint64 wraparound).
-func TestMixerReader_DiscontinuityReanchorsVideo(t *testing.T) {
-	t.Parallel()
-	bs := buffer.NewServiceForTesting(8)
-	bs.Create("cam")
-	bs.Create("radio")
-	r, err := NewMixerReader(
-		domain.Input{URL: mixerCamRadioURL}, bs,
-		mkCamRadioLookup(),
-	)
-	require.NoError(t, err)
-	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
-
-	// Anchor at 1000.
-	got := readOne(t, r, bs, "cam", videoPktTS(0xA0, 1000, 1000, false))
-	require.Equal(t, uint64(0), got.DTSms)
-
-	// Source loops back to PTS=0 with Discontinuity set — must re-anchor.
-	got = readOne(t, r, bs, "cam", videoPktTS(0xA1, 0, 0, true))
-	require.Equal(t, uint64(0), got.DTSms,
-		"Discontinuity re-anchors at the new DTS so output stays at 0")
-
-	// Continuing from new anchor: 40ms → 40.
-	got = readOne(t, r, bs, "cam", videoPktTS(0xA2, 40, 40, false))
-	require.Equal(t, uint64(40), got.DTSms)
-}
-
-// PTS dipping below the anchor (B-frame reorder where PTS < DTS) must
-// clamp to 0 instead of wrapping the unsigned subtraction. The clamp is
-// intentional — re-anchoring on every dip would invalidate the offset
-// for the (much more common) audio track that shares the timebase.
-func TestMixerReader_PTSBelowAnchorClampsToZero(t *testing.T) {
-	t.Parallel()
-	bs := buffer.NewServiceForTesting(8)
-	bs.Create("cam")
-	bs.Create("radio")
-	r, err := NewMixerReader(
-		domain.Input{URL: mixerCamRadioURL}, bs,
-		mkCamRadioLookup(),
-	)
-	require.NoError(t, err)
-	require.NoError(t, r.Open(context.Background()))
-	defer r.Close()
-
-	// Anchor at DTS=1000 with PTS=1000.
-	_ = readOne(t, r, bs, "cam", videoPktTS(0xA0, 1000, 1000, false))
-
-	// B-frame: PTS=900 < anchor=1000. Must clamp to 0, not wrap.
-	got := readOne(t, r, bs, "cam", videoPktTS(0xA1, 900, 1040, false))
-	require.Equal(t, uint64(0), got.PTSms, "PTS below anchor clamps to 0")
-	require.Equal(t, uint64(40), got.DTSms, "DTS still rebases normally")
-}
-
-// subOrZero is the building block — guard against future refactors that
-// might inadvertently regress to a bare a-b subtraction.
-func TestSubOrZero(t *testing.T) {
-	t.Parallel()
-	require.Equal(t, uint64(0), subOrZero(5, 10), "underflow clamps to 0")
-	require.Equal(t, uint64(5), subOrZero(10, 5))
-	require.Equal(t, uint64(0), subOrZero(0, 0))
-	require.Equal(t, uint64(100), subOrZero(100, 0))
+	got = readOne(t, r, bs, "radio", audioPktTS(0xB0, 5000, 5000, false))
+	require.Equal(t, uint64(5000), got.DTSms,
+		"audio packet must pass through too (no in-reader normalisation)")
 }

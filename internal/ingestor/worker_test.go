@@ -13,7 +13,15 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
+
+// disabledNormaliser is the no-op Normaliser used by readLoop tests that
+// only exercise buffer fan-out (not timestamp anchoring). Pass-through
+// matches the existing test expectations on PTS/DTS.
+func disabledNormaliser() *timeline.Normaliser {
+	return timeline.New(timeline.Config{})
+}
 
 // ---- mock PacketReader ----
 
@@ -105,7 +113,7 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil)
+		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser())
 	}()
 
 	var received [][]byte
@@ -141,7 +149,7 @@ func TestReadLoop_ContextCancelled(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		cancel()
-		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil)
+		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser())
 	}()
 
 	select {
@@ -170,7 +178,7 @@ func TestReadLoop_SkipsEmptyPackets(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil)
+		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser())
 	}()
 
 	select {
