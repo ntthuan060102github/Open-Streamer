@@ -598,18 +598,13 @@ func (s *Service) hlsSegCounter(streamID domain.StreamCode, profile string) prom
 	return s.m.PublisherSegmentsTotal.WithLabelValues(string(streamID), "hls", profile)
 }
 
-// dashSegCounter is the DASH counterpart to hlsSegCounter.
-func (s *Service) dashSegCounter(streamID domain.StreamCode, profile string) prometheus.Counter {
-	if s.m == nil {
-		return nil
-	}
-	return s.m.PublisherSegmentsTotal.WithLabelValues(string(streamID), "dash", profile)
-}
-
 // segWriteDurObserver pre-binds the segment-write-duration histogram for
 // the given stream + format. The histogram tracks wall-clock time spent
 // in os.WriteFile / writeFileAtomic — sustained P99 growth signals disk
 // I/O backpressure before BufferDropsTotal does. Nil-safe.
+//
+// The DASH publisher's segment counter is plumbed inside the dash
+// package; this helper is HLS-only after the DASH rewrite.
 func (s *Service) segWriteDurObserver(streamID domain.StreamCode, format string) prometheus.Observer {
 	if s.m == nil || s.m.PublisherSegmentWriteDuration == nil {
 		return nil

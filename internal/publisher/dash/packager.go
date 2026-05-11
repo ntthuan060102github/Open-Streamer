@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/Eyevinn/mp4ff/aac"
+	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 // packager.go — public Packager + Run loop.
@@ -152,9 +154,24 @@ func NewPackager(cfg Config) (*Packager, error) {
 
 // Run drives the run loop. Returns on ctx cancellation, subscriber close,
 // or unrecoverable I/O error. Caller invokes on its own goroutine.
+//
+// Raw-TS sources (UDP / HLS pull / HTTP-MPEG-TS / SRT pull / file pull /
+// transcoder output) feed bytes via pkt.TS; an internal demuxer
+// goroutine converts them into AV frames and dispatches through the
+// SAME handleH264 / handleAAC paths the direct-AV path uses. The
+// demuxer is lazily started on the first TS packet so AV-only streams
+// pay no goroutine cost.
 func (p *Packager) Run(ctx context.Context, sub *buffer.Subscriber) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
+
+	var tsCarry []byte
+	var tb *tsBuffer
+	defer func() {
+		if tb != nil {
+			tb.Close()
+		}
+	}()
 
 	for {
 		select {
@@ -166,7 +183,7 @@ func (p *Packager) Run(ctx context.Context, sub *buffer.Subscriber) {
 				p.finalFlush()
 				return
 			}
-			p.onPacket(pkt)
+			p.onPacket(pkt, &tsCarry, &tb)
 		case <-ticker.C:
 			p.tryCut(time.Now())
 		}
@@ -174,7 +191,10 @@ func (p *Packager) Run(ctx context.Context, sub *buffer.Subscriber) {
 }
 
 // onPacket dispatches one buffer.Packet through the appropriate path.
-func (p *Packager) onPacket(pkt buffer.Packet) {
+// tsCarry + tb belong to Run's local state — passed by reference so
+// the demuxer is lazily started on the FIRST TS packet rather than
+// always-on (AV-only streams pay nothing).
+func (p *Packager) onPacket(pkt buffer.Packet, tsCarry *[]byte, tb **tsBuffer) {
 	if pkt.SessionStart {
 		p.onSessionBoundary()
 	}
@@ -182,9 +202,49 @@ func (p *Packager) onPacket(pkt buffer.Packet) {
 	case pkt.AV != nil && len(pkt.AV.Data) > 0:
 		p.onAVPacket(pkt.AV)
 	case len(pkt.TS) > 0:
-		// Raw-TS path: defer to step 5 wiring. For now, dropped — only
-		// the AV-path is supported by the new packager. The replacement
-		// commit in step 5 introduces the TS demuxer integration.
+		if *tb == nil {
+			*tb = newTSBuffer(p.cfg.StreamID)
+			startDemuxer(*tb, p.onTSFrame)
+		}
+		aligned := alignTS(tsCarry, pkt.TS)
+		if len(aligned) > 0 {
+			_, _ = (*tb).Write(aligned)
+		}
+	}
+}
+
+// onTSFrame is invoked by the demuxer goroutine for every extracted
+// access unit. Routes to the same handle* methods the direct AV-path
+// uses, so init-segment building and queue management are codec-
+// agnostic to which input path delivered the frame.
+//
+// Runs on the demuxer goroutine — handleH264 / handleAAC acquire
+// p.mu inside, so concurrency with onAVPacket (run-loop goroutine) is
+// safe.
+//
+//nolint:exhaustive // unsupported codecs (PCM / MPEG audio L1/L2 / AC-3) intentionally drop
+func (p *Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+	if len(frame) == 0 {
+		return
+	}
+	av := &domain.AVPacket{
+		Data:     frame,
+		PTSms:    pts,
+		DTSms:    dts,
+		KeyFrame: false,
+	}
+	switch cid {
+	case mpeg2.TS_STREAM_H264:
+		av.Codec = domain.AVCodecH264
+		av.KeyFrame = tsmux.KeyFrameH264(frame)
+		p.onAVPacket(av)
+	case mpeg2.TS_STREAM_H265:
+		av.Codec = domain.AVCodecH265
+		av.KeyFrame = tsmux.KeyFrameH265(frame)
+		p.onAVPacket(av)
+	case mpeg2.TS_STREAM_AAC:
+		av.Codec = domain.AVCodecAAC
+		p.onAVPacket(av)
 	}
 }
 
