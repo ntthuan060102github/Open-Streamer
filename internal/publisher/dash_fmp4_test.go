@@ -152,6 +152,169 @@ func TestSeedersPreserveAudioVideoOffset(t *testing.T) {
 		"video starts 100ms past origin → 9000 ticks at 90 kHz")
 }
 
+// Small (sub-cap) inter-track skew: origin = min(firstV, firstA), both
+// seeds get the natural pre-roll preserved. This is the previous
+// behaviour for any legitimate pre-roll under dashSeedDelayAlignCapMs
+// (AAC encoder delay, RTSP audio leading video by 100 ms, …).
+func TestDecideOriginLocked_SmallSkewPreservesOrigin(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{packAudio: true}
+
+	// Audio first at DTS=5000, video 100 ms later at DTS=5100.
+	p.aPTS = []uint64{5000}
+	p.aRaw = [][]byte{{0x01}}
+	p.vDTS = []uint64{5100}
+	p.vAnnex = [][]byte{{0x02}}
+	p.vPTS = []uint64{5100}
+
+	p.decideOriginLocked(time.Now())
+	require.True(t, p.originDTSmsSet)
+	require.Equal(t, uint64(5000), p.originDTSms,
+		"100 ms skew is within cap → preserve, origin = min(firstV, firstA)")
+	require.Len(t, p.aPTS, 1, "no audio discarded for sub-cap skew")
+	require.Len(t, p.vDTS, 1, "no video discarded for sub-cap skew")
+	require.Equal(t, uint64(0), p.audioSkipUntilDTS)
+	require.Equal(t, uint64(0), p.videoSkipUntilDTS)
+}
+
+// Big inter-track skew with audio leading: video late by 30 s. Delay-
+// align must promote firstV to origin AND discard queued audio frames
+// whose DTS predates it — the upstream HLS pathology that turned
+// bac_ninh and every republisher into either-unplayable-or-30s-lip-
+// sync.
+func TestDecideOriginLocked_BigSkewDelayAlignsAudioLeads(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{packAudio: true}
+
+	// Audio arrived first with 3 frames at DTS=1000, 1020, 1040.
+	// Video then arrives at DTS=31000 (30 s ahead of audio's first).
+	p.aPTS = []uint64{1000, 1020, 1040}
+	p.aRaw = [][]byte{{0x01}, {0x02}, {0x03}}
+	p.vDTS = []uint64{31000}
+	p.vAnnex = [][]byte{{0x10}}
+	p.vPTS = []uint64{31000}
+
+	p.decideOriginLocked(time.Now())
+	require.True(t, p.originDTSmsSet)
+	require.Equal(t, uint64(31000), p.originDTSms,
+		"30 s skew exceeds cap → origin promotes to the late track's first DTS")
+	require.Empty(t, p.aPTS, "queued audio predating new origin must be discarded")
+	require.Empty(t, p.aRaw, "audio raw payload tracks aPTS — same discard scope")
+	require.Equal(t, uint64(31000), p.audioSkipUntilDTS,
+		"audioSkipUntilDTS must hold so subsequent late-arriving audio frames are dropped until upstream catches up")
+	require.Equal(t, uint64(0), p.videoSkipUntilDTS,
+		"video is the LATE track — no skip threshold needed for it")
+}
+
+// Mirror of the above: video leads audio by 30 s. Same logic must
+// promote firstA to origin and discard the early video tail.
+func TestDecideOriginLocked_BigSkewDelayAlignsVideoLeads(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{packAudio: true}
+
+	p.vDTS = []uint64{1000, 1040}
+	p.vAnnex = [][]byte{{0x10}, {0x11}}
+	p.vPTS = []uint64{1000, 1040}
+	p.aPTS = []uint64{31000}
+	p.aRaw = [][]byte{{0x20}}
+
+	p.decideOriginLocked(time.Now())
+	require.True(t, p.originDTSmsSet)
+	require.Equal(t, uint64(31000), p.originDTSms)
+	require.Empty(t, p.vDTS)
+	require.Empty(t, p.vAnnex)
+	require.Empty(t, p.vPTS)
+	require.Equal(t, uint64(31000), p.videoSkipUntilDTS)
+	require.Equal(t, uint64(0), p.audioSkipUntilDTS)
+}
+
+// While the second track hasn't arrived AND the timeout hasn't fired,
+// decide must hold off — seeding either track in isolation would lock
+// in the wrong origin (and then later finalise wouldn't get a chance
+// to delay-align).
+func TestDecideOriginLocked_HoldsOffUntilBothPresent(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{packAudio: true}
+
+	start := time.Now()
+	p.aPTS = []uint64{5000}
+	p.aRaw = [][]byte{{0x01}}
+	p.decideOriginLocked(start)
+	require.False(t, p.originDTSmsSet,
+		"only audio present and within wait window → defer seeding")
+	require.False(t, p.firstPacketAt.IsZero(),
+		"firstPacketAt should be set to track the wait window")
+}
+
+// Single-track sources (audio-only / video-only): after the wait
+// window expires the present track must seed solo.
+func TestDecideOriginLocked_SinglesAfterTimeout(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{packAudio: true}
+
+	start := time.Unix(1_700_000_000, 0)
+	p.aPTS = []uint64{7000}
+	p.aRaw = [][]byte{{0x01}}
+	p.firstPacketAt = start
+	// Same wall — within window → no seed.
+	p.decideOriginLocked(start)
+	require.False(t, p.originDTSmsSet)
+	// Past the timeout → seed solo with what we have.
+	p.decideOriginLocked(start.Add((dashSeedWaitTimeoutSec + 1) * time.Second))
+	require.True(t, p.originDTSmsSet)
+	require.Equal(t, uint64(7000), p.originDTSms)
+}
+
+// Video-only configs (packAudio=false) shouldn't wait for audio at
+// all — origin is the first video DTS, full stop.
+func TestDecideOriginLocked_NoAudioSeedsVideoImmediately(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{packAudio: false}
+
+	p.vDTS = []uint64{1234}
+	p.vAnnex = [][]byte{{0x10}}
+	p.vPTS = []uint64{1234}
+	p.decideOriginLocked(time.Now())
+	require.True(t, p.originDTSmsSet)
+	require.Equal(t, uint64(1234), p.originDTSms)
+}
+
+// Discard helpers — pure slicing math; cheap-to-test, easy-to-regress.
+func TestDiscardVideoBeforeLocked_TruncatesPredateThreshold(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{
+		vDTS:   []uint64{100, 200, 300, 400},
+		vPTS:   []uint64{100, 200, 300, 400},
+		vAnnex: [][]byte{{1}, {2}, {3}, {4}},
+	}
+	p.discardVideoBeforeLocked(300)
+	require.Equal(t, []uint64{300, 400}, p.vDTS)
+	require.Equal(t, []uint64{300, 400}, p.vPTS)
+	require.Len(t, p.vAnnex, 2)
+}
+
+func TestDiscardVideoBeforeLocked_NoOpWhenAllKept(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{
+		vDTS:   []uint64{500, 600},
+		vPTS:   []uint64{500, 600},
+		vAnnex: [][]byte{{1}, {2}},
+	}
+	p.discardVideoBeforeLocked(100)
+	require.Equal(t, []uint64{500, 600}, p.vDTS)
+}
+
+func TestDiscardAudioBeforeLocked_TruncatesPredateThreshold(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{
+		aPTS: []uint64{100, 200, 300},
+		aRaw: [][]byte{{1}, {2}, {3}},
+	}
+	p.discardAudioBeforeLocked(250)
+	require.Equal(t, []uint64{300}, p.aPTS)
+	require.Len(t, p.aRaw, 1)
+}
+
 // ─── tsBuffer leak guards ────────────────────────────────────────────────────
 //
 // Three production-observed leaks in the DASH packager paths:

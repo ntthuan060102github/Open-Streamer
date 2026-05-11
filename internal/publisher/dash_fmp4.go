@@ -67,6 +67,36 @@ const (
 	// Symmetric: backward step ⇒ source switch / wrap, forward step ⇒
 	// CDN playlist resync, NVENC stall recovery, transcoder restart.
 	dashSourceSwitchJumpMs = 1000
+
+	// dashSeedDelayAlignCapMs is the inter-track first-DTS skew that
+	// flips the seeding strategy from "preserve" to "delay-align". Below
+	// the cap, both tracks seed against the EARLIER first-DTS so a small
+	// natural pre-roll (AAC encoder delay 22-44ms, RTSP audio leading
+	// video by ~100ms) survives in tfdt and reaches the player as the
+	// source intended. Above it, the LATER track's first-DTS becomes
+	// the shared origin and queued frames in the early track whose DTS
+	// predate the origin are dropped — so V and A start at the same
+	// source moment, not at "whatever PES PTS the upstream encoder
+	// shipped first". 1 s sits well above any legitimate pre-roll and
+	// catches the pathological 30+ s offset seen on live.mediatech.vn
+	// + every republisher of bac_ninh.
+	dashSeedDelayAlignCapMs = 1000
+
+	// dashSeedWaitTimeoutSec caps how long we hold off seeding while
+	// waiting for the second track to arrive. After this, whichever
+	// track has packets seeds solo — necessary for audio-only / video-
+	// only sources, and for late-binding audio (RTSP servers that bind
+	// the audio track after the video track has been pumping for
+	// several seconds).
+	dashSeedWaitTimeoutSec = 5
+
+	// dashDriftCapLogEveryN throttles the drift-cap-fired warn log to
+	// the first event plus every Nth subsequent event per track. The
+	// drift cap can fire at frame-cadence on pathological sources
+	// (hundreds per second on a stream where origin-tracking baked a
+	// multi-second skew); the log is for diagnosis, not a per-event
+	// firehose.
+	dashDriftCapLogEveryN = 100
 )
 
 // dashRunOpts carries per-rendition ABR metadata.  nil = single-rendition mode.
@@ -196,10 +226,32 @@ type dashFMP4Packager struct {
 	// for B-frame setup while audio DTS=0; HLS pull where audio starts
 	// 100ms before the first IDR; etc.) permanently into the published
 	// stream as observable A/V drift.
-	originDTSms        uint64 // ms — first DTS seen on any track
+	originDTSms        uint64 // ms — frozen origin DTS used by both seed functions
 	originDTSmsSet     bool
 	videoFirstDTSmsSet bool // true once videoNextDecode has been seeded
 	audioFirstDTSmsSet bool // true once audioNextDecode has been seeded
+
+	// firstPacketAt is the wallclock at which the FIRST packet of any
+	// track was observed. Used by maybeSeedBothLocked to time out the
+	// "wait for the other track" gate when only one track ever shows
+	// up (audio-only / video-only sources, or a long-deferred audio
+	// binding on an RTSP server).
+	firstPacketAt time.Time
+
+	// videoSkipUntilDTS / audioSkipUntilDTS are the delay-align discard
+	// thresholds. When the origin is chosen as the LATE track's first
+	// DTS, the EARLY track's queued frames whose DTS < origin are
+	// discarded (truncated at seed time) AND incoming frames that still
+	// predate the origin are dropped until the upstream catches up.
+	// Reset to 0 once a frame ≥ threshold is observed (so a later input
+	// PTS regression doesn't accidentally trigger the latch again).
+	videoSkipUntilDTS uint64
+	audioSkipUntilDTS uint64
+
+	// Per-track drift-cap fire counters for the throttled warn log.
+	// Diagnostic only — does not affect cap behaviour.
+	videoDriftSkipCount int64
+	audioDriftSkipCount int64
 
 	// videoSkipUntilIDR latches when projected segment timeline races
 	// further than 1 segment ahead of wallclock — typically when the
@@ -498,6 +550,7 @@ func (p *dashFMP4Packager) shouldSkipVideoLocked(frame []byte, dts uint64) bool 
 	p.vAnnex = p.vAnnex[:0]
 	p.vDTS = p.vDTS[:0]
 	p.vPTS = p.vPTS[:0]
+	p.logDriftCapLocked("video", &p.videoDriftSkipCount, projectedEnd, elapsedTicks, dashVideoTimescale, isIDR)
 	if isIDR {
 		// Re-anchor videoNextDecode to wallclock so emitted tfdt no
 		// longer advertises future content.
@@ -551,10 +604,38 @@ func (p *dashFMP4Packager) shouldSkipAudioLocked(pts uint64) bool {
 	// a fresh segment boundary aligned with current wallclock.
 	p.aRaw = p.aRaw[:0]
 	p.aPTS = p.aPTS[:0]
+	p.logDriftCapLocked("audio", &p.audioDriftSkipCount, projectedEnd, elapsedTicks, uint64(p.audioSR), false)
 	if elapsedTicks > p.audioNextDecode {
 		p.audioNextDecode = elapsedTicks
 	}
 	return true
+}
+
+// logDriftCapLocked emits a rate-limited slog.Warn when shouldSkip*Locked
+// engages. The drift cap can fire at frame cadence on streams whose
+// origin tracking baked a multi-second tfdt skew — the throttle keeps
+// the log useful without drowning everything else. Diagnostic only;
+// does not affect cap behaviour. Caller must hold p.mu.
+func (p *dashFMP4Packager) logDriftCapLocked(track string, count *int64, projectedEnd, elapsedTicks, timescale uint64, isIDR bool) {
+	*count++
+	if *count != 1 && *count%dashDriftCapLogEveryN != 0 {
+		return
+	}
+	driftTicks := int64(projectedEnd) - int64(elapsedTicks) //nolint:gosec // bounded math
+	driftMs := int64(0)
+	if timescale > 0 {
+		driftMs = driftTicks * 1000 / int64(timescale) //nolint:gosec // bounded math
+	}
+	slog.Warn("publisher: DASH drift cap fired — dropping queue + re-anchor to wallclock",
+		"stream_code", p.streamID,
+		"track", track,
+		"count", *count,
+		"projected_end_ticks", projectedEnd,
+		"elapsed_ticks", elapsedTicks,
+		"drift_ms", driftMs,
+		"seg_sec", p.segSec,
+		"is_idr", isIDR,
+	)
 }
 
 // onTSFrame is the TSDemuxer callback; it runs in the demuxer goroutine.
@@ -582,6 +663,16 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
+		// Delay-align skip: drop video frames whose DTS predates the
+		// origin chosen at seed time. Fires only when the late-arriving
+		// audio set the origin and there's still in-flight video
+		// upstream catching up. Self-clearing once we pass the
+		// threshold.
+		if p.videoSkipUntilDTS > 0 && dts < p.videoSkipUntilDTS {
+			p.mu.Unlock()
+			return
+		}
+		p.videoSkipUntilDTS = 0
 		// Detect source-edge or upstream resync: timestamps should advance
 		// roughly at frame cadence. A jump in either direction past
 		// dashSourceSwitchJumpMs indicates one of:
@@ -593,10 +684,11 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		//     (root cause of "DASH live edge runs N seconds ahead of
 		//     wallclock" reports). Flush before appending so the jump
 		//     becomes a segment boundary, not an inter-sample dur.
-		if timestampJumpFromLast(p.vDTS, dts) {
+		// Skip pre-seed: with origin not yet decided, the segment write
+		// would emit tfdt=0 (default) and need a manual fix-up later.
+		if p.originDTSmsSet && timestampJumpFromLast(p.vDTS, dts) {
 			_ = p.flushSegmentLocked()
 		}
-		p.recordOriginDTSLocked(dts)
 		cp := append([]byte(nil), frame...)
 		p.vAnnex = append(p.vAnnex, cp)
 		p.vDTS = append(p.vDTS, dts)
@@ -607,10 +699,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		if p.videoInit == nil && p.appendVideoPSLocked(cp) {
 			pending = p.tryInitVideoLocked()
 		}
-		p.seedVideoNextDecodeLocked()
-		if p.segmentStart.IsZero() && p.videoInit != nil {
-			p.segmentStart = time.Now()
-		}
+		p.maybeSeedBothLocked(time.Now())
 
 	case mpeg2.TS_STREAM_H265:
 		if len(frame) == 0 {
@@ -622,10 +711,14 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
-		if timestampJumpFromLast(p.vDTS, dts) {
+		if p.videoSkipUntilDTS > 0 && dts < p.videoSkipUntilDTS {
+			p.mu.Unlock()
+			return
+		}
+		p.videoSkipUntilDTS = 0
+		if p.originDTSmsSet && timestampJumpFromLast(p.vDTS, dts) {
 			_ = p.flushSegmentLocked()
 		}
-		p.recordOriginDTSLocked(dts)
 		cp := append([]byte(nil), frame...)
 		p.vAnnex = append(p.vAnnex, cp)
 		p.vDTS = append(p.vDTS, dts)
@@ -637,10 +730,7 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 				pending = p.tryInitVideoH265Locked()
 			}
 		}
-		p.seedVideoNextDecodeLocked()
-		if p.segmentStart.IsZero() && p.videoInit != nil {
-			p.segmentStart = time.Now()
-		}
+		p.maybeSeedBothLocked(time.Now())
 
 	case mpeg2.TS_STREAM_AAC:
 		if !p.packAudio {
@@ -659,12 +749,18 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			p.mu.Unlock()
 			return
 		}
+		// Delay-align skip: mirror the video path. Dropped when video
+		// set the origin and audio upstream is still catching up.
+		if p.audioSkipUntilDTS > 0 && dts < p.audioSkipUntilDTS {
+			p.mu.Unlock()
+			return
+		}
+		p.audioSkipUntilDTS = 0
 		// Same forward+backward jump guard as for video: flush before
 		// mixing frames from two different sources in the audio queue.
-		if timestampJumpFromLast(p.aPTS, pts) {
+		if p.originDTSmsSet && timestampJumpFromLast(p.aPTS, pts) {
 			_ = p.flushSegmentLocked()
 		}
-		p.recordOriginDTSLocked(dts)
 		// A PES payload may contain multiple concatenated ADTS frames.
 		pos := 0
 		for pos+7 <= len(frame) {
@@ -693,12 +789,9 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			}
 			p.aRaw = append(p.aRaw, raw)
 			p.aPTS = append(p.aPTS, pts)
-			p.seedAudioNextDecodeLocked(dts)
-			if p.segmentStart.IsZero() && p.videoInit == nil && p.audioInit != nil {
-				p.segmentStart = time.Now()
-			}
 			pos += hLen + pLen
 		}
+		p.maybeSeedBothLocked(time.Now())
 
 	default:
 		p.mu.Unlock()
@@ -912,6 +1005,148 @@ func (p *dashFMP4Packager) seedAudioNextDecodeLocked(firstFrameDTSms uint64) {
 	}
 	p.audioNextDecode = scaleOffset(firstFrameDTSms, p.originDTSms, uint64(p.audioSR))
 	p.audioFirstDTSmsSet = true
+}
+
+// maybeSeedBothLocked decides the shared origin and seeds both track
+// counters once enough of the source has arrived to make a sound
+// decision. It runs on every onTSFrame call — early calls bail out
+// while we wait for the other track, the deciding call freezes the
+// origin and seeds whichever tracks have init segments ready, later
+// calls finalise any track whose init becomes ready post-seed.
+//
+// Three regimes:
+//   - Both tracks present: pick origin = min(firstV, firstA) when the
+//     skew is within dashSeedDelayAlignCapMs (preserve natural pre-
+//     roll), or origin = max(firstV, firstA) when it isn't (delay-
+//     align — discard the EARLY track's queued frames whose DTS
+//     predates the new origin so V and A start at the same source
+//     moment, not at "whatever PES PTS the upstream encoder happened
+//     to ship first").
+//   - One track present, second never arrives within
+//     dashSeedWaitTimeoutSec: seed the present track solo. Audio-only
+//     / video-only streams reach here.
+//   - packAudio=false: seed video as soon as it has a packet.
+//
+// Caller must hold p.mu.
+func (p *dashFMP4Packager) maybeSeedBothLocked(now time.Time) {
+	if !p.originDTSmsSet {
+		p.decideOriginLocked(now)
+	}
+	if !p.originDTSmsSet {
+		return
+	}
+	// Init segments may complete on different frames; try seeding
+	// each track on every call so a late-binding init still gets the
+	// seed without needing another delay-align decision.
+	p.seedVideoNextDecodeLocked()
+	if len(p.aPTS) > 0 {
+		p.seedAudioNextDecodeLocked(p.aPTS[0])
+	}
+	if p.segmentStart.IsZero() && (p.videoInit != nil || p.audioInit != nil) {
+		p.segmentStart = now
+	}
+}
+
+// decideOriginLocked is the policy core of maybeSeedBothLocked.
+// Extracted so the wait/decision logic stays small enough to fit
+// the cognitive-complexity ceiling, and so it can be unit-tested
+// without spinning up a TS demuxer.
+//
+// Caller must hold p.mu and ensure !p.originDTSmsSet.
+func (p *dashFMP4Packager) decideOriginLocked(now time.Time) {
+	if p.firstPacketAt.IsZero() {
+		p.firstPacketAt = now
+	}
+	hasV := len(p.vDTS) > 0
+	hasA := len(p.aPTS) > 0
+	timedOut := now.Sub(p.firstPacketAt) >= dashSeedWaitTimeoutSec*time.Second
+
+	var ready bool
+	switch {
+	case !p.packAudio:
+		ready = hasV
+	case hasV && hasA:
+		ready = true
+	case timedOut:
+		ready = hasV || hasA
+	}
+	if !ready {
+		return
+	}
+
+	switch {
+	case hasV && hasA:
+		firstV := p.vDTS[0]
+		firstA := p.aPTS[0]
+		delta := int64(firstV) - int64(firstA) //nolint:gosec // bounded by upstream timebase
+		switch {
+		case delta > dashSeedDelayAlignCapMs:
+			// Video late by > cap → audio's leading frames are the
+			// source's pathological pre-roll; discard them.
+			p.originDTSms = firstV
+			p.discardAudioBeforeLocked(firstV)
+			p.audioSkipUntilDTS = firstV
+			slog.Warn("publisher: DASH delay-align — audio queue truncated to V origin",
+				"stream_code", p.streamID,
+				"first_video_dts_ms", firstV,
+				"first_audio_dts_ms", firstA,
+				"skew_ms", delta,
+			)
+		case delta < -dashSeedDelayAlignCapMs:
+			// Audio late by > cap → symmetric.
+			p.originDTSms = firstA
+			p.discardVideoBeforeLocked(firstA)
+			p.videoSkipUntilDTS = firstA
+			slog.Warn("publisher: DASH delay-align — video queue truncated to A origin",
+				"stream_code", p.streamID,
+				"first_video_dts_ms", firstV,
+				"first_audio_dts_ms", firstA,
+				"skew_ms", delta,
+			)
+		default:
+			// Within cap: preserve natural pre-roll. Origin = the
+			// EARLIER of the two firsts so neither seed wraps below 0.
+			p.originDTSms = firstV
+			if firstA < firstV {
+				p.originDTSms = firstA
+			}
+		}
+	case hasV:
+		p.originDTSms = p.vDTS[0]
+	case hasA:
+		p.originDTSms = p.aPTS[0]
+	}
+	p.originDTSmsSet = true
+}
+
+// discardVideoBeforeLocked drops queued video frames whose DTS
+// predates threshold. Counterpart of audioSkipUntilDTS for the
+// already-buffered tail. Caller must hold p.mu.
+func (p *dashFMP4Packager) discardVideoBeforeLocked(threshold uint64) {
+	keep := 0
+	for keep < len(p.vDTS) && p.vDTS[keep] < threshold {
+		keep++
+	}
+	if keep == 0 {
+		return
+	}
+	p.vAnnex = p.vAnnex[keep:]
+	p.vDTS = p.vDTS[keep:]
+	p.vPTS = p.vPTS[keep:]
+}
+
+// discardAudioBeforeLocked drops queued audio frames whose DTS
+// predates threshold. Caller must hold p.mu.
+func (p *dashFMP4Packager) discardAudioBeforeLocked(threshold uint64) {
+	keep := 0
+	for keep < len(p.aPTS) && p.aPTS[keep] < threshold {
+		keep++
+	}
+	if keep == 0 {
+		return
+	}
+	p.aRaw = p.aRaw[keep:]
+	p.aPTS = p.aPTS[keep:]
 }
 
 // scaleOffset returns (firstDTSms - originDTSms) converted into `timescale`
