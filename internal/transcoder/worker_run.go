@@ -220,6 +220,13 @@ func (s *Service) runOnce(
 		"write_to", outBufferID,
 	)
 
+	// A fresh ffmpeg process emits a fresh PCR base, fresh PSI, and (with
+	// our `-reset_timestamps 1`-style invocation) a fresh PTS origin. From
+	// every downstream consumer's perspective this is a new lifetime —
+	// declare a StreamSession on the output buffer so the segmenter can
+	// reset its per-track state cleanly the moment Phase 2 turns this on.
+	_ = s.buf.SetSession(outBufferID, domain.SessionStartMixerCycle, nil, nil)
+
 	tail := newStderrTail(stderrTailCap)
 	go s.logStderr(logStream, track, stderr, tail)
 

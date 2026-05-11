@@ -386,6 +386,11 @@ func (c *Coordinator) abrMixerVideoForward(ctx context.Context, entry *abrMixerE
 	}
 	defer func() { _ = demux.Close() }()
 
+	// Mint a StreamSession on the downstream rendition buffer so downstream
+	// consumers see a fresh session whenever this forward cycle (re)starts.
+	// Cycles re-start on upstream tear-down — that is the mixer's equivalent
+	// of a reconnect.
+	_ = c.buf.SetSession(downBufID, domain.SessionStartMixerCycle, nil, nil)
 	rebaser := ptsRebaser{t0: entry.t0}
 	for {
 		batch, err := demux.ReadPackets(ctx)

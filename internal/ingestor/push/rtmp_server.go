@@ -274,6 +274,13 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 		rebaser:       ptsrebaser.New(s.rebaserCfg),
 		firstPacket:   true,
 	}
+	// Mint a new StreamSession on the target buffer. A pusher reconnecting
+	// is functionally equivalent to a pull reader's Reconnect — fresh PTS
+	// origin, fresh codec config — so we use that reason regardless of
+	// whether this is the very first publisher or a subsequent one. Phase 1
+	// consumers ignore the field; the future Timeline Normaliser will key
+	// off the SessionID to reset its per-track baselines.
+	_ = buf.SetSession(bufWriteID, domain.SessionStartReconnect, nil, nil)
 	session.SetPubSessionObserver(state)
 
 	s.mu.Lock()

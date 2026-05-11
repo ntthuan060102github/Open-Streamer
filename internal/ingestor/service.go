@@ -427,7 +427,11 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 					prevCancel()
 				}
 			},
-			rebaserCfg: s.rebaserConfig(),
+			// A non-nil prevCancel at scheduling time means the manager
+			// is replacing an active worker — i.e. a failover. Otherwise
+			// this is a cold start.
+			firstSessionReason: firstSessionReasonFor(prevCancel),
+			rebaserCfg:         s.rebaserConfig(),
 		}
 		s.mu.Unlock()
 		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, cb)

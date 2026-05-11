@@ -256,6 +256,13 @@ func (s *Service) runOnceMultiOutput(
 		"profiles", len(targets),
 	)
 
+	// Mint a fresh StreamSession on every rendition output buffer. Same
+	// rationale as worker_run.go's single-output path: a new ffmpeg process
+	// emits a fresh PCR base and PTS origin from each output pipe.
+	for _, target := range targets {
+		_ = s.buf.SetSession(target.BufferID, domain.SessionStartMixerCycle, nil, nil)
+	}
+
 	tail := newStderrTail(stderrTailCap)
 	go s.logStderr(logStream, "stream", stderr, tail)
 

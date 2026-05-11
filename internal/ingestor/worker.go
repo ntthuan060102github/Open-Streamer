@@ -37,6 +37,19 @@ type pullWorkerCallbacks struct {
 	// It is used by startPullWorker to cancel the previous source worker only after
 	// the new source has connected — eliminating the buffer gap during source transitions.
 	onHandoff func()
+	// onSession is called whenever the worker mints a new StreamSession on
+	// the buffer hub (first connect, reconnect, failover-handoff). The caller
+	// may publish a bus event or log the session for telemetry. The session
+	// argument is the live record returned by buffer.Service.SetSession;
+	// readers must not mutate it.
+	onSession func(streamID domain.StreamCode, sess *domain.StreamSession)
+
+	// firstSessionReason is the SessionStartReason used the first time this
+	// worker successfully Opens its source. Caller picks Fresh for a cold
+	// start and Failover when this worker is taking over from a predecessor.
+	// Subsequent Open attempts within the same worker always mint a
+	// Reconnect session, since by then we have already handed off.
+	firstSessionReason domain.SessionStartReason
 
 	// rebaserCfg controls AV-path PTS normalisation. A fresh Rebaser is
 	// constructed per readLoop invocation (i.e. per source connection),
@@ -57,7 +70,8 @@ func runPullWorker(
 	cb pullWorkerCallbacks,
 ) {
 	delay := reconnectBaseDelay
-	handedOff := false // onHandoff fires at most once (first successful Open)
+	handedOff := false     // onHandoff fires at most once (first successful Open)
+	firstOpenDone := false // distinguishes first Open from subsequent Reconnect
 
 	for {
 		if !openSource(ctx, streamID, input, r, cb, &delay, &handedOff) {
@@ -70,6 +84,11 @@ func runPullWorker(
 			"url", input.URL,
 		)
 		delay = reconnectBaseDelay // reset on successful open
+		// Mint a StreamSession before any packet is written. On the very
+		// first open we honour cb.firstSessionReason (Fresh or Failover);
+		// every subsequent open within this worker is a Reconnect.
+		mintSessionForOpen(streamID, bufferWriteID, buf, &cb, firstOpenDone)
+		firstOpenDone = true
 		if cb.onConnect != nil {
 			cb.onConnect(streamID, input.Priority)
 		}
@@ -136,6 +155,55 @@ func fireHandoffOnce(cb pullWorkerCallbacks, handedOff *bool) {
 	*handedOff = true
 	if cb.onHandoff != nil {
 		cb.onHandoff()
+	}
+}
+
+// firstSessionReasonFor picks the SessionStartReason to use on a freshly
+// scheduled pull worker's first Open. A non-nil prevCancel means there's
+// an active predecessor being handed off — that is a failover by Stream
+// Manager. A nil prevCancel means this is the first worker for this stream
+// in this Service's lifetime — a fresh cold start.
+func firstSessionReasonFor(prevCancel context.CancelFunc) domain.SessionStartReason {
+	if prevCancel != nil {
+		return domain.SessionStartFailover
+	}
+	return domain.SessionStartFresh
+}
+
+// mintSessionForOpen tells the buffer hub that a new StreamSession is
+// starting. firstOpenDone distinguishes the two cases: false means this is
+// the very first successful Open for this worker (use the caller-provided
+// firstSessionReason — Fresh or Failover); true means we are re-opening
+// within the same worker after a transient read error (always Reconnect).
+// The worker doesn't have init params on hand at this point — SPS/PPS / ASC
+// live inside the per-reader state and arrive on the first keyframe — so we
+// pass nil configs; downstream consumers fall back to in-band parsing
+// exactly as they do today.
+func mintSessionForOpen(
+	streamID, bufferWriteID domain.StreamCode,
+	buf *buffer.Service,
+	cb *pullWorkerCallbacks,
+	firstOpenDone bool,
+) {
+	reason := domain.SessionStartReconnect
+	if !firstOpenDone {
+		reason = cb.firstSessionReason
+		if reason == domain.SessionStartUnknown {
+			reason = domain.SessionStartFresh
+		}
+	}
+	sess := buf.SetSession(bufferWriteID, reason, nil, nil)
+	if sess == nil {
+		return
+	}
+	slog.Debug("ingestor: stream session minted",
+		"stream_code", streamID,
+		"buffer_id", bufferWriteID,
+		"session_id", sess.ID,
+		"reason", sess.Reason.String(),
+	)
+	if cb.onSession != nil {
+		cb.onSession(streamID, sess)
 	}
 }
 

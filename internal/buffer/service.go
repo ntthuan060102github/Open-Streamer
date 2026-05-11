@@ -6,6 +6,7 @@ package buffer
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,10 +30,19 @@ func (s *Subscriber) Recv() <-chan Packet { return s.ch }
 // `drops` is a pre-bound Prometheus counter for this stream's drop events
 // — pre-binding once (instead of `WithLabelValues` per write) keeps the
 // hot path map-lookup-free. Nil when metrics aren't injected (tests).
+//
+// `session` is the current StreamSession snapshot for this buffer. Mutated
+// only by Service.SetSession (under rb.mu) and read by ringBuffer.write to
+// stamp each outgoing Packet with SessionID / SessionStart. `sessionStartPending`
+// is a one-shot latch: SetSession sets it to true so the very next write
+// emits SessionStart=true, then write clears it. nil session means
+// "no session declared yet" — packets ship with SessionID=0.
 type ringBuffer struct {
-	mu    sync.Mutex
-	subs  []*Subscriber
-	drops prometheus.Counter
+	mu                  sync.Mutex
+	subs                []*Subscriber
+	drops               prometheus.Counter
+	session             *domain.StreamSession
+	sessionStartPending bool
 }
 
 func (rb *ringBuffer) write(pkt Packet) {
@@ -46,6 +56,17 @@ func (rb *ringBuffer) write(pkt Packet) {
 	// before users complain about frame drops.
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
+	// Stamp the session metadata onto the outgoing packet. The caller may
+	// also have set SessionID/SessionStart directly (e.g. a mixer fan-out
+	// that owns its own session table); we only overwrite when the caller
+	// left them zero, so explicit values pass through.
+	if pkt.SessionID == 0 && rb.session != nil {
+		pkt.SessionID = rb.session.ID
+		if rb.sessionStartPending {
+			pkt.SessionStart = true
+			rb.sessionStartPending = false
+		}
+	}
 	for _, s := range rb.subs {
 		pc := clonePacket(pkt)
 		select {
@@ -92,11 +113,16 @@ func (rb *ringBuffer) unsubscribeAll() {
 }
 
 // Service manages ring buffers for all active streams.
+//
+// `sessionCounter` produces a process-wide monotonic ID for every
+// SetSession call — each new session is observable as a distinct uint64
+// without needing per-buffer counters or wall-clock reads on the hot path.
 type Service struct {
-	cfg     config.BufferConfig
-	m       *metrics.Metrics
-	mu      sync.RWMutex
-	buffers map[domain.StreamCode]*ringBuffer
+	cfg            config.BufferConfig
+	m              *metrics.Metrics
+	mu             sync.RWMutex
+	buffers        map[domain.StreamCode]*ringBuffer
+	sessionCounter atomic.Uint64
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -264,4 +290,53 @@ func (s *Service) UnsubscribeAll(id domain.StreamCode) {
 		return
 	}
 	rb.unsubscribeAll()
+}
+
+// SetSession declares that subsequent packets written to buffer `id` belong
+// to a new StreamSession. The buffer mints a fresh monotonic SessionID and
+// latches a one-shot SessionStart=true marker on the very next packet,
+// regardless of whether that packet is a TS chunk or an AVPacket.
+//
+// `reason` is recorded on the session for telemetry. `video` and `audio`
+// are optional config snapshots — either may be nil for video-only / audio-
+// only streams, or both may be nil when the caller hasn't parsed the
+// init params yet (downstream consumers fall back to in-band parsing).
+//
+// Returns the StreamSession that was minted so callers can publish it on
+// the event bus / log it. Returns nil and does nothing when the buffer
+// hasn't been Create'd yet — that case is logged at the call site.
+func (s *Service) SetSession(id domain.StreamCode, reason domain.SessionStartReason, video *domain.SessionVideoConfig, audio *domain.SessionAudioConfig) *domain.StreamSession {
+	s.mu.RLock()
+	rb, ok := s.buffers[id]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	sess := &domain.StreamSession{
+		ID:        s.sessionCounter.Add(1),
+		StartedAt: time.Now(),
+		Reason:    reason,
+		Video:     video,
+		Audio:     audio,
+	}
+	rb.mu.Lock()
+	rb.session = sess
+	rb.sessionStartPending = true
+	rb.mu.Unlock()
+	return sess
+}
+
+// Session returns a snapshot of the buffer's current StreamSession, or nil
+// when SetSession has not been called yet or the buffer doesn't exist.
+// The returned pointer is the live session — callers must not mutate it.
+func (s *Service) Session(id domain.StreamCode) *domain.StreamSession {
+	s.mu.RLock()
+	rb, ok := s.buffers[id]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.session
 }
