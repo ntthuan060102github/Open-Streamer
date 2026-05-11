@@ -131,6 +131,16 @@ type Packager struct {
 	videoNextDecodeTicks uint64
 	audioNextDecodeTicks uint64
 
+	// pairingTruncated latches after truncateAtPairingLocked runs so it
+	// fires exactly once per session lifetime. Without this latch, a
+	// stream whose first Cut returns Ok=false (insufficient frames) would
+	// stay in WaitingForPairing across ticks; truncateAtPairingLocked
+	// would re-fire on every tick, re-thresholding against the now-
+	// older first-frame PTSms and dropping whichever track keeps
+	// arriving slower — an infinite-drop loop observed on ABR streams
+	// where V and A timeline axes don't perfectly match.
+	pairingTruncated bool
+
 	// Sliding-window state for manifest.
 	onDiskV     []string
 	onDiskA     []string
@@ -382,6 +392,12 @@ func (p *Packager) installVideoInit(vi *VideoInit) {
 // MPD timeline stays monotonic — players keep advancing through the
 // same SegmentTimeline without seeking back. Segment numbers also
 // survive for the same reason.
+//
+// pairingTruncated is NOT reset — a session boundary mid-stream isn't a
+// "fresh pairing window"; both tracks are already advancing and the
+// post-boundary content joins their existing timelines. Resetting the
+// latch would re-engage pairing-truncate and drop incoming frames
+// while waiting for the pairing condition to re-fire.
 func (p *Packager) onSessionBoundary() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -422,8 +438,16 @@ func (p *Packager) tryCut(now time.Time) {
 	// NVENC pipeline warmed up, or 16 s of mixer-drained V frames). The
 	// pre-pairing content is lost, but media-time anchors stay aligned
 	// — no perpetual A/V drift in the published timeline.
-	if p.state.State() == StateWaitingForPairing && haveVideo && haveAudio {
+	//
+	// Latch via pairingTruncated so this runs exactly once per session.
+	// Otherwise, when Cut returns Ok=false on the post-truncate queue
+	// (insufficient video), we'd loop and re-truncate every tick,
+	// dropping each newly-arrived V frame because A's first PTS stays
+	// ahead — observed on ABR streams as audio outrunning video by
+	// tens of seconds in the live-edge MPD timeline.
+	if !p.pairingTruncated && p.state.State() == StateWaitingForPairing && haveVideo && haveAudio {
 		p.truncateAtPairingLocked()
+		p.pairingTruncated = true
 	}
 
 	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio)
@@ -620,6 +644,13 @@ func (p *Packager) publishManifest(now time.Time) {
 
 // buildManifestInputLocked snapshots window state into a ManifestInput.
 // Returns nil when no track has emitted any segment yet.
+//
+// For ABR shards (ABRSlug non-empty + ManifestPath empty), init and
+// media paths are prefixed with the shard slug so the root MPD —
+// served at <stream>/index.mpd by the master — can reference
+// <stream>/<slug>/init_v.mp4 etc. without further URL rewriting.
+// Per-stream MPDs (single-rendition mode) keep the bare filenames
+// since the MPD sits next to the segments in the stream dir.
 func (p *Packager) buildManifestInputLocked(now time.Time) *ManifestInput {
 	if len(p.vSegEntries) == 0 && len(p.aSegEntries) == 0 {
 		return nil
@@ -629,6 +660,10 @@ func (p *Packager) buildManifestInputLocked(now time.Time) *ManifestInput {
 		PublishTime:       now,
 		SegDur:            p.cfg.SegDur,
 		Window:            p.cfg.Window,
+	}
+	pathPrefix := ""
+	if p.cfg.ABRSlug != "" && p.cfg.ManifestPath == "" {
+		pathPrefix = p.cfg.ABRSlug + "/"
 	}
 	if p.videoInit != nil && len(p.vSegEntries) > 0 {
 		bw := p.cfg.OverrideBandwidth
@@ -642,8 +677,8 @@ func (p *Packager) buildManifestInputLocked(now time.Time) *ManifestInput {
 			Width:        p.videoInit.Info.Width,
 			Height:       p.videoInit.Info.Height,
 			Timescale:    VideoTimescale,
-			InitFile:     dashVideoInitFile,
-			MediaPattern: dashVideoMediaPattern,
+			InitFile:     pathPrefix + dashVideoInitFile,
+			MediaPattern: pathPrefix + dashVideoMediaPattern,
 			StartNumber:  startNumberFor(p.onDiskV, p.cfg.Window),
 			Segments:     windowTail(p.vSegEntries, p.cfg.Window),
 		}}
@@ -655,8 +690,8 @@ func (p *Packager) buildManifestInputLocked(now time.Time) *ManifestInput {
 			Bandwidth:    128_000,
 			SampleRate:   p.audioInit.SampleRate,
 			Timescale:    uint32(p.audioInit.SampleRate), //nolint:gosec // SampleRate fits uint32
-			InitFile:     dashAudioInitFile,
-			MediaPattern: dashAudioMediaPattern,
+			InitFile:     pathPrefix + dashAudioInitFile,
+			MediaPattern: pathPrefix + dashAudioMediaPattern,
 			StartNumber:  startNumberFor(p.onDiskA, p.cfg.Window),
 			Segments:     windowTail(p.aSegEntries, p.cfg.Window),
 		}
