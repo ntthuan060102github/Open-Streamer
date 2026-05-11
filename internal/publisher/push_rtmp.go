@@ -282,11 +282,13 @@ func (p *rtmpPushPackager) connect(ctx context.Context) error {
 // feedLoop reads packets from sub, reassembles 188-byte TS packets via
 // alignedFeed, and pipes them into tb. Runs in its own goroutine.
 //
-// Discontinuity handling: the ingestor flags the first packet of every
-// (re)connect with Discontinuity=true — it has no notion of source switch vs.
-// initial start vs. transient reconnect, that's by design. Once we have an
-// active push session (connErr nil), any Discontinuity must restart the
-// session because remote codec params may have changed.
+// Session-boundary handling: every fresh StreamSession on the buffer hub
+// (cold start, reconnect, failover, mixer cycle, codec change) carries
+// buffer.Packet.SessionStart=true on its first packet. Once we have an
+// active push session (connErr nil), any SessionStart must restart the
+// downstream push session because the remote codec params and PCR base
+// may have changed. The first SessionStart of the worker (before connErr
+// is settled) is consumed by the initial setup path, not here.
 func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber, tb *tsBuffer) {
 	defer tb.Close()
 	var tsCarry []byte
@@ -300,7 +302,7 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 			if !ok {
 				return
 			}
-			if pkt.AV != nil && pkt.AV.Discontinuity && p.connErr.Load() == nil {
+			if pkt.SessionStart && p.connErr.Load() == nil {
 				p.gotDiscontinuity.Store(true)
 				return
 			}

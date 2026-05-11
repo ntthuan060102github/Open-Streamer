@@ -312,16 +312,20 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 				if !ok {
 					return
 				}
+				// Session boundary: reset the demuxer-side carry so a
+				// future source switch can't mix half-formed TS packets
+				// from the old session into the new one. The DASH
+				// packager's per-track anchors (videoNextDecode,
+				// audioNextDecode, init segment) survive the boundary —
+				// the Normaliser-anchored PTS coming in stays monotonic,
+				// and the packager's drift cap handles the steady state.
+				if pkt.SessionStart {
+					tsCarry = nil
+				}
 				// Direct AV path: route past the TS round-trip.
 				if pkt.AV != nil && len(pkt.AV.Data) > 0 {
 					cid, ok := dashStreamTypeForCodec(pkt.AV.Codec)
 					if ok {
-						// Discontinuity also resets the demuxer-side carry
-						// to keep the raw-TS branch idempotent if a future
-						// source mixes both forms — defensive.
-						if pkt.AV.Discontinuity {
-							tsCarry = nil
-						}
 						p.onTSFrame(cid, pkt.AV.Data, pkt.AV.PTSms, pkt.AV.DTSms)
 						continue
 					}

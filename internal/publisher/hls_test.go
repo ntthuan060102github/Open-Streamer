@@ -77,7 +77,6 @@ func TestHLSSegmenter_WriteManifest_EmptyOnDisk(t *testing.T) {
 		manifestPath: filepath.Join(dir, "index.m3u8"),
 		segSec:       2,
 		window:       5,
-		failoverGen:  func() uint64 { return 0 },
 	}
 	// No segments — manifest should still write without error.
 	err := p.writeManifestLocked()
@@ -97,7 +96,6 @@ func TestHLSSegmenter_WriteManifest_DiscontinuityTag(t *testing.T) {
 		manifestPath: filepath.Join(dir, "index.m3u8"),
 		segSec:       2,
 		window:       5,
-		failoverGen:  func() uint64 { return 0 },
 		onDisk: []hlsSegEntry{
 			{name: "seg_000001.ts", dur: 2.0, disc: false},
 			{name: "seg_000002.ts", dur: 2.0, disc: true},
@@ -122,7 +120,6 @@ func TestHLSSegmenter_WriteManifest_TargetDuration(t *testing.T) {
 		manifestPath: filepath.Join(dir, "index.m3u8"),
 		segSec:       2,
 		window:       5,
-		failoverGen:  func() uint64 { return 0 },
 		onDisk: []hlsSegEntry{
 			{name: "seg_000001.ts", dur: 5.7},
 		},
@@ -143,7 +140,6 @@ func TestHLSSegmenter_WriteManifest_MediaSequence(t *testing.T) {
 		manifestPath: filepath.Join(dir, "index.m3u8"),
 		segSec:       2,
 		window:       3,
-		failoverGen:  func() uint64 { return 0 },
 		segN:         10,
 		onDisk: []hlsSegEntry{
 			{name: "seg_000008.ts", dur: 2.0},
@@ -164,7 +160,6 @@ func TestHLSSegmenter_WriteManifest_NoPathNoABR(t *testing.T) {
 	p := &hlsSegmenter{
 		manifestPath: "",
 		abrMaster:    nil,
-		failoverGen:  func() uint64 { return 0 },
 	}
 	err := p.writeManifestLocked()
 	require.NoError(t, err)

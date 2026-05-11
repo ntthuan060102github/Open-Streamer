@@ -124,7 +124,12 @@ func runRTMPPlayPipeline(
 				if !ok {
 					return
 				}
-				if pkt.AV != nil && pkt.AV.Discontinuity {
+				if pkt.SessionStart {
+					// Source switched (failover / reconnect / mixer cycle).
+					// Drop stale muxer state so the new session gets fresh
+					// PAT/PMT tables and clean continuity counters; flush
+					// the TS carry so a half-formed packet from the old
+					// session can't merge with new-session bytes.
 					avMux = nil
 					tsCarry = nil
 				}

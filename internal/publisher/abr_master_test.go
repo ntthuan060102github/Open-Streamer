@@ -461,7 +461,6 @@ func TestHLSSegmenter_DoFlush_NoOpWhenBufferEmpty(t *testing.T) {
 		manifestPath: filepath.Join(dir, "index.m3u8"),
 		segSec:       2,
 		window:       3,
-		failoverGen:  func() uint64 { return 0 },
 	}
 	// No segBuf → doFlush is a no-op (no manifest written, no segments).
 	p.doFlush()
@@ -479,7 +478,6 @@ func TestHLSSegmenter_FlushLocked_WritesSegmentAndManifest(t *testing.T) {
 		segSec:       2,
 		window:       3,
 		ephemeral:    true,
-		failoverGen:  func() uint64 { return 0 },
 		segBuf:       []byte("ts-payload"),
 		segStart:     time.Now().Add(-2 * time.Second),
 	}
