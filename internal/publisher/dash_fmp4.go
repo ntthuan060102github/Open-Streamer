@@ -633,6 +633,16 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		//     wallclock" reports). Flush before appending so the jump
 		//     becomes a segment boundary, not an inter-sample dur.
 		if timestampJumpFromLast(p.vDTS, dts) {
+			lastDts := p.vDTS[len(p.vDTS)-1]
+			delta := int64(dts) - int64(lastDts) //nolint:gosec
+			slog.Warn("diag: DASH timestamp jump — flushing segment (H264)",
+				"stream_code", p.streamID,
+				"prev_dts_ms", lastDts,
+				"new_dts_ms", dts,
+				"delta_ms", delta,
+				"video_next_decode_ticks", p.videoNextDecode,
+				"v_queue_len_before_flush", len(p.vDTS),
+			)
 			_ = p.flushSegmentLocked()
 		}
 		p.recordOriginDTSLocked(dts)
@@ -662,6 +672,16 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 			return
 		}
 		if timestampJumpFromLast(p.vDTS, dts) {
+			lastDts := p.vDTS[len(p.vDTS)-1]
+			delta := int64(dts) - int64(lastDts) //nolint:gosec
+			slog.Warn("diag: DASH timestamp jump — flushing segment (H265)",
+				"stream_code", p.streamID,
+				"prev_dts_ms", lastDts,
+				"new_dts_ms", dts,
+				"delta_ms", delta,
+				"video_next_decode_ticks", p.videoNextDecode,
+				"v_queue_len_before_flush", len(p.vDTS),
+			)
 			_ = p.flushSegmentLocked()
 		}
 		p.recordOriginDTSLocked(dts)
@@ -701,6 +721,16 @@ func (p *dashFMP4Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts
 		// Same forward+backward jump guard as for video: flush before
 		// mixing frames from two different sources in the audio queue.
 		if timestampJumpFromLast(p.aPTS, pts) {
+			lastPts := p.aPTS[len(p.aPTS)-1]
+			delta := int64(pts) - int64(lastPts) //nolint:gosec
+			slog.Warn("diag: DASH timestamp jump — flushing segment (AAC)",
+				"stream_code", p.streamID,
+				"prev_pts_ms", lastPts,
+				"new_pts_ms", pts,
+				"delta_ms", delta,
+				"audio_next_decode_ticks", p.audioNextDecode,
+				"a_queue_len_before_flush", len(p.aPTS),
+			)
 			_ = p.flushSegmentLocked()
 		}
 		p.recordOriginDTSLocked(dts)
@@ -1114,6 +1144,23 @@ func (p *dashFMP4Packager) writeVideoSegmentLocked() error {
 			if dur == 0 {
 				dur = uint32(p.segSec) * dashVideoTimescale / uint32(len(p.vAnnex))
 			}
+		}
+
+		// Diagnostic: flag suspicious per-sample dur. A frame-cadence
+		// inter-frame delta is ~40ms (25fps) / ~17ms (60fps). Anything
+		// > 500 ms means the input PES had a jump the `timestampJump`
+		// guard didn't catch — baking that delta as ONE sample's dur
+		// pushes videoNextDecode forward by that amount permanently.
+		if dur > 500*90 {
+			slog.Warn("diag: DASH video suspicious sample dur",
+				"stream_code", p.streamID,
+				"dur_ticks", dur,
+				"dur_ms", uint64(dur)/90,
+				"sample_idx", i,
+				"queue_len", len(p.vDTS),
+				"v_seg_n", p.vSegN+1,
+				"video_next_decode_ticks", p.videoNextDecode,
+			)
 		}
 
 		flags := mp4.NonSyncSampleFlags
