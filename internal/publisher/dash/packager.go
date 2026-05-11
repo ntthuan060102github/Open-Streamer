@@ -119,18 +119,6 @@ type Packager struct {
 	vSegN      uint64
 	aSegN      uint64
 
-	// videoNextDecodeTicks / audioNextDecodeTicks accumulate sequentially:
-	// each new segment's tfdt = the previous segment's tfdt + dur. This
-	// avoids the wallclock-recompute drift that the naïve
-	// `tfdt = (now - AST) × timescale` model exhibits — audio durs come
-	// in 1024-sample steps (≈ 32 ms at 32 kHz) that don't divide ms
-	// wallclock exactly, so the gap between V's wallclock-tfdt and A's
-	// frame-count-derived end grew by ~30 ms per segment and reached
-	// tens of seconds over a few minutes. Sequential accumulation makes
-	// both tracks advance at exactly source rate, staying in lockstep.
-	videoNextDecodeTicks uint64
-	audioNextDecodeTicks uint64
-
 	// pairingTruncated latches after truncateAtPairingLocked runs so it
 	// fires exactly once per session lifetime. Without this latch, a
 	// stream whose first Cut returns Ok=false (insufficient frames) would
@@ -527,11 +515,21 @@ func (p *Packager) writeSegments(now time.Time, d CutDecision) bool {
 
 // writeVideoSegment serialises one .m4s file and updates window state.
 // Returns true on success.
-func (p *Packager) writeVideoSegment(_ time.Time, frames []VideoFrame) bool {
+//
+// tfdt is wallclock-since-AST × 90 kHz. This anchors the segment's
+// presentation time to wallclock so the DASH live edge math
+// (live_edge = (now − AST) − liveDelay) finds the segment immediately
+// after it's available. The earlier "sequential accumulator" approach
+// (tfdt = sum of previous durs) interacted catastrophically with
+// audio under-emission: when audio frames were missing, audio dur sums
+// fell behind wallclock and the audio MPD timeline drifted >100 s
+// behind video, making playback impossible. Wallclock-based tfdt
+// hides under-emission as small per-segment gaps that players tolerate.
+func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame) bool {
 	p.vSegN++
 	name := fmt.Sprintf("seg_v_%05d.m4s", p.vSegN)
 
-	tfdt := p.videoNextDecodeTicks
+	tfdt := wallclockTicks(now, p.availStart, uint64(VideoTimescale))
 	segDurTicks := computeVideoSegDurTicks(frames)
 
 	data, err := BuildVideoFragment(uint32(p.vSegN), p.videoInit.TrackID, tfdt, frames, p.isHEVC, segDurTicks) //nolint:gosec // segN fits uint32 for the stream's lifetime
@@ -547,20 +545,16 @@ func (p *Packager) writeVideoSegment(_ time.Time, frames []VideoFrame) bool {
 	}
 	p.onDiskV = append(p.onDiskV, name)
 	p.vSegEntries = append(p.vSegEntries, SegmentEntry{StartTicks: tfdt, DurTicks: segDurTicks})
-	// Sequential accumulator: next segment's tfdt = end of this one. The
-	// alternative "tfdt = (now - AST) × 90000" drifts against the dur
-	// sum because per-segment durs aren't exact multiples of wallclock
-	// ms (see the videoNextDecodeTicks field comment).
-	p.videoNextDecodeTicks += segDurTicks
 	return true
 }
 
 // writeAudioSegment is the audio counterpart of writeVideoSegment.
-func (p *Packager) writeAudioSegment(_ time.Time, frames []AudioFrame) bool {
+func (p *Packager) writeAudioSegment(now time.Time, frames []AudioFrame) bool {
 	p.aSegN++
 	name := fmt.Sprintf("seg_a_%05d.m4s", p.aSegN)
 
-	tfdt := p.audioNextDecodeTicks
+	sr := uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0
+	tfdt := wallclockTicks(now, p.availStart, sr)
 	durTicks := uint64(len(frames)) * 1024 // AAC: 1024 samples per frame
 
 	data, err := BuildAudioFragment(uint32(p.aSegN), p.audioInit.TrackID, tfdt, frames) //nolint:gosec // segN fits uint32
@@ -576,8 +570,22 @@ func (p *Packager) writeAudioSegment(_ time.Time, frames []AudioFrame) bool {
 	}
 	p.onDiskA = append(p.onDiskA, name)
 	p.aSegEntries = append(p.aSegEntries, SegmentEntry{StartTicks: tfdt, DurTicks: durTicks})
-	p.audioNextDecodeTicks += durTicks
 	return true
+}
+
+// wallclockTicks returns (now − ast) × timescale, clamping to 0 when
+// ast is unset (the very first segment whose tfdt should be 0). Used
+// by both writeVideoSegment and writeAudioSegment so the two tracks
+// share a wallclock anchor.
+func wallclockTicks(now, ast time.Time, timescale uint64) uint64 {
+	if ast.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(ast).Milliseconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return uint64(elapsed) * timescale / 1000 //nolint:gosec // elapsed positive
 }
 
 // computeVideoSegDurTicks returns the total segment duration in 90 kHz
