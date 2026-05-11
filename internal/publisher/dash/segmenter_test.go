@@ -79,23 +79,25 @@ func TestCut_AtIDRBoundary(t *testing.T) {
 	}
 }
 
-// TestCut_PrefersLatestIDRWithinWindow — when multiple IDRs are queued
-// past segDur, the segmenter cuts at the LATEST IDR to maximise the
-// segment duration up to segDur.
-func TestCut_PrefersLatestIDRWithinWindow(t *testing.T) {
+// TestCut_PrefersFirstIDRPastSegDur — segmenter cuts at the FIRST IDR
+// whose PTS is at least segDur past the queue's first frame. This
+// keeps segment durs ≤ segDur, preventing the overlapping-timeline
+// problem where frame-PTS-span exceeded inter-cut wallclock and the
+// MPD's (t, d) describes overlapping ranges.
+func TestCut_PrefersFirstIDRPastSegDur(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 	// 4 s of video @ 40 ms, GOP=25 → IDRs at 0, 25, 50, 75 (PTS 0, 1000,
-	// 2000, 3000). Cut should land at IDR index 75 (PTS 3000) since it's
-	// the latest IDR within the queue.
+	// 2000, 3000). With segDur=2 s, the first IDR whose PTS ≥ 2000ms
+	// is index 50 (PTS 2000). Cut drains frames 0..50 = 51 frames.
 	fillVideo(q, 100, 40, 25)
 
 	d := s.Cut(time.Now(), q, true, false)
 	if !d.Ok || !d.IsIDRAligned {
 		t.Fatalf("expected IDR cut, got %+v", d)
 	}
-	if d.VideoCount != 76 {
-		t.Errorf("VideoCount = %d, want 76 (drain through index 75)", d.VideoCount)
+	if d.VideoCount != 51 {
+		t.Errorf("VideoCount = %d, want 51 (drain through index 50, first IDR past segDur)", d.VideoCount)
 	}
 }
 

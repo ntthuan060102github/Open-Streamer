@@ -140,14 +140,24 @@ func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedM
 	return CutDecision{}
 }
 
-// findIDRCutPoint searches for the trailing IDR within the segDur
-// window. Returns the index of the LAST IDR in the video queue whose
-// PTSms is at least segDurMS past the first frame's PTSms, or -1 when
-// no IDR satisfies that bound.
+// findIDRCutPoint searches for the FIRST IDR whose PTSms is at least
+// segDurMS past the first frame, returning its index. Returns -1 when
+// no such IDR is queued.
 //
-// Picking the LAST IDR (rather than the first) maximises segment
-// duration up to segDur — short GOPs that have 2-3 IDRs within segDur
-// produce one fragment of segDur, not one fragment per GOP.
+// Picking the FIRST IDR past segDur (rather than the LATEST in queue)
+// keeps each segment ≤ ~segDur in frame-PTS span, which matters
+// because the published segment dur (= frame-PTS span) must NOT exceed
+// the inter-cut wallclock interval — otherwise the MPD's per-segment
+// (t, d) values would describe overlapping ranges and strict players
+// reject the manifest. Production hit this exact problem on HLS-pull
+// sources: V queue accumulated 6+ seconds of frames between cuts (HLS
+// chunks deliver a segment at a time), and the latest-IDR pick
+// produced 6.5 s of frame span for a cut that should have spanned
+// ~5 s wallclock.
+//
+// First-IDR-past-segDur trades latency for correctness: short-GOP
+// sources may produce slightly smaller-than-segDur segments, but the
+// timeline always stays non-overlapping.
 func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 	first, ok := q.FirstVideo()
 	if !ok {
@@ -156,15 +166,22 @@ func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 	if q.VideoSpanMS() < segDurMS {
 		return -1
 	}
-	last := q.LastIDRIndex()
-	if last < 0 {
-		return -1
+	// Scan from oldest to newest; the FIRST IDR whose PTS is >=
+	// first+segDur is the cut point.
+	for i := 1; i < q.VideoLen(); i++ {
+		ptsMS, ok := q.videoPTSAt(i)
+		if !ok {
+			continue
+		}
+		if ptsMS-first.PTSms < segDurMS {
+			continue
+		}
+		// Need an IDR at or past this point. Check if frame i is IDR.
+		if vf, ok := q.videoAt(i); ok && vf.IsIDR {
+			return i
+		}
 	}
-	idrPTS, ok := q.videoPTSAt(last)
-	if !ok || idrPTS-first.PTSms < segDurMS {
-		return -1
-	}
-	return last
+	return -1
 }
 
 // buildCutDecision packages the cut-up-to-frame-N answer.

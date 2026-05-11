@@ -217,6 +217,15 @@ func (q *FrameQueue) videoPTSAt(i int) (uint64, bool) {
 	return q.video[i].PTSms, true
 }
 
+// videoAt returns the video frame at index i (by value, no aliasing
+// into the queue's storage) and a presence flag.
+func (q *FrameQueue) videoAt(i int) (VideoFrame, bool) {
+	if i < 0 || i >= len(q.video) {
+		return VideoFrame{}, false
+	}
+	return q.video[i], true
+}
+
 // audioCountAtOrBefore returns the number of OLDEST audio frames whose
 // PTSms is ≤ thresholdMS. Used by the segmenter to drain the audio
 // frames that share the video segment's time window.
