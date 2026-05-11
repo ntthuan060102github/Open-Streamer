@@ -423,6 +423,33 @@ func (s *Service) record(
 				)
 			}
 
+			// Session boundary: flush the in-progress segment (if any)
+			// so old-session bytes land in their own segment and the
+			// next segment starts cleanly under the new session. Mark
+			// the upcoming segment as discontinuous so the recording
+			// index records the boundary alongside any gaps.
+			//
+			// Previously DVR only segmented on gap detection (timer
+			// firing when no packets arrive for gapDur). Same-input
+			// reconnects that finished within the gap window were
+			// silently glued together, hiding source switches in the
+			// recording. Reading buffer.Packet.SessionStart makes
+			// session breaks first-class — every Normaliser-anchored
+			// session transition produces a clean segment boundary.
+			if pkt.SessionStart {
+				if len(segBuf) > 0 {
+					dur := mediaDur(hasPTS, segWallStart, segStartPTSms, 0)
+					s.flushSegment(ctx, sess, segIdx, segBuf, dur,
+						segWallStart, pendingDiscontinuity, segDir)
+					segBuf = segBuf[:0]
+					segIdx++
+				}
+				avMux = nil
+				hasPTS = false
+				pendingDiscontinuity = true
+				segWallStart = time.Now()
+			}
+
 			var pktPTSms uint64
 			if pkt.AV != nil {
 				pktPTSms = pkt.AV.PTSms

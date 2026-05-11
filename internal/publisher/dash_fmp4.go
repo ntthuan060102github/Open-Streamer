@@ -312,15 +312,17 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 				if !ok {
 					return
 				}
-				// Session boundary: reset the demuxer-side carry so a
-				// future source switch can't mix half-formed TS packets
-				// from the old session into the new one. The DASH
-				// packager's per-track anchors (videoNextDecode,
-				// audioNextDecode, init segment) survive the boundary —
-				// the Normaliser-anchored PTS coming in stays monotonic,
-				// and the packager's drift cap handles the steady state.
+				// Session boundary: drop the demuxer-side carry AND
+				// reset every per-track timeline anchor so the new
+				// session's first DTS becomes the fresh origin. See
+				// resetTimelineOnSessionBoundary for the full state
+				// inventory and rationale. Segment counters + sliding
+				// window + init segments are deliberately preserved so
+				// the MPD timeline stays continuous and the player
+				// keeps fetching the next $Number$ across the boundary.
 				if pkt.SessionStart {
 					tsCarry = nil
+					p.resetTimelineOnSessionBoundary()
 				}
 				// Direct AV path: route past the TS round-trip.
 				if pkt.AV != nil && len(pkt.AV.Data) > 0 {
@@ -916,6 +918,68 @@ func (p *dashFMP4Packager) seedAudioNextDecodeLocked(firstFrameDTSms uint64) {
 	}
 	p.audioNextDecode = scaleOffset(firstFrameDTSms, p.originDTSms, uint64(p.audioSR))
 	p.audioFirstDTSmsSet = true
+}
+
+// resetTimelineOnSessionBoundary is invoked when a buffer.Packet with
+// SessionStart=true reaches the reader loop. It clears every piece of
+// per-track decode-timeline state so the new session's first DTS becomes
+// the fresh origin and the per-track tfdt anchors re-seed cleanly.
+//
+// Without this, the packager keeps the previous session's `originDTSms`,
+// `videoNextDecode`, `audioNextDecode`, etc., so when the upstream
+// reconnects (or failover swaps inputs) the new source's PTS is compared
+// against a stale anchor — `tfdt` math races ahead of (or behind)
+// wallclock, the player's live-edge calculation lands outside the
+// available segments, and playback stalls. That was the residual
+// "DASH lệch + đứng hình" symptom after Phase 3's initial commit.
+//
+// What is kept across the boundary (per design doc §4.6):
+//   - Segment counters `vSegN` / `aSegN` so the MPD `$Number$` template
+//     keeps advancing — the player keeps fetching the next segment
+//     URL without needing to seek backwards.
+//   - Sliding-window state (`onDiskV` / `onDiskA` / `vSegDurs` etc.) and
+//     `availabilityStart` so the MPD's `availabilityStartTime` and
+//     SegmentTimeline stay continuous.
+//   - Init segments + codec metadata. Init rebuild on a codec change is
+//     a follow-up scope; right now the buffer-hub SetSession call site
+//     passes nil Video/Audio configs, so the packager has no way to
+//     detect codec deltas at boundary time. Reconnect / failover
+//     scenarios with the same codec — the common case — work fine
+//     because the existing init segments stay valid.
+//
+// What is reset:
+//   - Queued AVPacket batches (vAnnex/vDTS/vPTS, aRaw/aPTS) — drop a
+//     few ms of old-session data rather than ship it under the new
+//     session's anchor and produce a mixed segment.
+//   - `segmentStart` so the next packet starts a fresh wallclock window.
+//   - `originDTSms` / `originDTSmsSet` so the new session's first DTS
+//     anchors the shared cross-track origin.
+//   - `videoFirstDTSmsSet` / `audioFirstDTSmsSet` so seedVideo /
+//     seedAudio re-seed per-track tfdt from the new origin.
+//   - `videoNextDecode` / `audioNextDecode` — cleared so seedXxx writes
+//     fresh values rather than accumulating onto the old session's tick.
+//   - `videoSkipUntilIDR` latch — a session boundary supersedes any
+//     mid-stream drift-cap latch; the new session re-establishes its
+//     own anchor at the next IDR.
+func (p *dashFMP4Packager) resetTimelineOnSessionBoundary() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.vAnnex = p.vAnnex[:0]
+	p.vDTS = p.vDTS[:0]
+	p.vPTS = p.vPTS[:0]
+	p.aRaw = p.aRaw[:0]
+	p.aPTS = p.aPTS[:0]
+
+	p.segmentStart = time.Time{}
+
+	p.originDTSms = 0
+	p.originDTSmsSet = false
+	p.videoFirstDTSmsSet = false
+	p.audioFirstDTSmsSet = false
+	p.videoNextDecode = 0
+	p.audioNextDecode = 0
+	p.videoSkipUntilIDR = false
 }
 
 // scaleOffset returns (firstDTSms - originDTSms) converted into `timescale`
