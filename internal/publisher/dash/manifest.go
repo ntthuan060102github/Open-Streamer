@@ -237,24 +237,35 @@ func buildAudioAdaptationSet(t *TrackManifest) *mpdAdaptationSet {
 	}
 }
 
-// buildSegTimeline emits the SegmentTimeline child. Only the FIRST
-// segment carries an explicit `<S t="...">`; the rest use only `d="..."`
-// (the player accumulates from t).
+// buildSegTimeline emits the SegmentTimeline child with an EXPLICIT
+// `t=` on every entry.
+//
+// The DASH spec allows omitting `t=` on entries after the first — the
+// player then accumulates `prev_t + prev_d` for each subsequent segment,
+// implying a contiguous timeline. That's correct when per-segment durs
+// exactly sum to the inter-write wallclock delta. With wallclock-based
+// tfdt and sample-count-based durs (the AAC 1024-sample frame rule),
+// the actual segment files can carry a tfdt that's AHEAD of the
+// implied-cumulative value — e.g. an under-emitting audio track writes
+// 0.5 s of content every 2 s of wallclock, leaving a 1.5 s gap between
+// the segment-file tfdt and the next segment's start.
+//
+// Without explicit `t=`, the player's view of where each segment lives
+// diverges from the segment file's actual tfdt. Players that strictly
+// validate this (dashjs in some modes, Shaka) refuse to play. Emitting
+// explicit `t=` keeps the MPD's view of each segment's start exactly
+// equal to the segment file's tfdt.
 func buildSegTimeline(segs []SegmentEntry) *mpdSegTimeline {
 	if len(segs) == 0 {
 		return nil
 	}
 	tl := &mpdSegTimeline{S: make([]mpdSTimeline, 0, len(segs))}
-	for i, s := range segs {
+	for _, s := range segs {
 		if s.DurTicks == 0 {
 			continue
 		}
-		entry := mpdSTimeline{D: s.DurTicks}
-		if i == 0 {
-			t := s.StartTicks
-			entry.T = &t
-		}
-		tl.S = append(tl.S, entry)
+		t := s.StartTicks
+		tl.S = append(tl.S, mpdSTimeline{T: &t, D: s.DurTicks})
 	}
 	return tl
 }

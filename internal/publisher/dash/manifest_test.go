@@ -66,8 +66,11 @@ func TestBuildManifest_ContainsVideoAndAudio(t *testing.T) {
 	}
 }
 
-// TestBuildManifest_SegmentTimelineHasExplicitT — only the FIRST <S>
-// entry carries `t=`; subsequent entries are duration-only.
+// TestBuildManifest_SegmentTimelineHasExplicitT — every <S> entry has
+// an explicit `t=`. We emit it on every segment so that the MPD's view
+// of each segment's start exactly matches the segment file's tfdt —
+// the inferred-cumulative form would drift away from wallclock-based
+// tfdt anchoring when per-segment durs don't fill the inter-write gap.
 func TestBuildManifest_SegmentTimelineHasExplicitT(t *testing.T) {
 	in := sampleManifestInput()
 	data, err := BuildManifest(in)
@@ -75,7 +78,6 @@ func TestBuildManifest_SegmentTimelineHasExplicitT(t *testing.T) {
 		t.Fatalf("BuildManifest: %v", err)
 	}
 
-	// Parse the XML back and inspect the structure.
 	var parsed mpdRoot
 	if err := xml.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
@@ -86,20 +88,13 @@ func TestBuildManifest_SegmentTimelineHasExplicitT(t *testing.T) {
 	for _, as := range parsed.Periods[0].AdaptationSets {
 		for _, rep := range as.Representations {
 			tl := rep.SegmentTemplate.Timeline
-			if tl == nil {
-				t.Errorf("%s: missing SegmentTimeline", rep.ID)
+			if tl == nil || len(tl.S) == 0 {
+				t.Errorf("%s: missing/empty SegmentTimeline", rep.ID)
 				continue
 			}
-			if len(tl.S) == 0 {
-				t.Errorf("%s: empty SegmentTimeline", rep.ID)
-				continue
-			}
-			if tl.S[0].T == nil {
-				t.Errorf("%s: first <S> missing t attr", rep.ID)
-			}
-			for i, s := range tl.S[1:] {
-				if s.T != nil {
-					t.Errorf("%s: <S>[%d] should NOT have t attr (implied)", rep.ID, i+1)
+			for i, s := range tl.S {
+				if s.T == nil {
+					t.Errorf("%s: <S>[%d] missing t attr (every segment must carry explicit t=)", rep.ID, i)
 				}
 			}
 		}
