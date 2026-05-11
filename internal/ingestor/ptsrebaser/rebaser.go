@@ -31,6 +31,7 @@
 package ptsrebaser
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -59,7 +60,20 @@ type Config struct {
 	// the segment timeline race indefinitely ahead of publishTime and
 	// breaking downstream HLS / DASH liveness math.
 	MaxAheadMs int64
+
+	// StreamCode is observability-only — included as a log field on
+	// re-anchor events so operators can correlate Discontinuity bursts
+	// with the affected stream without having to inspect call stacks.
+	// Optional: empty string is acceptable and just drops the field.
+	StreamCode domain.StreamCode
 }
+
+// reanchorLogEveryN throttles the re-anchor warn log. The first event
+// per (track, reason) always logs; subsequent events log once every N.
+// 100 keeps a sustained ~5 re-anchor/s pathology (as seen on test3)
+// down to one log entry every ~20s — enough cadence to diagnose, low
+// enough not to drown the log.
+const reanchorLogEveryN = 100
 
 // DefaultConfig returns the recommended steady-state settings. MaxAheadMs
 // is intentionally left at 0 (disabled): the drop semantics create a stuck
@@ -125,6 +139,12 @@ type trackState struct {
 	inputOrigin   int64
 	outputAnchor  int64
 	lastOutputDts int64
+
+	// Per-(track, reason) re-anchor counters drive the log throttle in
+	// Apply. Cumulative across the rebaser lifetime; reset along with
+	// the rest of the track state in Reset / on a fresh New.
+	reanchorsDrift      int64
+	reanchorsRegression int64
 }
 
 // Rebaser is per-stream PTS anchor state. Safe for concurrent Apply
@@ -247,17 +267,13 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) bool {
 	//     floor (downstream dur math is uint64 — never let it
 	//     underflow, no matter what the input did).
 	if absInt64(drift) > r.cfg.JumpThresholdMs || expectedDts < track.lastOutputDts {
-		target := actualNowMs
-		if target <= track.lastOutputDts {
-			// Wallclock too close to (or behind) last emitted; nudge
-			// forward by 1 ms to preserve strict monotonicity.
-			target = track.lastOutputDts + 1
-		}
-		track.inputOrigin = inDts
-		track.outputAnchor = target
-		track.lastOutputDts = target
-		assignTimes(p, target, cto)
-		p.Discontinuity = true
+		r.reanchorLocked(track, tk, p, reanchorInputs{
+			inDts:       inDts,
+			expectedDts: expectedDts,
+			actualNowMs: actualNowMs,
+			drift:       drift,
+			cto:         cto,
+		})
 		return true
 	}
 
@@ -301,6 +317,68 @@ func (r *Rebaser) seedTrackLocked(
 	track.outputAnchor = anchor
 	track.lastOutputDts = anchor
 	assignTimes(p, anchor, cto)
+}
+
+// reanchorInputs bundles the read-only values reanchorLocked needs.
+// Kept as a struct so Apply doesn't blow past the parameter-count lint
+// when it hands them across.
+type reanchorInputs struct {
+	inDts       int64
+	expectedDts int64
+	actualNowMs int64
+	drift       int64
+	cto         int64
+}
+
+// reanchorLocked applies the monotonic-floor target, bumps the per-
+// reason re-anchor counter, throttle-logs, and rewrites the packet.
+// Extracted from Apply purely to keep Apply's cognitive complexity
+// within budget — semantics live inline at the call site, this is
+// the body that used to live inside the `if absInt64(drift) > …` block.
+//
+// Caller must hold r.mu.
+func (r *Rebaser) reanchorLocked(track *trackState, tk trackKey, p *domain.AVPacket, in reanchorInputs) {
+	target := in.actualNowMs
+	if target <= track.lastOutputDts {
+		// Wallclock too close to (or behind) last emitted; nudge
+		// forward by 1 ms to preserve strict monotonicity.
+		target = track.lastOutputDts + 1
+	}
+	reason := "drift"
+	count := &track.reanchorsDrift
+	if in.expectedDts < track.lastOutputDts {
+		reason = "regression"
+		count = &track.reanchorsRegression
+	}
+	*count++
+	if *count == 1 || *count%reanchorLogEveryN == 0 {
+		slog.Warn("ptsrebaser: hard re-anchor — flagging Discontinuity",
+			"stream_code", string(r.cfg.StreamCode),
+			"track", trackKeyName(tk),
+			"reason", reason,
+			"count", *count,
+			"in_dts_ms", in.inDts,
+			"expected_dts_ms", in.expectedDts,
+			"actual_now_ms", in.actualNowMs,
+			"drift_ms", in.drift,
+			"last_output_dts_ms", track.lastOutputDts,
+			"target_ms", target,
+			"jump_threshold_ms", r.cfg.JumpThresholdMs,
+		)
+	}
+	track.inputOrigin = in.inDts
+	track.outputAnchor = target
+	track.lastOutputDts = target
+	assignTimes(p, target, in.cto)
+	p.Discontinuity = true
+}
+
+// trackKeyName returns the slog-friendly track label.
+func trackKeyName(tk trackKey) string {
+	if tk == trackVideo {
+		return "video"
+	}
+	return "audio"
 }
 
 // trackKeyFor maps AVCodec to its V / A slot. Returns ok=false for

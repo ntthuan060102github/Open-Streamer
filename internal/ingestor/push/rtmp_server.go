@@ -264,6 +264,8 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 	}
 
 	cb := s.callbacksFor(streamID)
+	rebaserCfg := s.rebaserCfg
+	rebaserCfg.StreamCode = streamID
 	state := &pubState{
 		key:           key,
 		bufferWriteID: bufWriteID,
@@ -271,7 +273,7 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 		buf:           buf,
 		cb:            cb,
 		converter:     pull.NewRTMPMsgConverter(),
-		rebaser:       ptsrebaser.New(s.rebaserCfg),
+		rebaser:       ptsrebaser.New(rebaserCfg),
 		firstPacket:   true,
 	}
 	session.SetPubSessionObserver(state)
