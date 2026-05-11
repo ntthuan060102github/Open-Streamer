@@ -551,12 +551,19 @@ func (p *dashFMP4Packager) shouldSkipVideoLocked(frame []byte, dts uint64) bool 
 	p.vDTS = p.vDTS[:0]
 	p.vPTS = p.vPTS[:0]
 	p.logDriftCapLocked("video", &p.videoDriftSkipCount, projectedEnd, elapsedTicks, dashVideoTimescale, isIDR)
+	// Re-anchor videoNextDecode to wallclock so emitted tfdt no longer
+	// advertises future content. Unconditional — mirrors the audio
+	// drift cap which always re-anchors. The IDR-only gate this used
+	// to have created a per-stream startup pathology: audio cap would
+	// re-anchor audioNextDecode immediately while video cap waited
+	// for the next IDR (2-4 s away on typical sources). audioNextDecode
+	// raced ahead, videoNextDecode stayed at the preserved-skew seed,
+	// and the divergence baked permanently into every subsequent tfdt
+	// — measured as +2.85 s audio-trails-video on bac_ninh.
+	if elapsedTicks > p.videoNextDecode {
+		p.videoNextDecode = elapsedTicks
+	}
 	if isIDR {
-		// Re-anchor videoNextDecode to wallclock so emitted tfdt no
-		// longer advertises future content.
-		if elapsedTicks > p.videoNextDecode {
-			p.videoNextDecode = elapsedTicks
-		}
 		return false
 	}
 	p.videoSkipUntilIDR = true
@@ -1079,37 +1086,37 @@ func (p *dashFMP4Packager) decideOriginLocked(now time.Time) {
 		firstV := p.vDTS[0]
 		firstA := p.aPTS[0]
 		delta := int64(firstV) - int64(firstA) //nolint:gosec // bounded by upstream timebase
-		switch {
-		case delta > dashSeedDelayAlignCapMs:
-			// Video late by > cap → audio's leading frames are the
-			// source's pathological pre-roll; discard them.
+		// Always delay-align — origin = max(firstV, firstA). The earlier
+		// "preserve natural pre-roll" branch for |delta| < cap let small
+		// upstream skew (e.g. FFmpeg-output AAC encoder pre-roll of
+		// ~100ms on bac_ninh's per-profile transcode) bake into the
+		// seed, then the asymmetric drift-cap re-anchor (audio
+		// unconditional, video IDR-only) compounded it over startup
+		// firings into multi-second tfdt divergence — observed
+		// empirically as the +2.85s audio-trails-video DASH measurement
+		// on bac_ninh and its republishers. Collapsing to delay-align
+		// for ALL skew loses up to ~50ms of one track's pre-roll
+		// (imperceptible to the player) but eliminates the divergence
+		// path.
+		if firstV >= firstA {
 			p.originDTSms = firstV
-			p.discardAudioBeforeLocked(firstV)
-			p.audioSkipUntilDTS = firstV
-			slog.Warn("publisher: DASH delay-align — audio queue truncated to V origin",
-				"stream_code", p.streamID,
-				"first_video_dts_ms", firstV,
-				"first_audio_dts_ms", firstA,
-				"skew_ms", delta,
-			)
-		case delta < -dashSeedDelayAlignCapMs:
-			// Audio late by > cap → symmetric.
+			if firstA < firstV {
+				p.discardAudioBeforeLocked(firstV)
+				p.audioSkipUntilDTS = firstV
+			}
+		} else {
 			p.originDTSms = firstA
 			p.discardVideoBeforeLocked(firstA)
 			p.videoSkipUntilDTS = firstA
-			slog.Warn("publisher: DASH delay-align — video queue truncated to A origin",
+		}
+		if delta != 0 {
+			slog.Warn("publisher: DASH delay-align — early track truncated to shared origin",
 				"stream_code", p.streamID,
 				"first_video_dts_ms", firstV,
 				"first_audio_dts_ms", firstA,
 				"skew_ms", delta,
+				"chosen_origin_ms", p.originDTSms,
 			)
-		default:
-			// Within cap: preserve natural pre-roll. Origin = the
-			// EARLIER of the two firsts so neither seed wraps below 0.
-			p.originDTSms = firstV
-			if firstA < firstV {
-				p.originDTSms = firstA
-			}
 		}
 	case hasV:
 		p.originDTSms = p.vDTS[0]

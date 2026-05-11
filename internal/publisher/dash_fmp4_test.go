@@ -152,11 +152,13 @@ func TestSeedersPreserveAudioVideoOffset(t *testing.T) {
 		"video starts 100ms past origin → 9000 ticks at 90 kHz")
 }
 
-// Small (sub-cap) inter-track skew: origin = min(firstV, firstA), both
-// seeds get the natural pre-roll preserved. This is the previous
-// behaviour for any legitimate pre-roll under dashSeedDelayAlignCapMs
-// (AAC encoder delay, RTSP audio leading video by 100 ms, …).
-func TestDecideOriginLocked_SmallSkewPreservesOrigin(t *testing.T) {
+// Small inter-track skew: delay-align still fires (origin = max). The
+// old preserve-pre-roll branch let small upstream skew bake into the
+// seed, then the asymmetric drift-cap re-anchor compounded it over
+// startup into multi-second tfdt divergence (the +2.85 s bac_ninh
+// measurement). Always-align loses up to ~50 ms of one track's
+// pre-roll (imperceptible) but eliminates the divergence path.
+func TestDecideOriginLocked_SmallSkewStillDelayAligns(t *testing.T) {
 	t.Parallel()
 	p := &dashFMP4Packager{packAudio: true}
 
@@ -169,12 +171,13 @@ func TestDecideOriginLocked_SmallSkewPreservesOrigin(t *testing.T) {
 
 	p.decideOriginLocked(time.Now())
 	require.True(t, p.originDTSmsSet)
-	require.Equal(t, uint64(5000), p.originDTSms,
-		"100 ms skew is within cap → preserve, origin = min(firstV, firstA)")
-	require.Len(t, p.aPTS, 1, "no audio discarded for sub-cap skew")
-	require.Len(t, p.vDTS, 1, "no video discarded for sub-cap skew")
-	require.Equal(t, uint64(0), p.audioSkipUntilDTS)
-	require.Equal(t, uint64(0), p.videoSkipUntilDTS)
+	require.Equal(t, uint64(5100), p.originDTSms,
+		"origin = max(firstV, firstA) even for sub-cap skew")
+	require.Empty(t, p.aPTS, "audio frames predating new origin must be discarded")
+	require.Equal(t, uint64(5100), p.audioSkipUntilDTS,
+		"audioSkipUntilDTS must hold so straggling audio drops until upstream catches up")
+	require.Equal(t, uint64(0), p.videoSkipUntilDTS,
+		"video is the LATE track — no skip threshold needed")
 }
 
 // Big inter-track skew with audio leading: video late by 30 s. Delay-
@@ -669,6 +672,33 @@ func TestShouldSkipVideoLocked_EngagesLatchOnDriftAndDropsNonIDR(t *testing.T) {
 	require.True(t, p.videoSkipUntilIDR, "latch must engage")
 	// Subsequent non-IDR also drops while latched.
 	require.True(t, p.shouldSkipVideoLocked(nonKey, 0))
+}
+
+// Non-IDR cap firing must STILL re-anchor videoNextDecode forward to
+// wallclock — mirrors the audio drift cap which has always re-anchored
+// unconditionally. The IDR-only gate this used to have meant audio's
+// tfdt raced to wallclock at startup while video's tfdt sat at the
+// preserved-skew seed until the next IDR (2-4 s away on typical
+// sources), and the divergence then baked permanently into every
+// emitted segment — the +2.85 s a-v skew measured empirically on
+// bac_ninh.
+func TestShouldSkipVideoLocked_NonIDRCapAlsoReanchorsToWallclock(t *testing.T) {
+	t.Parallel()
+	p := &dashFMP4Packager{streamDir: t.TempDir(), segSec: 4}
+	p.availabilityStart = time.Now().Add(-10 * time.Second) // 10 s elapsed
+	// videoNextDecode at 1 s — well behind wallclock; drift threshold is
+	// elapsed (10 s) + segSec (4 s) = 14 s; projectedEnd must exceed it.
+	// We use a hugely-ahead videoNextDecode of 20 s to force the cap.
+	p.videoNextDecode = 20 * dashVideoTimescale
+
+	nonKey := []byte{0x00, 0x00, 0x00, 0x01, 0x41, 0x88, 0x80}
+	require.True(t, p.shouldSkipVideoLocked(nonKey, 0),
+		"non-IDR past drift threshold must engage latch + drop")
+	require.True(t, p.videoSkipUntilIDR, "latch must engage")
+	// videoNextDecode must have been re-anchored to wallclock — that's
+	// the whole point of this fix.
+	require.GreaterOrEqual(t, p.videoNextDecode, uint64(10*dashVideoTimescale),
+		"non-IDR cap firing must re-anchor videoNextDecode forward to wallclock")
 }
 
 func TestShouldSkipVideoLocked_IDRClearsLatchAndReanchorsToWallclock(t *testing.T) {
