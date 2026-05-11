@@ -287,7 +287,17 @@ func (s *Service) runOnce(
 	_ = stdin.Close()
 	stdinWG.Wait()
 
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+	waitErr := cmd.Wait()
+	// ctx cancellation is the ONLY graceful-shutdown signal. If ctx was
+	// cancelled, treat any wait outcome (error from SIGKILL, or clean
+	// exit if the process happened to finish first) as expected — return
+	// crashed=false so the worker loop exits. The waitErr (likely an
+	// "signal: killed" from exec.CommandContext's SIGKILL) is intentionally
+	// swallowed: the cancellation is the cause, not a real failure.
+	if ctx.Err() != nil {
+		return false, nil //nolint:nilerr // waitErr is the consequence of ctx-cancel, not an independent fault
+	}
+	if waitErr != nil {
 		// Enrich the otherwise-opaque exit-status error with the last few
 		// warn-level stderr lines — they carry the actual cause (filter not
 		// found, codec init failure, encoder rejected option, …) that turns
@@ -296,15 +306,35 @@ func (s *Service) runOnce(
 		slog.Error("transcoder: ffmpeg exited with error",
 			"stream_code", logStream,
 			"profile", track,
-			"err", err,
+			"err", waitErr,
 			"stderr_tail", stderrCtx,
 		)
 		if stderrCtx != "" {
-			return true, fmt.Errorf("ffmpeg exit: %w; stderr: %s", err, stderrCtx)
+			return true, fmt.Errorf("ffmpeg exit: %w; stderr: %s", waitErr, stderrCtx)
 		}
-		return true, fmt.Errorf("ffmpeg exit: %w", err)
+		return true, fmt.Errorf("ffmpeg exit: %w", waitErr)
 	}
-	return false, nil
+	// Exit code 0 with worker ctx still alive: FFmpeg quit on its own
+	// (typically stdin reached EOF because the raw-ingest subscriber
+	// chan was closed by a buffer churn, or the input stalled long
+	// enough that the OS pipe writer goroutine returned). The worker
+	// MUST restart — leaving here with crashed=false silently retires
+	// the transcoder for the rest of the stream's lifetime even though
+	// ingest resumes. Field-reproduced on bac_ninh after an HLS-pull
+	// source briefly 404'd and was redirected to a new URL: ingestor
+	// recovered, but the FFmpeg child had already exited code 0 during
+	// the stall, and the loop's `if !crashed { return }` orphaned the
+	// rendition buffer — every downstream consumer froze indefinitely.
+	stderrCtx := formatStderrTail(tail.snapshot())
+	slog.Warn("transcoder: ffmpeg exited code 0 while worker context is alive — treating as crash so the loop restarts",
+		"stream_code", logStream,
+		"profile", track,
+		"stderr_tail", stderrCtx,
+	)
+	if stderrCtx != "" {
+		return true, fmt.Errorf("ffmpeg exited cleanly without cancellation; stderr: %s", stderrCtx)
+	}
+	return true, fmt.Errorf("ffmpeg exited cleanly without cancellation")
 }
 
 func minDuration(a, b time.Duration) time.Duration {
