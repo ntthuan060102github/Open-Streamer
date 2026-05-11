@@ -295,9 +295,19 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 	}
 }
 
-// handleAAC enqueues an AAC frame and tries to build the audio init
-// segment from the ADTS header on the first frame.
+// handleAAC enqueues AAC access units and tries to build the audio
+// init segment from the first ADTS header observed.
+//
+// Bundled-PES splitting: a single AAC PES from gomedia's TSDemuxer
+// (raw-TS path) or from a buffer.Packet carrying a multi-frame ADTS
+// payload (AV path under bursty source pacing) commonly contains
+// 4–8 access units. splitADTSBundle splits them and assigns
+// per-frame PTS — see splitADTSBundle's docstring for why.
 func (p *Packager) handleAAC(av *domain.AVPacket) {
+	frames := splitADTSBundle(av.Data, av.PTSms)
+	if len(frames) == 0 {
+		return
+	}
 	if p.audioInit == nil {
 		if hdr := parseADTS(av.Data); hdr != nil {
 			ai, err := BuildAACInit(hdr)
@@ -311,10 +321,9 @@ func (p *Packager) handleAAC(av *domain.AVPacket) {
 			}
 		}
 	}
-	p.queue.PushAudio(AudioFrame{
-		Raw:   stripADTSHeader(av.Data),
-		PTSms: av.PTSms,
-	})
+	for _, f := range frames {
+		p.queue.PushAudio(f)
+	}
 	if p.audioInit != nil {
 		p.state.OpenPairingWindow(time.Now())
 	}
@@ -794,22 +803,57 @@ func parseADTS(frame []byte) *aac.ADTSHeader {
 	return hdr
 }
 
-// stripADTSHeader returns frame with the leading ADTS header removed.
-// AAC inside MP4 must not carry ADTS headers (those are an MPEG-TS
-// transport convention; mp4 uses sample size + ESDS for the same info).
+// splitADTSBundle iterates concatenated ADTS frames in `data` and
+// returns one AudioFrame per AAC access unit found, with each frame's
+// raw payload (ADTS header stripped) and PTS = basePTSms + frameIdx ×
+// 1024 × 1000 / sampleRate (integer ms).
 //
-// When the input doesn't start with a valid ADTS header (e.g. the
-// ingestor stripped it upstream already), returns frame unchanged.
-func stripADTSHeader(frame []byte) []byte {
-	hdr, _, err := aac.DecodeADTSHeader(bytes.NewReader(frame))
+// gomedia's TSDemuxer hands the packager a complete PES payload via
+// onTSFrame, and a single AAC PES typically carries 4–8 concatenated
+// ADTS frames (encoders bundle for transmit efficiency — at 48 kHz, 8
+// frames is ~170 ms of audio per delivery). The DASH writer assigns a
+// fixed 1024-sample duration per AudioFrame ([writeAudioSegment]'s
+// `len(frames) * 1024`), so treating one bundled PES as a single
+// AudioFrame under-declares segment dur by the bundling factor — the
+// MPD's audio `<S d=…>` ends up 4–8× too small, audio falls behind
+// video on the live edge, and players that strictly enforce
+// sample-count continuity stall.
+//
+// When the data has no ADTS header at offset 0 (defensive: pure raw
+// AAC delivered via a path that pre-strips headers), returns a single
+// AudioFrame carrying the data unchanged at basePTSms.
+func splitADTSBundle(data []byte, basePTSms uint64) []AudioFrame {
+	if len(data) == 0 {
+		return nil
+	}
+	hdr, _, err := aac.DecodeADTSHeader(bytes.NewReader(data))
 	if err != nil || hdr == nil {
-		return cloneBytes(frame)
+		return []AudioFrame{{Raw: cloneBytes(data), PTSms: basePTSms}}
 	}
-	hs := int(hdr.HeaderLength)
-	if hs <= 0 || hs >= len(frame) {
-		return cloneBytes(frame)
+	sampleRate := int(hdr.Frequency())
+	out := make([]AudioFrame, 0, 8)
+	pos := 0
+	frameIdx := 0
+	for pos < len(data) {
+		h, _, perr := aac.DecodeADTSHeader(bytes.NewReader(data[pos:]))
+		if perr != nil || h == nil {
+			break // garbage in the bundle tail — stop rather than mis-emit
+		}
+		hLen := int(h.HeaderLength)
+		pLen := int(h.PayloadLength)
+		if hLen <= 0 || pLen <= 0 || pos+hLen+pLen > len(data) {
+			break
+		}
+		raw := cloneBytes(data[pos+hLen : pos+hLen+pLen])
+		var ptsOffset uint64
+		if sampleRate > 0 {
+			ptsOffset = uint64(frameIdx) * 1024 * 1000 / uint64(sampleRate) //nolint:gosec // frameIdx bounded by bundle size
+		}
+		out = append(out, AudioFrame{Raw: raw, PTSms: basePTSms + ptsOffset})
+		pos += hLen + pLen
+		frameIdx++
 	}
-	return cloneBytes(frame[hs:])
+	return out
 }
 
 // firstTrack returns &tracks[0] or nil when empty.

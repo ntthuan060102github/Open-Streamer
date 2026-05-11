@@ -1,6 +1,7 @@
 package dash
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -398,6 +399,84 @@ func TestPackager_ABRMode_NotifiesMaster(t *testing.T) {
 	waitForFile(t, rootMPD, 2*time.Second)
 	cancel()
 	<-doneCh
+}
+
+// TestSplitADTSBundle exercises the bundled-PES splitter that turns
+// gomedia's multi-frame AAC PES into individual AudioFrames. The bug
+// the splitter fixes: writeAudioSegment declares each AudioFrame as
+// exactly 1024 samples in segment dur math (`len(frames) * 1024`), so
+// emitting a bundled PES as a single AudioFrame collapses sample-count
+// by the bundling factor — the MPD then advertises ~1.2 s of audio
+// per 5 s wallclock interval (~20 % of expected) and the audio
+// timeline lags wallclock indefinitely.
+func TestSplitADTSBundle(t *testing.T) {
+	// testADTSFrame: ADTS header (7B) + 1-byte payload (0xAA).
+	// Sample rate idx encodes 48000 Hz → per-frame ms offset = 1024 * 1000 / 48000 = 21.
+	const expectedPTSStepMS = 21
+
+	t.Run("empty_input_returns_nil", func(t *testing.T) {
+		if got := splitADTSBundle(nil, 0); got != nil {
+			t.Errorf("expected nil for empty input, got %v", got)
+		}
+	})
+
+	t.Run("single_frame_returns_one_AudioFrame", func(t *testing.T) {
+		got := splitADTSBundle(testADTSFrame, 1000)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 frame, got %d", len(got))
+		}
+		if got[0].PTSms != 1000 {
+			t.Errorf("PTSms = %d, want 1000", got[0].PTSms)
+		}
+		if !bytes.Equal(got[0].Raw, []byte{0xAA}) {
+			t.Errorf("Raw = %x, want [aa]", got[0].Raw)
+		}
+	})
+
+	t.Run("bundle_of_three_frames_splits_with_monotonic_PTS", func(t *testing.T) {
+		bundle := bytes.Repeat(testADTSFrame, 3)
+		got := splitADTSBundle(bundle, 1000)
+		if len(got) != 3 {
+			t.Fatalf("expected 3 frames, got %d (%+v)", len(got), got)
+		}
+		for i, f := range got {
+			wantPTS := uint64(1000 + i*expectedPTSStepMS) //nolint:gosec
+			if f.PTSms != wantPTS {
+				t.Errorf("frame[%d].PTSms = %d, want %d", i, f.PTSms, wantPTS)
+			}
+			if !bytes.Equal(f.Raw, []byte{0xAA}) {
+				t.Errorf("frame[%d].Raw = %x, want [aa]", i, f.Raw)
+			}
+		}
+	})
+
+	t.Run("garbage_tail_stops_at_parse_error", func(t *testing.T) {
+		// One valid ADTS frame followed by 3 bytes that don't parse as ADTS.
+		bundle := append(append([]byte{}, testADTSFrame...), 0x00, 0x00, 0x00)
+		got := splitADTSBundle(bundle, 1000)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 frame (garbage tail discarded), got %d", len(got))
+		}
+		if got[0].PTSms != 1000 {
+			t.Errorf("PTSms = %d, want 1000", got[0].PTSms)
+		}
+	})
+
+	t.Run("no_ADTS_header_falls_back_to_single_raw_frame", func(t *testing.T) {
+		// Raw AAC payload with no sync word — defensive fallback for paths
+		// that pre-strip ADTS upstream.
+		raw := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+		got := splitADTSBundle(raw, 500)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 frame on no-ADTS fallback, got %d", len(got))
+		}
+		if got[0].PTSms != 500 {
+			t.Errorf("PTSms = %d, want 500", got[0].PTSms)
+		}
+		if !bytes.Equal(got[0].Raw, raw) {
+			t.Errorf("Raw = %x, want %x (data passed through unchanged)", got[0].Raw, raw)
+		}
+	})
 }
 
 // TestPackager_BehindPrevSegEnd — the timeline-pace gate. Verifies the
