@@ -400,6 +400,116 @@ func TestPackager_ABRMode_NotifiesMaster(t *testing.T) {
 	<-doneCh
 }
 
+// TestPackager_BehindPrevSegEnd — the timeline-pace gate. Verifies the
+// helper that holds emit until wallclock catches up to the previous
+// segment's end. Manipulates Packager state directly so each case is
+// hermetic; integration with tryCut is covered by the run-loop tests.
+func TestPackager_BehindPrevSegEnd(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("availStart_zero_returns_false", func(t *testing.T) {
+		p := &Packager{}
+		if p.behindPrevSegEnd(t0) {
+			t.Error("expected false when availStart is zero")
+		}
+	})
+
+	t.Run("no_entries_returns_false", func(t *testing.T) {
+		p := &Packager{availStart: t0}
+		if p.behindPrevSegEnd(t0.Add(time.Second)) {
+			t.Error("expected false with no segment entries")
+		}
+	})
+
+	t.Run("video_now_before_prev_end_returns_true", func(t *testing.T) {
+		// Prev video seg: t=0, d=6s @ 90 kHz → end at 6s after AST.
+		p := &Packager{
+			availStart:  t0,
+			vSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 6 * uint64(VideoTimescale)}},
+		}
+		// Now = AST + 1s → 1s < 6s → hold.
+		if !p.behindPrevSegEnd(t0.Add(1 * time.Second)) {
+			t.Error("expected true when now is before prev seg end")
+		}
+	})
+
+	t.Run("video_now_at_prev_end_returns_false", func(t *testing.T) {
+		p := &Packager{
+			availStart:  t0,
+			vSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 6 * uint64(VideoTimescale)}},
+		}
+		// Now = AST + 6s → equal → not strictly less → proceed.
+		if p.behindPrevSegEnd(t0.Add(6 * time.Second)) {
+			t.Error("expected false when now equals prev seg end")
+		}
+	})
+
+	t.Run("video_now_after_prev_end_returns_false", func(t *testing.T) {
+		p := &Packager{
+			availStart:  t0,
+			vSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 6 * uint64(VideoTimescale)}},
+		}
+		if p.behindPrevSegEnd(t0.Add(7 * time.Second)) {
+			t.Error("expected false when now is past prev seg end")
+		}
+	})
+
+	t.Run("audio_only_now_before_prev_end_returns_true", func(t *testing.T) {
+		// Audio-only: vSegEntries empty, audio has 1 entry.
+		// Audio timescale = sample rate (48000). Prev audio: t=0, d=2s @ 48 kHz.
+		p := &Packager{
+			availStart:  t0,
+			audioInit:   &AudioInit{SampleRate: 48000},
+			aSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 2 * 48000}},
+		}
+		if !p.behindPrevSegEnd(t0.Add(1 * time.Second)) {
+			t.Error("expected true when audio is behind on audio-only stream")
+		}
+	})
+
+	t.Run("video_ahead_audio_behind_returns_true", func(t *testing.T) {
+		// Mismatched per-track timelines: video caught up, audio still behind.
+		// Gate should hold because audio would overlap.
+		p := &Packager{
+			availStart: t0,
+			audioInit:  &AudioInit{SampleRate: 48000},
+			// Video prev seg ends at 1s.
+			vSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 1 * uint64(VideoTimescale)}},
+			// Audio prev seg ends at 5s.
+			aSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 5 * 48000}},
+		}
+		// Now = AST + 2s → video OK (2 ≥ 1) but audio still behind (2 < 5).
+		if !p.behindPrevSegEnd(t0.Add(2 * time.Second)) {
+			t.Error("expected true when audio is behind even if video is OK")
+		}
+	})
+
+	t.Run("video_behind_audio_ahead_returns_true", func(t *testing.T) {
+		p := &Packager{
+			availStart:  t0,
+			audioInit:   &AudioInit{SampleRate: 48000},
+			vSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 5 * uint64(VideoTimescale)}},
+			aSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 1 * 48000}},
+		}
+		// Now = AST + 2s → video behind (2 < 5), audio OK.
+		if !p.behindPrevSegEnd(t0.Add(2 * time.Second)) {
+			t.Error("expected true when video is behind")
+		}
+	})
+
+	t.Run("both_caught_up_returns_false", func(t *testing.T) {
+		p := &Packager{
+			availStart:  t0,
+			audioInit:   &AudioInit{SampleRate: 48000},
+			vSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 1 * uint64(VideoTimescale)}},
+			aSegEntries: []SegmentEntry{{StartTicks: 0, DurTicks: 1 * 48000}},
+		}
+		if p.behindPrevSegEnd(t0.Add(2 * time.Second)) {
+			t.Error("expected false when both tracks caught up")
+		}
+	})
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────
 
 // waitForFile polls path until it exists or timeout elapses.

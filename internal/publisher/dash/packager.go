@@ -438,6 +438,20 @@ func (p *Packager) tryCut(now time.Time) {
 		p.pairingTruncated = true
 	}
 
+	// DASH timeline-pace gate. tfdt is wallclock-anchored
+	// (wallclockTicks(now, AST)) but per-segment dur is the frame-PTS
+	// span. The two stay coherent ONLY when wallclock-since-last-emit
+	// matches the media span emitted into that segment. Raw-TS sources
+	// bypass the ingest rebaser, so they deliver chunks in bursts —
+	// without this gate, two consecutive cuts within a chunk burst
+	// produce <S> entries whose [t, t+d] ranges overlap (strict players
+	// reject the MPD). Holding here lets the queue absorb the burst;
+	// emit resumes once wallclock catches up to the previous segment's
+	// end, draining the queue at wallclock pace across many cuts.
+	if p.behindPrevSegEnd(now) {
+		return
+	}
+
 	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio)
 	if !d.Ok {
 		return
@@ -571,6 +585,41 @@ func (p *Packager) writeAudioSegment(now time.Time, frames []AudioFrame) bool {
 	p.onDiskA = append(p.onDiskA, name)
 	p.aSegEntries = append(p.aSegEntries, SegmentEntry{StartTicks: tfdt, DurTicks: durTicks})
 	return true
+}
+
+// behindPrevSegEnd reports whether emitting NOW would create a segment
+// whose tfdt (= wallclockTicks(now, AST)) lands BEFORE the previous
+// segment's end (= prev.StartTicks + prev.DurTicks). When true, the
+// caller must hold the cut — emitting would bake an overlap into the
+// MPD's <S t=...> entries. Checks both video and audio tracks; either
+// being behind is enough to hold.
+//
+// availStart-zero (first cut ever) returns false: there's nothing to
+// overlap with yet, and we want the first segment to anchor the timeline.
+//
+// Caller must hold p.mu.
+func (p *Packager) behindPrevSegEnd(now time.Time) bool {
+	if p.availStart.IsZero() {
+		return false
+	}
+	if n := len(p.vSegEntries); n > 0 {
+		last := p.vSegEntries[n-1]
+		prevEndTicks := last.StartTicks + last.DurTicks
+		nowTicks := wallclockTicks(now, p.availStart, uint64(VideoTimescale))
+		if nowTicks < prevEndTicks {
+			return true
+		}
+	}
+	if n := len(p.aSegEntries); n > 0 && p.audioInit != nil {
+		last := p.aSegEntries[n-1]
+		prevEndTicks := last.StartTicks + last.DurTicks
+		sr := uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0 once audioInit is built
+		nowTicks := wallclockTicks(now, p.availStart, sr)
+		if nowTicks < prevEndTicks {
+			return true
+		}
+	}
+	return false
 }
 
 // wallclockTicks returns (now − ast) × timescale, clamping to 0 when
