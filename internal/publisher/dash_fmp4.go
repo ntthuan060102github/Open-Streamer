@@ -67,21 +67,6 @@ const (
 	// Symmetric: backward step ⇒ source switch / wrap, forward step ⇒
 	// CDN playlist resync, NVENC stall recovery, transcoder restart.
 	dashSourceSwitchJumpMs = 1000
-
-	// dashSeedPreserveSkewMs caps the inter-track DTS skew that the per-
-	// track tfdt seeding will preserve. Values within this window — AAC
-	// encoder delay (~22-44ms), RTSP audio leading video by ~100ms, mp4
-	// edit-list pre-roll — are baked into the published timeline so the
-	// player reproduces the source's natural A/V offset. Beyond it the
-	// skew is treated as upstream pathology (HLS source where audio PTS
-	// trails video PTS by tens of seconds; observed empirically on the
-	// live.mediatech.vn chunklist feed that fanned out to bac_ninh and
-	// every republisher of it). The seed falls back to "origin" for the
-	// late-arriving track so V and A start at the same tfdt — MSE then
-	// plays cleanly, at the cost of collapsing whatever offset the
-	// source intended. 1 s is comfortably above any legitimate pre-roll
-	// and well below dashjs / hls.js A/V sync tolerance.
-	dashSeedPreserveSkewMs = 1000
 )
 
 // dashRunOpts carries per-rendition ABR metadata.  nil = single-rendition mode.
@@ -913,7 +898,7 @@ func (p *dashFMP4Packager) seedVideoNextDecodeLocked() {
 	if p.videoFirstDTSmsSet || p.videoInit == nil || len(p.vDTS) == 0 {
 		return
 	}
-	p.videoNextDecode = scaleOffset(capSeedSkew(p.vDTS[0], p.originDTSms), p.originDTSms, dashVideoTimescale)
+	p.videoNextDecode = scaleOffset(p.vDTS[0], p.originDTSms, dashVideoTimescale)
 	p.videoFirstDTSmsSet = true
 }
 
@@ -925,21 +910,8 @@ func (p *dashFMP4Packager) seedAudioNextDecodeLocked(firstFrameDTSms uint64) {
 	if p.audioFirstDTSmsSet || p.audioInit == nil || p.audioSR <= 0 {
 		return
 	}
-	p.audioNextDecode = scaleOffset(capSeedSkew(firstFrameDTSms, p.originDTSms), p.originDTSms, uint64(p.audioSR))
+	p.audioNextDecode = scaleOffset(firstFrameDTSms, p.originDTSms, uint64(p.audioSR))
 	p.audioFirstDTSmsSet = true
-}
-
-// capSeedSkew clamps the late-arriving track's first-frame DTS to within
-// dashSeedPreserveSkewMs of the shared origin. When the skew exceeds the
-// cap, the seed collapses to originDTSms — V and A then start at the same
-// tfdt offset, sacrificing the source's claimed offset to keep MSE happy.
-// See dashSeedPreserveSkewMs for the trade-off.
-func capSeedSkew(firstDTSms, originDTSms uint64) uint64 {
-	delta := int64(firstDTSms) - int64(originDTSms)
-	if delta > dashSeedPreserveSkewMs || delta < -dashSeedPreserveSkewMs {
-		return originDTSms
-	}
-	return firstDTSms
 }
 
 // scaleOffset returns (firstDTSms - originDTSms) converted into `timescale`
