@@ -874,16 +874,20 @@ func (p *dashFMP4Packager) prepareAudioInitLocked(hdr *aac.ADTSHeader) (*pending
 	return &pendingInitWrite{init: init, filename: "init_a.mp4"}, nil
 }
 
-// recordOriginDTSLocked seeds the shared per-stream origin on the first
-// frame of any track. Both per-track tfdt counters are subsequently anchored
-// to this origin so that the published DASH timeline preserves whatever
-// inter-track offset the source had at startup (encoder pre-roll, mp4 edit
-// list, HLS source where audio leads video by a few hundred ms, …).
+// recordOriginDTSLocked is kept as a diagnostic field only — every track
+// now anchors its tfdt at 0 from its own first DTS, independently. This
+// replaces the previous shared-origin approach which preserved any
+// inter-track arrival offset (intended to keep sub-frame intrinsic offsets
+// like a 33ms B-frame DTS pre-roll) but also baked in multi-second
+// transcoder-pipeline startup delays — for an HLS-pull-with-NVENC stream
+// the audio AAC encoder ran immediately while the video NVENC pipeline
+// took ~8 seconds to emit its first frame; with shared origin that 8s
+// gap became a permanent A/V skew in the published MPD.
 //
-// Without an explicit origin, video and audio nextDecode counters both
-// defaulted to 0, which collapsed the source's actual offset into "both
-// tracks start at the same moment" — players then play audio and video
-// out of sync by exactly that lost offset. Caller must hold p.mu.
+// Per-track origin trades the sub-frame preservation for robustness:
+// every track plays from media time 0 at the player's live edge,
+// regardless of which track happened to arrive first at the packager.
+// Caller must hold p.mu.
 func (p *dashFMP4Packager) recordOriginDTSLocked(dts uint64) {
 	if !p.originDTSmsSet {
 		p.originDTSms = dts
@@ -891,32 +895,36 @@ func (p *dashFMP4Packager) recordOriginDTSLocked(dts uint64) {
 	}
 }
 
-// seedVideoNextDecodeLocked initialises videoNextDecode from the first
-// queued video DTS, expressed as the offset from the shared origin in 90
-// kHz ticks. No-op once seeded, after the video init segment exists, and
-// when there is at least one queued AU to anchor to.
+// seedVideoNextDecodeLocked anchors the video tfdt counter at 0 using
+// the first queued video DTS as the per-track origin. No-op once seeded,
+// before the video init segment exists, or with no queued AU.
 //
 // Subsequent video segments accumulate from this seed via the existing
-// `p.videoNextDecode += segDur` path, so the offset persists for the full
-// stream lifetime — meaning "audio leads video by 100ms" stays "audio leads
-// video by 100ms" all the way to the player. Caller must hold p.mu.
+// `p.videoNextDecode += segDur` path. By anchoring each track at 0
+// independently, the player schedules both tracks from media time 0 at
+// the same wallclock moment — so audio and video play in sync regardless
+// of which track's first frame arrived first at the packager (the
+// arrival gap, especially during transcoder warmup, is no longer
+// baked into the published timeline). Caller must hold p.mu.
 func (p *dashFMP4Packager) seedVideoNextDecodeLocked() {
 	if p.videoFirstDTSmsSet || p.videoInit == nil || len(p.vDTS) == 0 {
 		return
 	}
-	p.videoNextDecode = scaleOffset(p.vDTS[0], p.originDTSms, dashVideoTimescale)
+	p.videoNextDecode = 0
 	p.videoFirstDTSmsSet = true
 }
 
 // seedAudioNextDecodeLocked is the audio counterpart of
-// seedVideoNextDecodeLocked, scaling into the audio sample rate. Called
-// once after the audio init exists and the first AAC frame has been
-// queued. Caller must hold p.mu.
+// seedVideoNextDecodeLocked — anchors audioNextDecode at 0 from this
+// track's own first frame. The firstFrameDTSms argument is retained for
+// the call signature but the value is no longer used; each track is
+// timeline-independent. Caller must hold p.mu.
 func (p *dashFMP4Packager) seedAudioNextDecodeLocked(firstFrameDTSms uint64) {
 	if p.audioFirstDTSmsSet || p.audioInit == nil || p.audioSR <= 0 {
 		return
 	}
-	p.audioNextDecode = scaleOffset(firstFrameDTSms, p.originDTSms, uint64(p.audioSR))
+	_ = firstFrameDTSms
+	p.audioNextDecode = 0
 	p.audioFirstDTSmsSet = true
 }
 

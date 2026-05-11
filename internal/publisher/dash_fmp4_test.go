@@ -76,12 +76,14 @@ func TestSeedVideoNextDecodeLockedRunsOnceAndRequiresInit(t *testing.T) {
 	require.Equal(t, uint64(0), p.videoNextDecode)
 	require.False(t, p.videoFirstDTSmsSet)
 
-	// Init exists, queued frame at +100ms → seed lands at 9000 (90 kHz).
+	// Init exists → seed lands at 0 (per-track origin: video tfdt always
+	// starts at 0 from its own first frame, independent of when audio
+	// arrived).
 	p.videoInit = mp4.CreateEmptyInit()
 	p.seedVideoNextDecodeLocked()
 	require.True(t, p.videoFirstDTSmsSet)
-	require.Equal(t, uint64(9000), p.videoNextDecode,
-		"100ms past origin → 100*90 ticks")
+	require.Equal(t, uint64(0), p.videoNextDecode,
+		"per-track origin: videoNextDecode seeds at 0 regardless of vDTS")
 
 	// Subsequent calls must be no-ops even with different vDTS values.
 	p.vDTS = []uint64{2000}
@@ -91,11 +93,9 @@ func TestSeedVideoNextDecodeLockedRunsOnceAndRequiresInit(t *testing.T) {
 		"seed must not re-fire after first call")
 }
 
-// Audio seed mirrors video — once-only, requires init, scales to audioSR.
-// The frame DTS is passed in directly (rather than reading from a queue)
-// because by the time seedAudioNextDecodeLocked runs we have just appended
-// it to aRaw; passing it explicitly keeps the helper testable in isolation.
-func TestSeedAudioNextDecodeLockedRunsOnceAndScalesToSampleRate(t *testing.T) {
+// Audio seed mirrors video — once-only, requires init + audioSR set,
+// and anchors at 0 from this track's own first frame.
+func TestSeedAudioNextDecodeLockedRunsOnceAndAnchorsAtZero(t *testing.T) {
 	t.Parallel()
 	p := &dashFMP4Packager{}
 	p.recordOriginDTSLocked(1000)
@@ -109,47 +109,48 @@ func TestSeedAudioNextDecodeLockedRunsOnceAndScalesToSampleRate(t *testing.T) {
 	p.seedAudioNextDecodeLocked(1100)
 	require.Equal(t, uint64(0), p.audioNextDecode)
 
-	// Full state → seed at +100ms on a 48 kHz clock = 4800 ticks.
+	// Full state → seed at 0 regardless of firstFrameDTSms value.
 	p.audioSR = 48000
 	p.seedAudioNextDecodeLocked(1100)
 	require.True(t, p.audioFirstDTSmsSet)
-	require.Equal(t, uint64(4800), p.audioNextDecode)
+	require.Equal(t, uint64(0), p.audioNextDecode,
+		"per-track origin: audioNextDecode seeds at 0")
 
-	// 44.1 kHz scaling on a fresh packager (regression guard against the
-	// helper hardcoding 48000 anywhere).
+	// Different sample rate → still anchors at 0.
 	p2 := &dashFMP4Packager{}
 	p2.recordOriginDTSLocked(1000)
 	p2.audioInit = mp4.CreateEmptyInit()
 	p2.audioSR = 44100
 	p2.seedAudioNextDecodeLocked(1100)
-	require.Equal(t, uint64(100*44100/1000), p2.audioNextDecode)
+	require.Equal(t, uint64(0), p2.audioNextDecode)
 }
 
-// The cross-track scenario this whole change exists for: audio arrives
-// first at DTS=5000, video arrives 100ms later at DTS=5100. The two
-// nextDecode counters must reflect that 100ms gap — audio at tfdt=0, video
-// at tfdt=9000 (in 90 kHz).
-//
-// Without the fix, both lined up at tfdt=0 and the player rendered audio
-// 100ms ahead of video forever.
-func TestSeedersPreserveAudioVideoOffset(t *testing.T) {
+// Each track anchors at tfdt=0 from its own first frame — the
+// previous behaviour preserved any inter-track arrival offset (intended
+// to keep a sub-frame intrinsic offset like a 33ms B-frame pre-roll)
+// but also baked in multi-second transcoder-pipeline startup delays.
+// Per-track origin trades that sub-frame preservation for robustness:
+// both tracks play from media time 0 at the player's live edge.
+func TestSeedersAnchorEachTrackAtZeroIndependently(t *testing.T) {
 	t.Parallel()
 	p := &dashFMP4Packager{}
 
-	// Audio first.
+	// Audio first at DTS=5000.
 	p.recordOriginDTSLocked(5000)
 	p.audioInit = mp4.CreateEmptyInit()
 	p.audioSR = 48000
 	p.seedAudioNextDecodeLocked(5000)
 	require.Equal(t, uint64(0), p.audioNextDecode,
-		"audio anchors at the origin → tfdt 0")
+		"audio seeds at its own zero")
 
-	// Video 100ms later.
+	// Video arrives much later (transcoder warmup case — was 9 seconds
+	// behind audio in the production incident). Per-track origin keeps
+	// videoNextDecode at 0 regardless of arrival gap.
 	p.videoInit = mp4.CreateEmptyInit()
-	p.vDTS = []uint64{5100}
+	p.vDTS = []uint64{14000} // 9 seconds past audio first DTS
 	p.seedVideoNextDecodeLocked()
-	require.Equal(t, uint64(9000), p.videoNextDecode,
-		"video starts 100ms past origin → 9000 ticks at 90 kHz")
+	require.Equal(t, uint64(0), p.videoNextDecode,
+		"video seeds at its own zero — encoder-warmup delay is not baked into the timeline")
 }
 
 // ─── tsBuffer leak guards ────────────────────────────────────────────────────
