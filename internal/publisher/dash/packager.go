@@ -119,6 +119,18 @@ type Packager struct {
 	vSegN      uint64
 	aSegN      uint64
 
+	// videoNextDecodeTicks / audioNextDecodeTicks accumulate sequentially:
+	// each new segment's tfdt = the previous segment's tfdt + dur. This
+	// avoids the wallclock-recompute drift that the naïve
+	// `tfdt = (now - AST) × timescale` model exhibits — audio durs come
+	// in 1024-sample steps (≈ 32 ms at 32 kHz) that don't divide ms
+	// wallclock exactly, so the gap between V's wallclock-tfdt and A's
+	// frame-count-derived end grew by ~30 ms per segment and reached
+	// tens of seconds over a few minutes. Sequential accumulation makes
+	// both tracks advance at exactly source rate, staying in lockstep.
+	videoNextDecodeTicks uint64
+	audioNextDecodeTicks uint64
+
 	// Sliding-window state for manifest.
 	onDiskV     []string
 	onDiskA     []string
@@ -365,12 +377,18 @@ func (p *Packager) installVideoInit(vi *VideoInit) {
 
 // onSessionBoundary handles a buffer.Packet with SessionStart=true.
 // Flushes whatever's queued, drops the queue, signals the state machine.
+//
+// Per-track decode counters are preserved across the boundary so the
+// MPD timeline stays monotonic — players keep advancing through the
+// same SegmentTimeline without seeking back. Segment numbers also
+// survive for the same reason.
 func (p *Packager) onSessionBoundary() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.state.OnSessionStart()
 	// Drop queues — old session content shouldn't bleed into new session
-	// segments. Init segments + AST + segment counters survive.
+	// segments. Init segments + AST + segment counters + nextDecode
+	// counters survive.
 	_ = p.queue.PopVideo(p.queue.VideoLen())
 	_ = p.queue.PopAudio(p.queue.AudioLen())
 	p.seg.Reset()
@@ -398,6 +416,16 @@ func (p *Packager) tryCut(now time.Time) {
 		return
 	}
 
+	// First-segment moment: align queues so V and A start at the LATER
+	// of the two firsts. This drops the earlier-arrived track's pre-
+	// pairing accumulation (e.g. 4 s of audio that flowed while the
+	// NVENC pipeline warmed up, or 16 s of mixer-drained V frames). The
+	// pre-pairing content is lost, but media-time anchors stay aligned
+	// — no perpetual A/V drift in the published timeline.
+	if p.state.State() == StateWaitingForPairing && haveVideo && haveAudio {
+		p.truncateAtPairingLocked()
+	}
+
 	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio)
 	if !d.Ok {
 		return
@@ -412,6 +440,30 @@ func (p *Packager) tryCut(now time.Time) {
 		}
 		p.trimWindow()
 		p.publishManifest(now)
+	}
+}
+
+// truncateAtPairingLocked drops frames whose PTSms is earlier than the
+// later track's first frame. Called once at WaitingForPairing → Live
+// transition so the first emitted segment for V and A starts at the
+// SAME media-time anchor. Caller must hold p.mu.
+func (p *Packager) truncateAtPairingLocked() {
+	vFirst, ok1 := p.queue.FirstVideo()
+	aFirst, ok2 := p.queue.FirstAudio()
+	if !ok1 || !ok2 {
+		return
+	}
+	threshold := vFirst.PTSms
+	if aFirst.PTSms > threshold {
+		threshold = aFirst.PTSms
+	}
+	if vd, ad := p.queue.TruncateBefore(threshold); vd > 0 || ad > 0 {
+		slog.Info("dash: pairing-truncate",
+			"stream_id", p.cfg.StreamID,
+			"threshold_ms", threshold,
+			"video_dropped", vd,
+			"audio_dropped", ad,
+		)
 	}
 }
 
@@ -451,11 +503,11 @@ func (p *Packager) writeSegments(now time.Time, d CutDecision) bool {
 
 // writeVideoSegment serialises one .m4s file and updates window state.
 // Returns true on success.
-func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame) bool {
+func (p *Packager) writeVideoSegment(_ time.Time, frames []VideoFrame) bool {
 	p.vSegN++
 	name := fmt.Sprintf("seg_v_%05d.m4s", p.vSegN)
 
-	tfdt := uint64(now.Sub(p.effectiveASTLocked()).Milliseconds()) * uint64(VideoTimescale) / 1000 //nolint:gosec // bounded by positive duration
+	tfdt := p.videoNextDecodeTicks
 	segDurTicks := computeVideoSegDurTicks(frames)
 
 	data, err := BuildVideoFragment(uint32(p.vSegN), p.videoInit.TrackID, tfdt, frames, p.isHEVC, segDurTicks) //nolint:gosec // segN fits uint32 for the stream's lifetime
@@ -471,17 +523,21 @@ func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame) bool {
 	}
 	p.onDiskV = append(p.onDiskV, name)
 	p.vSegEntries = append(p.vSegEntries, SegmentEntry{StartTicks: tfdt, DurTicks: segDurTicks})
+	// Sequential accumulator: next segment's tfdt = end of this one. The
+	// alternative "tfdt = (now - AST) × 90000" drifts against the dur
+	// sum because per-segment durs aren't exact multiples of wallclock
+	// ms (see the videoNextDecodeTicks field comment).
+	p.videoNextDecodeTicks += segDurTicks
 	return true
 }
 
 // writeAudioSegment is the audio counterpart of writeVideoSegment.
-func (p *Packager) writeAudioSegment(now time.Time, frames []AudioFrame) bool {
+func (p *Packager) writeAudioSegment(_ time.Time, frames []AudioFrame) bool {
 	p.aSegN++
 	name := fmt.Sprintf("seg_a_%05d.m4s", p.aSegN)
 
-	sr := uint64(p.audioInit.SampleRate)                                       //nolint:gosec // SampleRate >0
-	tfdt := uint64(now.Sub(p.effectiveASTLocked()).Milliseconds()) * sr / 1000 //nolint:gosec // bounded
-	durTicks := uint64(len(frames)) * 1024                                     // AAC: 1024 samples per frame
+	tfdt := p.audioNextDecodeTicks
+	durTicks := uint64(len(frames)) * 1024 // AAC: 1024 samples per frame
 
 	data, err := BuildAudioFragment(uint32(p.aSegN), p.audioInit.TrackID, tfdt, frames) //nolint:gosec // segN fits uint32
 	if err != nil {
@@ -496,17 +552,8 @@ func (p *Packager) writeAudioSegment(now time.Time, frames []AudioFrame) bool {
 	}
 	p.onDiskA = append(p.onDiskA, name)
 	p.aSegEntries = append(p.aSegEntries, SegmentEntry{StartTicks: tfdt, DurTicks: durTicks})
+	p.audioNextDecodeTicks += durTicks
 	return true
-}
-
-// effectiveASTLocked returns the AST used for tfdt math. Falls back to
-// time.Now() when AST hasn't been set yet (first segment is being
-// written — its tfdt should be 0).
-func (p *Packager) effectiveASTLocked() time.Time {
-	if !p.availStart.IsZero() {
-		return p.availStart
-	}
-	return time.Now()
 }
 
 // computeVideoSegDurTicks returns the total segment duration in 90 kHz
