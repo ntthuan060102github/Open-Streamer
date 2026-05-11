@@ -153,6 +153,62 @@ func TestSeedersAnchorEachTrackAtZeroIndependently(t *testing.T) {
 		"video seeds at its own zero — encoder-warmup delay is not baked into the timeline")
 }
 
+// shouldHoldForPairingLocked gates the FIRST segment flush so V and A
+// start emitting together. Without this gate, a transcoder whose audio
+// pipeline runs ahead of its video pipeline (NVENC warmup) would write
+// audio seg_1 alone, set AST at that moment, and bake the V-A wallclock
+// gap into the published MPD.
+func TestShouldHoldForPairingLocked_HoldsUntilBothTracksOrTimeout(t *testing.T) {
+	t.Parallel()
+
+	t.Run("audio_only_so_far → hold", func(t *testing.T) {
+		p := &dashFMP4Packager{
+			audioInit:          mp4.CreateEmptyInit(),
+			firstFlushDeadline: time.Now().Add(3 * time.Second),
+		}
+		require.True(t, p.shouldHoldForPairingLocked(),
+			"video init not yet ready → wait inside the pairing window")
+	})
+
+	t.Run("video_only_so_far → hold", func(t *testing.T) {
+		p := &dashFMP4Packager{
+			videoInit:          mp4.CreateEmptyInit(),
+			firstFlushDeadline: time.Now().Add(3 * time.Second),
+		}
+		require.True(t, p.shouldHoldForPairingLocked(),
+			"audio init not yet ready → wait inside the pairing window")
+	})
+
+	t.Run("both ready → flush", func(t *testing.T) {
+		p := &dashFMP4Packager{
+			videoInit:          mp4.CreateEmptyInit(),
+			audioInit:          mp4.CreateEmptyInit(),
+			firstFlushDeadline: time.Now().Add(3 * time.Second),
+		}
+		require.False(t, p.shouldHoldForPairingLocked(),
+			"both inits ready → pairing achieved, allow flush")
+	})
+
+	t.Run("deadline_elapsed → flush even with one track", func(t *testing.T) {
+		p := &dashFMP4Packager{
+			audioInit:          mp4.CreateEmptyInit(),
+			firstFlushDeadline: time.Now().Add(-1 * time.Millisecond),
+		}
+		require.False(t, p.shouldHoldForPairingLocked(),
+			"timeout escape: proceed audio-only after 3 s of no video")
+	})
+
+	t.Run("AST_set → gate permanently open", func(t *testing.T) {
+		p := &dashFMP4Packager{
+			audioInit:          mp4.CreateEmptyInit(),
+			availabilityStart:  time.Now().Add(-10 * time.Second),
+			firstFlushDeadline: time.Now().Add(3 * time.Second), // would normally hold
+		}
+		require.False(t, p.shouldHoldForPairingLocked(),
+			"once any segment has been written, pairing is no longer enforced")
+	})
+}
+
 // ─── tsBuffer leak guards ────────────────────────────────────────────────────
 //
 // Three production-observed leaks in the DASH packager paths:

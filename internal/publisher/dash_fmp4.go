@@ -227,6 +227,21 @@ type dashFMP4Packager struct {
 	// Set on first segment available; needed for MPD availabilityStartTime.
 	availabilityStart time.Time
 
+	// firstFlushDeadline is the wallclock cutoff after which the first
+	// segment flush proceeds even if only one track is ready. Set when
+	// either init segment first appears (whichever arrives first). The
+	// 3-second window lets the LATER track catch up so V and A's first
+	// segments emit together with identical AST — eliminating the
+	// "audio plays for N seconds before video appears" startup skew
+	// observed in transcoded streams (NVENC pipeline emits first video
+	// frame several seconds after audio starts flowing) and mixer://
+	// streams (separate forward goroutines race their first packets).
+	//
+	// Video-only / audio-only sources hit the timeout and proceed with
+	// what they have. A zero value means no init segment has appeared
+	// yet (and thus no pairing window is open).
+	firstFlushDeadline time.Time
+
 	// ABR wiring.
 	abrMaster *dashABRMaster
 	abrSlug   string
@@ -408,6 +423,13 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 				continue
 			}
 
+			// Open the pairing window on the first track that gets its
+			// init segment. The other track has 3 s wallclock to catch up
+			// before we proceed without it.
+			if p.firstFlushDeadline.IsZero() {
+				p.firstFlushDeadline = time.Now().Add(3 * time.Second)
+			}
+
 			wallDue := !p.segmentStart.IsZero() &&
 				time.Since(p.segmentStart) >= segDur
 
@@ -421,6 +443,10 @@ func (p *dashFMP4Packager) run(ctx context.Context, sub *buffer.Subscriber) {
 				len(p.aRaw) >= p.audioFramesPerSegment()
 
 			if wallDue || videoByDur || audioOnly {
+				if p.shouldHoldForPairingLocked() {
+					p.mu.Unlock()
+					continue
+				}
 				if err := p.flushSegmentLocked(); err != nil {
 					slog.Warn("publisher: DASH segment flush failed",
 						"stream_code", p.streamID, "err", err)
@@ -872,6 +898,38 @@ func (p *dashFMP4Packager) prepareAudioInitLocked(hdr *aac.ADTSHeader) (*pending
 	// hardcoded 0 — that's how cross-track tfdt offsets stay correct.
 
 	return &pendingInitWrite{init: init, filename: "init_a.mp4"}, nil
+}
+
+// shouldHoldForPairingLocked decides whether to delay the very first
+// segment flush in order to align V and A timeline anchors. Returns true
+// only during the startup pairing window — once `availabilityStart` is
+// non-zero (any segment has been written), the gate is permanently
+// open and pairing is no longer enforced.
+//
+// The pairing window opens when EITHER init segment first appears
+// (firstFlushDeadline is set to now + 3 s). Within the window:
+//
+//   - If only one track has its init segment, hold off the flush so the
+//     other track's transcoder warmup (NVENC pipeline latency) or
+//     mixer-pipeline race can catch up. Both segments then flush
+//     together as seg_1 with tfdt=0 and a shared AST.
+//   - If both tracks are ready, allow the flush — pairing achieved.
+//   - If the 3-second deadline elapses with only one track ready
+//     (video-only or audio-only source, or a transcoder taking
+//     pathologically long to emit its first frame), allow the flush
+//     and proceed as a single-track stream. Far better than waiting
+//     indefinitely.
+//
+// Caller must hold p.mu.
+func (p *dashFMP4Packager) shouldHoldForPairingLocked() bool {
+	if !p.availabilityStart.IsZero() {
+		return false
+	}
+	if !p.firstFlushDeadline.IsZero() && time.Now().After(p.firstFlushDeadline) {
+		return false
+	}
+	bothReady := p.videoInit != nil && p.audioInit != nil
+	return !bothReady
 }
 
 // recordOriginDTSLocked is kept as a diagnostic field only — every track
