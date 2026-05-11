@@ -206,3 +206,24 @@ func (q *FrameQueue) LastIDRIndex() int {
 	}
 	return -1
 }
+
+// videoPTSAt returns the PTSms of the video frame at index i, or
+// (0, false) when the index is out of range. Package-internal so the
+// segmenter can peek without exposing the underlying slice.
+func (q *FrameQueue) videoPTSAt(i int) (uint64, bool) {
+	if i < 0 || i >= len(q.video) {
+		return 0, false
+	}
+	return q.video[i].PTSms, true
+}
+
+// audioCountAtOrBefore returns the number of OLDEST audio frames whose
+// PTSms is ≤ thresholdMS. Used by the segmenter to drain the audio
+// frames that share the video segment's time window.
+func (q *FrameQueue) audioCountAtOrBefore(thresholdMS uint64) int {
+	n := 0
+	for n < len(q.audio) && q.audio[n].PTSms <= thresholdMS {
+		n++
+	}
+	return n
+}
