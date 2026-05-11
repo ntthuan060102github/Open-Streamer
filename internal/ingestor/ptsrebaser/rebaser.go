@@ -105,40 +105,51 @@ const (
 	numTracks
 )
 
-// crossTrackSnapMs is the cross-track progression gap (ms) above which
-// a newly-seeded track snaps its output anchor onto the already-seeded
-// other track instead of starting from current wallclock-elapsed.
-//
-// We compare against the OTHER track's CONTENT progression, not its
-// wallclock arrival time, because mixer-style sources (mixer://,
-// copy:// of a busy buffer) can drain a multi-second burst of one
-// track's frames into the rebaser within microseconds — wallclock-
-// based snap would never fire (both tracks "arrived within 1 ms")
-// while the late-seeding track is content-wise seconds behind. The
-// progression check sees the burst directly and snaps the anchor
-// accordingly so V and A play in lockstep regardless of how the
-// upstream chose to deliver them.
-//
-// RTSP / RTMP same-source A/V interleave within tens of ms — neither
-// has time to progress past 1 s before the other seeds — so the
-// typical sub-second intrinsic A/V offset still survives.
-const crossTrackSnapMs int64 = 1000
+// seedPairWaitTimeoutSec caps how long Apply defers seeding a track
+// while waiting for the OTHER track's first packet to arrive. After
+// this elapses without the partner showing up the track seeds solo —
+// the assumption is video-only / audio-only source, or a partner
+// track that simply never connects (rare RTSP / RTMP encoder
+// configs). Picked at 5 s: shorter than the 6-8 s shaka-player
+// startup tolerance, longer than the typical sub-second A/V
+// interleave gap so we don't false-trigger on legitimately paired
+// streams whose partner is briefly delayed.
+const seedPairWaitTimeoutSec = 5
 
 // trackState is the per-(stream, track) anchor.
 //
-//   - inputOrigin: input DTS at this track's first observed packet.
-//   - outputAnchor: output DTS to emit for that first packet — equal
-//     to elapsed ms since wallOrigin at the time it arrived. Subsequent
-//     packets emit outputAnchor + (input - inputOrigin), preserving the
-//     track's frame cadence.
-//   - lastOutputDts: monotonicity floor for this track. After a hard
-//     re-anchor we always emit ≥ lastOutputDts + 1 so downstream uint64
-//     dur math (vDTS[i+1] − vDTS[i]) can never underflow.
+//   - inputOrigin: input DTS used as the source-side reference point.
+//     Set at seed time; subsequent output PTS = outputAnchor +
+//     (input - inputOrigin) so the track's frame cadence carries
+//     through.
+//   - outputAnchor: where this track's first emitted packet lands in
+//     the output timeline, in ms since r.wallOrigin. Seed sets it to
+//     actualNowMs of the first packet that passes seeding.
+//   - lastOutputDts: monotonicity floor. After a hard re-anchor we
+//     always emit ≥ lastOutputDts + 1 so downstream uint64 dur math
+//     (vDTS[i+1] − vDTS[i]) can never underflow.
+//
+// V/A-pairing fields drive the cross-track delay-align logic that
+// replaced the older cross-track-snap heuristic:
+//
+//   - firstSeenSet / firstSeenDts / firstSeenAt: the track's first
+//     observed packet. Recorded immediately, BEFORE seeding, so the
+//     other track's later first-packet arrival can decide whether to
+//     promote the late track's first DTS to a shared origin.
+//   - Until BOTH tracks have firstSeenSet (or seedPairWaitTimeoutSec
+//     elapses), Apply drops incoming packets for the unseed track —
+//     we'd rather lose a fraction of a second of one track at startup
+//     than bake a multi-second A/V offset into the buffer hub that
+//     downstream packagers cannot compensate for.
 type trackState struct {
 	seeded        bool
 	inputOrigin   int64
 	outputAnchor  int64
 	lastOutputDts int64
+
+	firstSeenSet bool
+	firstSeenDts int64
+	firstSeenAt  time.Time
 
 	// Per-(track, reason) re-anchor counters drive the log throttle in
 	// Apply. Cumulative across the rebaser lifetime; reset along with
@@ -224,11 +235,11 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) bool {
 	}
 
 	track := &r.tracks[tk]
+	otherTrack := &r.tracks[numTracks-1-tk]
 	actualNowMs := now.Sub(r.wallOrigin).Milliseconds()
 
 	if !track.seeded {
-		r.seedTrackLocked(track, tk, inDts, actualNowMs, cto, p)
-		return true
+		return r.maybeSeedTrackLocked(track, otherTrack, inDts, actualNowMs, cto, now, p)
 	}
 
 	inputDelta := inDts - track.inputOrigin
@@ -282,41 +293,84 @@ func (r *Rebaser) Apply(p *domain.AVPacket, now time.Time) bool {
 	return true
 }
 
-// seedTrackLocked installs the per-track anchor on a track's first
-// observed packet. Default anchor is current elapsed wallclock — this
-// preserves any small intrinsic A/V offset the source produced
-// (RTSP audio leading video by ~100 ms, RTMP codec-config pre-roll).
+// maybeSeedTrackLocked is the V/A-pairing seed gate. Replaces the old
+// per-track "seed immediately on first packet" path that preserved
+// whatever arrival-time skew the source produced — perfectly fine for
+// well-behaved encoders (audio leading video by 100 ms after RTSP
+// jitter-buffering, AAC encoder pre-roll of 22-44 ms) but disastrous
+// for upstream HLS feeds whose V and A PES PTS happen to differ by
+// many seconds. Origin-tracking + per-track seeds preserved the gap
+// all the way into DASH tfdt, and downstream packagers couldn't
+// recover.
 //
-// Mixer-style sources (mixer://, copy:// from a non-AV upstream) can
-// deliver V and A from independent producers whose first packets
-// arrive seconds apart. Preserving that arrival skew bakes a multi-
-// second A/V offset into the output, which downstream HLS / DASH
-// packagers can't compensate for and hls.js refuses to sync. When the
-// OTHER track is already seeded AND its arrival was more than
-// crossTrackSnapMs ago, snap this track's anchor to where the other
-// track is now so both streams start in lockstep.
+// Algorithm:
 //
-// Caller must hold r.mu.
-func (r *Rebaser) seedTrackLocked(
-	track *trackState, tk trackKey, inDts, actualNowMs, cto int64, p *domain.AVPacket,
-) {
-	anchor := actualNowMs
-	otherTrack := &r.tracks[numTracks-1-tk]
-	if otherTrack.seeded {
-		// Progression-based snap: how far the other track has already
-		// moved its output PTS since its own seed. Catches both
-		// "arrived seconds late" (RTSP A behind V) and "drained burst"
-		// (mixer V emitted seconds of frames before A's first packet).
-		otherProgression := otherTrack.lastOutputDts - otherTrack.outputAnchor
-		if otherProgression > crossTrackSnapMs {
-			anchor = otherTrack.lastOutputDts
-		}
+//  1. Record this track's first observed DTS + arrival time. Cumulative
+//     across calls — only set once.
+//  2. If the OTHER track has NOT yet recorded its firstSeen AND the
+//     wait timeout hasn't fired: drop this packet (return false). The
+//     caller MUST NOT write a dropped packet into the buffer hub.
+//     Subsequent packets of this same track also drop until either
+//     pairing resolves or the timeout fires — so we lose up to
+//     seedPairWaitTimeoutSec of the early-arriving track at startup.
+//  3. Once both firstSeens are recorded (the common case, partner
+//     usually arrives within tens of ms) OR the timeout fires (audio-
+//     only / video-only sources), decide the shared origin:
+//     - Both present: origin = max(firstSeenDts, otherTrack.firstSeenDts).
+//       The LATER source moment becomes the timeline zero so the early
+//     - Single track (timeout): origin = this packet's DTS, so we
+//       don't bake the wait into the output timeline.
+//  4. If this packet's DTS is still below the chosen origin, drop it
+//     (the early track is catching up to the late track's first
+//     moment). Subsequent packets keep dropping until DTS >= origin
+//     naturally — this is the "skip-until" phase.
+//  5. Otherwise, seed: inputOrigin = origin, outputAnchor = wallclock
+//     elapsed NOW. Emit the packet rebased.
+//
+// Returns true iff the packet was rebased and should be written to
+// the buffer hub. Caller must hold r.mu.
+func (r *Rebaser) maybeSeedTrackLocked(
+	track, otherTrack *trackState,
+	inDts, actualNowMs, cto int64,
+	now time.Time,
+	p *domain.AVPacket,
+) bool {
+	if !track.firstSeenSet {
+		track.firstSeenSet = true
+		track.firstSeenDts = inDts
+		track.firstSeenAt = now
 	}
+
+	bothSeen := otherTrack.firstSeenSet
+	waitExpired := now.Sub(track.firstSeenAt) >= seedPairWaitTimeoutSec*time.Second
+	if !bothSeen && !waitExpired {
+		return false
+	}
+
+	var origin int64
+	if bothSeen {
+		origin = track.firstSeenDts
+		if otherTrack.firstSeenDts > origin {
+			origin = otherTrack.firstSeenDts
+		}
+	} else {
+		// Timed out without partner. Anchor the timeline on this
+		// packet's DTS — using firstSeenDts here would output a packet
+		// at media time `seedPairWaitTimeoutSec` seconds, since
+		// outputAnchor = now − wallOrigin elapsed-while-waiting.
+		origin = inDts
+	}
+
+	if inDts < origin {
+		return false
+	}
+
 	track.seeded = true
-	track.inputOrigin = inDts
-	track.outputAnchor = anchor
-	track.lastOutputDts = anchor
-	assignTimes(p, anchor, cto)
+	track.inputOrigin = origin
+	track.outputAnchor = actualNowMs
+	track.lastOutputDts = actualNowMs
+	assignTimes(p, actualNowMs, cto)
+	return true
 }
 
 // reanchorInputs bundles the read-only values reanchorLocked needs.

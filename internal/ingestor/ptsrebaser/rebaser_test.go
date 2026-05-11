@@ -7,6 +7,26 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
+// seedRebaserPastPairing primes both tracks past the V/A pairing gate
+// using three matched-DTS Apply calls (V → A → V): the first V records
+// firstSeen and drops; the A call detects the pair, picks origin =
+// max(dtsV, dtsA) = dts, and seeds A (its DTS == origin); the second
+// V call sees both firstSeens, its DTS == origin, and seeds V. After
+// this returns both trackVideo and trackAudio are seeded with
+// inputOrigin = dts and outputAnchor = (now − wallOrigin). Use this
+// when a test wants to drive post-seed behaviour (drift caps,
+// monotonicity, re-anchor) without the pairing gate adding noise.
+//
+// Tests of V/A pairing semantics MUST drive Apply directly — they
+// can't use this helper because it bakes in the very seeding decision
+// they want to observe.
+func seedRebaserPastPairing(t *testing.T, r *Rebaser, dts uint64, now time.Time) {
+	t.Helper()
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecH264, DTSms: dts, PTSms: dts}, now)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: dts, PTSms: dts}, now)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecH264, DTSms: dts, PTSms: dts}, now)
+}
+
 func TestApply_DisabledIsPassThrough(t *testing.T) {
 	r := New(Config{Enabled: false, JumpThresholdMs: 2000})
 	p := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 12345, DTSms: 12340}
@@ -40,99 +60,126 @@ func TestApply_UnknownCodecIsPassThrough(t *testing.T) {
 	}
 }
 
-func TestApply_FirstPacketAnchorsAtZero(t *testing.T) {
+func TestApply_FirstPostPairingPacketAnchorsAtZero(t *testing.T) {
 	r := New(DefaultConfig())
+	start := time.Unix(1_700_000_000, 0)
+	// V/A arrive simultaneously at the same DTS — the pairing gate
+	// resolves immediately, both tracks seed with origin = that DTS,
+	// outputAnchor = (now − wallOrigin) = 0.
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 12345, PTSms: 12345}, start)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 12345, PTSms: 12345}, start)
+
+	// First post-pairing V packet with a 5 ms CTO (PTS > DTS). Output
+	// must land at dts=0, pts=5 (CTO preserved).
 	p := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 12350, DTSms: 12345}
-	r.Apply(p, time.Unix(1_700_000_000, 0))
-	// CTO = 5ms (PTS - DTS) preserved; first-of-track output anchored at
-	// elapsed-since-wallOrigin = 0 (this packet IS the wallclock seed).
+	r.Apply(p, start)
 	if p.DTSms != 0 || p.PTSms != 5 {
-		t.Fatalf("first packet should map to dts=0 pts=5; got dts=%d pts=%d", p.DTSms, p.PTSms)
+		t.Fatalf("first post-pairing packet should map to dts=0 pts=5; got dts=%d pts=%d", p.DTSms, p.PTSms)
 	}
 	if p.Discontinuity {
-		t.Fatal("first packet must not flag Discontinuity")
+		t.Fatal("first post-pairing packet must not flag Discontinuity")
 	}
 }
 
-func TestApply_CrossTrackSnap_OnBurstProgression(t *testing.T) {
-	// Mixer-style scenario: V drains a multi-second burst of frames
-	// into the rebaser within milliseconds of wallclock (mixer reads
-	// buffered upstream content at startup), THEN A seeds. Without a
-	// progression-based snap, A would anchor at current wallclock
-	// elapsed (~1 ms) while V's lastOutputDts is already seconds
-	// ahead — emitted output would carry a multi-second A/V gap that
-	// downstream HLS / DASH cannot reconcile (test_mixer hls.js refusal
-	// to play, observed empirically).
+// V/A pairing: video and audio arrive at the same wallclock with
+// matching first DTS. The pairing gate resolves on A's call (V's
+// first Apply records firstSeen and drops); A seeds, V seeds on its
+// next call. Both share origin = the matching DTS.
+func TestApply_VAPairing_SimultaneousArrivalSeedsBothAtZero(t *testing.T) {
 	r := New(DefaultConfig())
 	start := time.Unix(1_700_000_000, 0)
 
-	// Burst: 100 V frames spaced 40 ms in PTS arriving in <1 ms wall.
-	for i := 0; i < 100; i++ {
-		v := &domain.AVPacket{
-			Codec: domain.AVCodecH264,
-			PTSms: uint64(i) * 40, //nolint:gosec
-			DTSms: uint64(i) * 40, //nolint:gosec
+	v1 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 1000, PTSms: 1000}
+	if r.Apply(v1, start) {
+		t.Fatal("first V packet must drop while waiting for A's firstSeen")
+	}
+
+	a1 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 1000, PTSms: 1000}
+	if !r.Apply(a1, start) {
+		t.Fatal("A packet at the agreed origin must seed audio and emit")
+	}
+	if a1.DTSms != 0 {
+		t.Fatalf("audio seed: want dts=0, got %d", a1.DTSms)
+	}
+
+	v2 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 1000, PTSms: 1000}
+	if !r.Apply(v2, start) {
+		t.Fatal("V packet at origin (post-pairing) must seed video and emit")
+	}
+	if v2.DTSms != 0 {
+		t.Fatalf("video seed: want dts=0, got %d", v2.DTSms)
+	}
+}
+
+// V/A pairing — pathological upstream skew (live.mediatech.vn pattern
+// that broke bac_ninh and every republisher of it): audio's first PES
+// PTS sits 30 s ahead of video's first PES PTS in source-time terms.
+// The rebaser must promote the LATER source moment (max-DTS) to origin,
+// drop the early track's catch-up packets, and seed both tracks once
+// each crosses the origin — V immediately (its DTS == origin), A once
+// upstream catches up.
+func TestApply_VAPairing_BigSkewDropsEarlyTrackUntilCatchUp(t *testing.T) {
+	r := New(DefaultConfig())
+	start := time.Unix(1_700_000_000, 0)
+
+	// Audio arrives first with PES DTS=1000. firstSeen recorded; drop.
+	a0 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 1000, PTSms: 1000}
+	if r.Apply(a0, start) {
+		t.Fatal("first A packet must drop while V's firstSeen not yet recorded")
+	}
+
+	// More audio frames arrive — still no V firstSeen. All drop.
+	for i := 1; i < 5; i++ {
+		a := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 1000 + uint64(i)*20, PTSms: 1000 + uint64(i)*20} //nolint:gosec
+		if r.Apply(a, start.Add(time.Duration(i)*time.Millisecond)) {
+			t.Fatalf("A packet %d should still drop (V not yet seen)", i)
 		}
-		r.Apply(v, start.Add(time.Duration(i)*5*time.Microsecond))
 	}
-	// V's last emitted output should be ≈ 99 × 40 = 3960 ms.
 
-	// A's first packet arrives 600 µs after the V burst ends — wallclock-
-	// only snap (`actualNow - V.outputAnchor > 1 s`) would NOT fire
-	// because only ~1 ms elapsed. Progression-based snap MUST fire
-	// because V's content has moved 3960 ms.
-	a := &domain.AVPacket{Codec: domain.AVCodecAAC, PTSms: 0, DTSms: 0}
-	r.Apply(a, start.Add(600*time.Microsecond))
+	// Video first packet arrives with PES DTS=31000 — 30 s ahead of audio.
+	// Pair detected, origin = max(1000, 31000) = 31000. V's DTS == origin
+	// → seed and emit.
+	v1 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 31000, PTSms: 31000}
+	if !r.Apply(v1, start.Add(20*time.Millisecond)) {
+		t.Fatal("V packet at origin must seed and emit")
+	}
 
-	// A must anchor at V's lastOutputDts so subsequent A frames sit
-	// alongside V on the output timeline. Allow 1 ms tolerance for the
-	// final V packet's wallclock-floor adjustment.
-	if a.DTSms < 3900 {
-		t.Fatalf("A.first output must snap onto V's progression (≈3960ms), got %d", a.DTSms)
+	// Next audio packet is still below origin → drops.
+	a6 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 1200, PTSms: 1200}
+	if r.Apply(a6, start.Add(25*time.Millisecond)) {
+		t.Fatal("A packet still below origin must drop after V seed")
+	}
+
+	// Audio upstream eventually catches up to origin.
+	a7 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 31000, PTSms: 31000}
+	if !r.Apply(a7, start.Add(30*time.Millisecond)) {
+		t.Fatal("A packet at origin must seed audio and emit")
 	}
 }
 
-func TestApply_VideoAndAudioTracksAreIndependent(t *testing.T) {
-	// RTSP/RTMP-style scenario: V and A on entirely different timebases
-	// (e.g. RTP per-track timestamps). Pre-fix this caused every packet
-	// to ping-pong the shared origin and emit non-monotonic outputs.
+// V/A pairing — single-track source (audio-only or video-only): the
+// partner never arrives, so the pairing gate must time out and let
+// the present track seed solo. Origin uses the timed-out packet's DTS
+// (not its firstSeenDts) so the wait period doesn't bake into output.
+func TestApply_VAPairing_TimesOutForSingleTrack(t *testing.T) {
 	r := New(DefaultConfig())
 	start := time.Unix(1_700_000_000, 0)
 
-	// First video packet arrives at t=0.
-	v1 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1_000_000, DTSms: 1_000_000}
-	r.Apply(v1, start)
-
-	// First audio packet arrives 5ms later, on a totally different
-	// timebase. Pre-fix: huge delta vs the (video) origin → reset.
-	// Post-fix: audio gets its own anchor — no Discontinuity, no jitter.
-	a1 := &domain.AVPacket{Codec: domain.AVCodecAAC, PTSms: 50_000_000, DTSms: 50_000_000}
-	r.Apply(a1, start.Add(5*time.Millisecond))
-
-	if v1.DTSms != 0 {
-		t.Fatalf("video first: want dts=0, got %d", v1.DTSms)
-	}
-	if a1.Discontinuity {
-		t.Fatal("audio first packet must not flag Discontinuity even with wildly different timebase")
-	}
-	if a1.DTSms != 5 {
-		t.Fatalf("audio first packet: want dts=5 (=5ms after wallOrigin), got %d", a1.DTSms)
+	p1 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 1000, PTSms: 1000}
+	if r.Apply(p1, start) {
+		t.Fatal("first packet must drop while waiting for partner")
 	}
 
-	// Subsequent video and audio packets advance independently.
-	v2 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1_000_040, DTSms: 1_000_040}
-	r.Apply(v2, start.Add(40*time.Millisecond))
-	a2 := &domain.AVPacket{Codec: domain.AVCodecAAC, PTSms: 50_000_021, DTSms: 50_000_021}
-	r.Apply(a2, start.Add(45*time.Millisecond))
+	// Inside the wait window — still drops.
+	p2 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 1080, PTSms: 1080}
+	if r.Apply(p2, start.Add(2*time.Second)) {
+		t.Fatal("packet inside wait window must still drop")
+	}
 
-	if v2.DTSms != 40 {
-		t.Fatalf("video second: want dts=40, got %d", v2.DTSms)
-	}
-	if a2.DTSms != 26 {
-		t.Fatalf("audio second: want dts=26 (5+21), got %d", a2.DTSms)
-	}
-	if v2.Discontinuity || a2.Discontinuity {
-		t.Fatal("steady-state packets must not flag Discontinuity")
+	// Past the timeout — seeds solo using this packet's DTS as origin.
+	p3 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 6000, PTSms: 6000}
+	if !r.Apply(p3, start.Add(6*time.Second)) {
+		t.Fatal("packet past timeout must seed solo and emit")
 	}
 }
 
@@ -143,6 +190,7 @@ func TestApply_OutputIsMonotonicPerTrackAcrossResets(t *testing.T) {
 	// Post-fix: monotonic floor pushes each emit ≥ lastOutputDts+1.
 	r := New(Config{Enabled: true, JumpThresholdMs: 500})
 	start := time.Unix(1_700_000_000, 0)
+	seedRebaserPastPairing(t, r, 1000, start)
 
 	// Steady run of video at 25fps for 1 s (25 packets).
 	for i := 0; i < 25; i++ {
@@ -172,9 +220,7 @@ func TestApply_OutputIsMonotonicPerTrackAcrossResets(t *testing.T) {
 func TestApply_HardResetWhenForwardJumpExceedsThreshold(t *testing.T) {
 	r := New(Config{Enabled: true, JumpThresholdMs: 500})
 	start := time.Unix(1_700_000_000, 0)
-
-	p1 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1000, DTSms: 1000}
-	r.Apply(p1, start)
+	seedRebaserPastPairing(t, r, 1000, start)
 
 	// 100 ms wallclock, 5 s input PTS jump → drift +4900 ms, way over 500.
 	p2 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 6000, DTSms: 6000}
@@ -195,10 +241,7 @@ func TestApply_HardResetWhenForwardJumpExceedsThreshold(t *testing.T) {
 func TestApply_ReanchorCountersClassifyDriftVsRegression(t *testing.T) {
 	r := New(Config{Enabled: true, JumpThresholdMs: 500, StreamCode: "diag_stream"})
 	start := time.Unix(1_700_000_000, 0)
-
-	// Seed video.
-	p1 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1000, DTSms: 1000}
-	r.Apply(p1, start)
+	seedRebaserPastPairing(t, r, 1000, start)
 
 	// Forward jump > threshold → "drift" reason.
 	p2 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 10000, DTSms: 10000}
@@ -281,6 +324,7 @@ func TestApply_PreservesPTSDTSOffset(t *testing.T) {
 	// B-frame ordering: PTS leads DTS by 80 ms. Offset must survive.
 	r := New(DefaultConfig())
 	start := time.Unix(1_700_000_000, 0)
+	seedRebaserPastPairing(t, r, 1000, start)
 
 	p1 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1080, DTSms: 1000}
 	r.Apply(p1, start)
@@ -312,20 +356,21 @@ func TestApply_PreservesExistingDiscontinuity(t *testing.T) {
 func TestReset_ReseedsFromNextPacket(t *testing.T) {
 	r := New(DefaultConfig())
 	start := time.Unix(1_700_000_000, 0)
-
-	p1 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 1000, DTSms: 1000}
-	r.Apply(p1, start)
-	if p1.DTSms != 0 {
-		t.Fatalf("first: want dts=0, got %d", p1.DTSms)
-	}
+	seedRebaserPastPairing(t, r, 1000, start)
 
 	r.Reset()
 
-	// After Reset, next packet anchors fresh (DTS = 0 again).
+	// After Reset, the next packet must re-enter pairing — single
+	// V packet drops, then A pairs and seeds, then V seeds. Output
+	// dts lands at 0 (fresh wallOrigin set on the first post-Reset
+	// Apply call).
+	resetWall := start.Add(5 * time.Second)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 9999, PTSms: 9999}, resetWall)
+	r.Apply(&domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 9999, PTSms: 9999}, resetWall)
 	p2 := &domain.AVPacket{Codec: domain.AVCodecH264, PTSms: 9999, DTSms: 9999}
-	r.Apply(p2, start.Add(5*time.Second))
+	r.Apply(p2, resetWall)
 	if p2.DTSms != 0 {
-		t.Fatalf("post-Reset first packet should be dts=0; got %d", p2.DTSms)
+		t.Fatalf("post-Reset first emitted packet should be dts=0; got %d", p2.DTSms)
 	}
 	if p2.Discontinuity {
 		t.Fatal("post-Reset re-seed must not auto-flag Discontinuity")
