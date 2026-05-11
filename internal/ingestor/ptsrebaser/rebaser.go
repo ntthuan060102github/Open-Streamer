@@ -365,11 +365,25 @@ func (r *Rebaser) maybeSeedTrackLocked(
 		return false
 	}
 
+	// Buffer-and-shift anchor: if the OTHER track already seeded, this
+	// track's first emission must land at the OTHER's outputAnchor so
+	// V and A at the same source PES emit at the same output PTS.
+	// Without this, the late-to-catch-up track's outputAnchor lands at
+	// its OWN (later) seed wallclock — the output timeline carries a
+	// gap equal to the catch-up period (audio-leads-video by 720ms
+	// when V upstream took 720ms to reach origin, as observed on
+	// test_puhser). The track that seeded first is still anchored at
+	// its actualNowMs, so the wallclock relationship to the buffer
+	// hub stays sensible for downstream packagers.
+	outputAnchor := actualNowMs
+	if otherTrack.seeded {
+		outputAnchor = otherTrack.outputAnchor
+	}
 	track.seeded = true
 	track.inputOrigin = origin
-	track.outputAnchor = actualNowMs
-	track.lastOutputDts = actualNowMs
-	assignTimes(p, actualNowMs, cto)
+	track.outputAnchor = outputAnchor
+	track.lastOutputDts = outputAnchor
+	assignTimes(p, outputAnchor, cto)
 	return true
 }
 

@@ -161,6 +161,52 @@ func TestApply_VAPairing_BigSkewDropsEarlyTrackUntilCatchUp(t *testing.T) {
 // partner never arrives, so the pairing gate must time out and let
 // the present track seed solo. Origin uses the timed-out packet's DTS
 // (not its firstSeenDts) so the wait period doesn't bake into output.
+// V/A pairing — buffer-and-shift anchor: when the late-to-catch-up
+// track finally seeds, its outputAnchor must be the OTHER track's
+// outputAnchor (not the current wallclock) so V at source PES X and
+// A at source PES X emit at the same output PTS. Without this, the
+// audio-leads-video offset observed on test_puhser (a-v = -0.72 s)
+// re-appears as a permanent timeline offset equal to the wallclock
+// distance between V's and A's first-emit moments.
+func TestApply_VAPairing_LateTrackInheritsOtherAnchor(t *testing.T) {
+	r := New(DefaultConfig())
+	start := time.Unix(1_700_000_000, 0)
+
+	// A arrives first with PES=1000 — recorded, dropped (waiting for V).
+	a0 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 1000, PTSms: 1000}
+	r.Apply(a0, start)
+
+	// V arrives 5 ms wallclock later with PES=2000 — pair detected,
+	// origin = max(1000, 2000) = 2000, V's DTS == origin → V seeds.
+	// V.outputAnchor at this moment = (start+5ms) − wallOrigin = 5.
+	v1 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 2000, PTSms: 2000}
+	r.Apply(v1, start.Add(5*time.Millisecond))
+	if v1.DTSms != 5 {
+		t.Fatalf("V at origin seeds at outputAnchor=5; got DTSms=%d", v1.DTSms)
+	}
+
+	// 1 s wallclock later, A's upstream catches up to PES=2000. With
+	// the OLD per-seed-anchors behaviour A.outputAnchor would land at
+	// 1005 ms — A's output_PTS would then sit 1000 ms ahead of where
+	// V was at the same source PES, producing the audio-leads-video
+	// offset. With the buffer-and-shift fix, A inherits V's anchor (5).
+	a1 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 2000, PTSms: 2000}
+	r.Apply(a1, start.Add(1005*time.Millisecond))
+	if a1.DTSms != 5 {
+		t.Fatalf("A at origin should inherit V's outputAnchor (5); got DTSms=%d", a1.DTSms)
+	}
+
+	// Sanity: subsequent V and A at SAME source PES must emit at SAME
+	// output PTS. This is the property the fix guarantees.
+	v2 := &domain.AVPacket{Codec: domain.AVCodecH264, DTSms: 3000, PTSms: 3000}
+	r.Apply(v2, start.Add(2005*time.Millisecond))
+	a2 := &domain.AVPacket{Codec: domain.AVCodecAAC, DTSms: 3000, PTSms: 3000}
+	r.Apply(a2, start.Add(2010*time.Millisecond))
+	if v2.DTSms != a2.DTSms {
+		t.Fatalf("V and A at same source PES must emit at same output PTS; v=%d a=%d", v2.DTSms, a2.DTSms)
+	}
+}
+
 func TestApply_VAPairing_TimesOutForSingleTrack(t *testing.T) {
 	r := New(DefaultConfig())
 	start := time.Unix(1_700_000_000, 0)
