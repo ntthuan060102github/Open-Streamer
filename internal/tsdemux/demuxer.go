@@ -39,9 +39,18 @@ const (
 // OnFrameFunc fires once per fully-assembled PES whose PID was
 // declared in a PMT. ptsMs / dtsMs are converted from astits's 90 kHz
 // ClockReference to milliseconds (the unit the rest of Open-Streamer
-// uses on the AVPacket boundary). dtsMs == 0 means the source had no
-// DTS field on this PES (PTS-only); callers typically substitute
-// ptsMs in that case.
+// uses on the AVPacket boundary).
+//
+// When the upstream PES uses PTSDTSIndicator=OnlyPTS (no DTS field on
+// the wire — the spec's "DTS is implicitly PTS" shortcut for I/P-frame-
+// only video and all AAC audio), dtsMs is filled with ptsMs so callers
+// see the spec-implied value rather than zero. Returning 0 for the
+// missing DTS — the original contract — meant every consumer had to
+// remember the substitution; one production caller (serve_rtsp.go)
+// missed it, and computeAudioRTP(0) collapsed the AAC RTP timeline
+// into +1-tick monotonic-clamp emits that Flussonic / ffmpeg rejected
+// as non-monotonic. Doing the substitution here at the boundary makes
+// the contract impossible to miss.
 type OnFrameFunc func(cid StreamType, frame []byte, ptsMs, dtsMs uint64)
 
 // Demuxer is the public type callers construct. Set OnFrame, then
@@ -106,6 +115,10 @@ func (d *Demuxer) Input(r io.Reader) error {
 // astits's 90 kHz clock reference to milliseconds. Returns (0, 0)
 // when the PES has no optional header (rare but valid for some
 // stream types) or when the PTS field is absent.
+//
+// When the PES uses PTSDTSIndicator=OnlyPTS (no DTS field on the
+// wire), dtsMs is filled with ptsMs — see OnFrameFunc's docstring
+// for why this lives at the boundary rather than at every caller.
 func pesTimestampsMs(p *astits.PESData) (ptsMs, dtsMs uint64) {
 	if p == nil || p.Header == nil || p.Header.OptionalHeader == nil {
 		return 0, 0
@@ -116,6 +129,11 @@ func pesTimestampsMs(p *astits.PESData) (ptsMs, dtsMs uint64) {
 	}
 	if oh.DTS != nil {
 		dtsMs = uint64(oh.DTS.Base) / 90 //nolint:gosec
+	} else {
+		// OnlyPTS PES — per ISO/IEC 13818-1 § 2.4.3.7 the absence of
+		// the DTS field means DTS equals PTS. Substitute here so every
+		// downstream consumer sees the spec value (instead of zero).
+		dtsMs = ptsMs
 	}
 	return ptsMs, dtsMs
 }
