@@ -220,6 +220,33 @@ func TestBuildManifest_DurationsISO(t *testing.T) {
 	}
 }
 
+// TestBuildManifest_DurationsAdaptToObserved — when the longest
+// observed segment is bigger than 3× segDur (long-GOP source where the
+// segmenter's safety-net cut emitted a giant segment), MinBuffer and
+// MaxSegmentDuration grow to match so the MPD's announced timing
+// matches what the player actually has to fetch. SuggestedPresentation
+// Delay stays at 3× segDur — that's a separate live-edge knob.
+func TestBuildManifest_DurationsAdaptToObserved(t *testing.T) {
+	in := sampleManifestInput()
+	in.SegDur = 2 * time.Second
+	// 10 s observed video segment at 90 kHz = 900 000 ticks.
+	in.Video[0].Segments = []SegmentEntry{
+		{StartTicks: 0, DurTicks: 900_000}, // 10 s
+		{StartTicks: 900_000, DurTicks: 540_000},
+	}
+	data, _ := BuildManifest(in)
+	s := string(data)
+	for _, want := range []string{
+		`minBufferTime="PT10S"`,        // = max(2×2, 10) = 10
+		`maxSegmentDuration="PT10S"`,   // = max(3×2, 10) = 10
+		`suggestedPresentationDelay="PT6S"`, // unchanged at 3 × segDur
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing adapted duration attr %q in:\n%s", want, s)
+		}
+	}
+}
+
 // TestBuildManifest_AvailabilityStartTimeRFC3339 — AST is RFC3339 UTC.
 func TestBuildManifest_AvailabilityStartTimeRFC3339(t *testing.T) {
 	ast := time.Date(2026, 5, 11, 8, 52, 5, 0, time.UTC)

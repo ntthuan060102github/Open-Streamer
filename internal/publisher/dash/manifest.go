@@ -105,6 +105,34 @@ type SegmentEntry struct {
 	DurTicks   uint64
 }
 
+// longestObservedSegSec scans every track's segment list and returns the
+// longest segment duration in whole seconds (rounded up). Used by
+// buildMPDDoc to tune MinBuffer and MaxSegmentDuration so the MPD's
+// announced timing matches what the player will actually fetch.
+//
+// Returns 0 when the input has no segments yet — caller falls back to
+// the segDur-based defaults.
+func longestObservedSegSec(in *ManifestInput) int {
+	maxSec := 0
+	scan := func(t *TrackManifest) {
+		if t == nil || t.Timescale == 0 {
+			return
+		}
+		for _, s := range t.Segments {
+			// Round UP so a 5960 ms segment doesn't get announced as 5 s.
+			secs := int((s.DurTicks + uint64(t.Timescale) - 1) / uint64(t.Timescale))
+			if secs > maxSec {
+				maxSec = secs
+			}
+		}
+	}
+	for i := range in.Video {
+		scan(&in.Video[i])
+	}
+	scan(in.Audio)
+	return maxSec
+}
+
 // BuildManifest serialises the MPD XML for a live DASH stream. Returns
 // the bytes ready to atomically write to disk.
 //
@@ -129,18 +157,37 @@ func BuildManifest(in *ManifestInput) ([]byte, error) {
 
 // buildMPDDoc constructs the in-memory MPD document. Returns nil when
 // neither track has any segments yet.
+//
+// MPD timing attrs are derived from BOTH the configured segDur AND the
+// largest observed segment dur on the current window. Configured-only
+// values would lie to the player when a source's GOP forces segments
+// well above segDur: a 2 s `SegDur` configured with an 8 s observed
+// GOP would advertise `minBufferTime="PT4S"` while each new segment
+// the player fetches is 8 s long, forcing the player to underrun its
+// announced buffer at the first hand-off. Adapting to observed dur
+// keeps the announcement honest; the player buffers enough to swallow
+// the next segment before starting.
 func buildMPDDoc(in *ManifestInput) *mpdRoot {
 	segSec := int(in.SegDur.Seconds())
 	if segSec < 1 {
 		segSec = 1
 	}
+	maxObservedSec := longestObservedSegSec(in)
+	minBufferSec := segSec * 2
+	if maxObservedSec > minBufferSec {
+		minBufferSec = maxObservedSec
+	}
+	maxSegDurSec := segSec * 3
+	if maxObservedSec > maxSegDurSec {
+		maxSegDurSec = maxObservedSec
+	}
 	doc := &mpdRoot{
 		XMLNS:                      "urn:mpeg:dash:schema:mpd:2011",
 		Type:                       "dynamic",
 		Profiles:                   "urn:mpeg:dash:profile:isoff-live:2011",
-		MinBuffer:                  durationISO(segSec * 2),
+		MinBuffer:                  durationISO(minBufferSec),
 		SuggestedPresentationDelay: durationISO(segSec * 3),
-		MaxSegmentDuration:         durationISO(segSec * 3),
+		MaxSegmentDuration:         durationISO(maxSegDurSec),
 		AvailabilityStartTime:      formatRFC3339(in.AvailabilityStart),
 		MinUpdate:                  durationISO(segSec),
 		BufferDepth:                durationISO(segSec * in.Window),

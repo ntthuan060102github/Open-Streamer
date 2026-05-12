@@ -547,20 +547,35 @@ func (p *Packager) writeSegments(now time.Time, d CutDecision) bool {
 // writeVideoSegment serialises one .m4s file and updates window state.
 // Returns true on success.
 //
-// tfdt is wallclock-since-AST × 90 kHz. This anchors the segment's
-// presentation time to wallclock so the DASH live edge math
-// (live_edge = (now − AST) − liveDelay) finds the segment immediately
-// after it's available. The earlier "sequential accumulator" approach
-// (tfdt = sum of previous durs) interacted catastrophically with
-// audio under-emission: when audio frames were missing, audio dur sums
-// fell behind wallclock and the audio MPD timeline drifted >100 s
-// behind video, making playback impossible. Wallclock-based tfdt
-// hides under-emission as small per-segment gaps that players tolerate.
+// tfdt anchors:
+//
+//   - Segment 0: tfdt = wallclockTicks(now, AST) — pins the MPD timeline
+//     onto the wallclock at the very first emit so DASH live-edge math
+//     (live_edge_media_time = (now − AST) − liveDelay) has a meaningful
+//     starting point.
+//   - Segment N>0: tfdt = previous segment's end = prev.StartTicks +
+//     prev.DurTicks. Sequential on media-time. This keeps adjacent
+//     segments contiguous in MPD timeline (no inter-segment gap from
+//     the 50 ms run-loop tick granularity that wallclock-anchored tfdt
+//     would inherit — that gap rendered as a per-segment 1-frame
+//     stutter on player). The pacing gate in tryCut already ensures
+//     emits never run ahead of wallclock, so sequential tfdt can only
+//     LAG wallclock (when source < realtime), never overshoot.
+//
+// The earlier "sequential accumulator" approach the package tried,
+// which interacted catastrophically with audio under-emission, set
+// tfdt = sum of all previous durs INDEPENDENTLY for each track —
+// audio-frame loss caused audio dur sums to fall behind wallclock and
+// the audio MPD timeline drifted >100 s behind video. The fix in this
+// commit pairs sequential tfdt with splitADTSBundle (audio frames now
+// emit at full source rate) and the dur-via-next-PTS math (no
+// per-segment under-report), so the chronic divergence that motivated
+// the wallclock-anchor revert is gone.
 func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame, nextPTSms uint64, hasNext bool) bool {
 	p.vSegN++
 	name := fmt.Sprintf("seg_v_%05d.m4s", p.vSegN)
 
-	tfdt := wallclockTicks(now, p.availStart, uint64(VideoTimescale))
+	tfdt := videoTfdtForSegment(p.vSegEntries, now, p.availStart)
 	segDurTicks := computeVideoSegDurTicks(frames, nextPTSms, hasNext)
 
 	data, err := BuildVideoFragment(uint32(p.vSegN), p.videoInit.TrackID, tfdt, frames, p.isHEVC, segDurTicks) //nolint:gosec // segN fits uint32 for the stream's lifetime
@@ -580,12 +595,14 @@ func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame, nextPTS
 }
 
 // writeAudioSegment is the audio counterpart of writeVideoSegment.
+// Uses the same sequential-after-first tfdt anchor as video; see
+// writeVideoSegment's docstring for why.
 func (p *Packager) writeAudioSegment(now time.Time, frames []AudioFrame) bool {
 	p.aSegN++
 	name := fmt.Sprintf("seg_a_%05d.m4s", p.aSegN)
 
 	sr := uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0
-	tfdt := wallclockTicks(now, p.availStart, sr)
+	tfdt := audioTfdtForSegment(p.aSegEntries, now, p.availStart, sr)
 	durTicks := uint64(len(frames)) * 1024 // AAC: 1024 samples per frame
 
 	data, err := BuildAudioFragment(uint32(p.aSegN), p.audioInit.TrackID, tfdt, frames) //nolint:gosec // segN fits uint32
@@ -639,10 +656,37 @@ func (p *Packager) behindPrevSegEnd(now time.Time) bool {
 	return false
 }
 
+// videoTfdtForSegment picks the start-tick anchor for the next video
+// segment. The first segment seeds onto wallclock-since-AST so the
+// MPD timeline is wallclock-anchored at its origin; every subsequent
+// segment uses the previous segment's end (sequential on media time)
+// so adjacent segments are contiguous in the MPD's <S t=...> entries.
+//
+// Sequential anchoring eliminates the per-segment ≤50 ms gap that
+// wallclock-anchored tfdt inherited from the run-loop tick granularity
+// — see writeVideoSegment's docstring for the full rationale.
+func videoTfdtForSegment(entries []SegmentEntry, now, ast time.Time) uint64 {
+	if n := len(entries); n > 0 {
+		last := entries[n-1]
+		return last.StartTicks + last.DurTicks
+	}
+	return wallclockTicks(now, ast, uint64(VideoTimescale))
+}
+
+// audioTfdtForSegment is the audio counterpart of videoTfdtForSegment.
+// timescale is the audio sample rate (Hz) — each tick is one sample.
+func audioTfdtForSegment(entries []SegmentEntry, now, ast time.Time, timescale uint64) uint64 {
+	if n := len(entries); n > 0 {
+		last := entries[n-1]
+		return last.StartTicks + last.DurTicks
+	}
+	return wallclockTicks(now, ast, timescale)
+}
+
 // wallclockTicks returns (now − ast) × timescale, clamping to 0 when
 // ast is unset (the very first segment whose tfdt should be 0). Used
-// by both writeVideoSegment and writeAudioSegment so the two tracks
-// share a wallclock anchor.
+// to seed the FIRST segment's tfdt; subsequent segments stay on the
+// media-time anchor (see videoTfdtForSegment / audioTfdtForSegment).
 func wallclockTicks(now, ast time.Time, timescale uint64) uint64 {
 	if ast.IsZero() {
 		return 0

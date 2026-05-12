@@ -479,6 +479,68 @@ func TestSplitADTSBundle(t *testing.T) {
 	})
 }
 
+// TestTfdtForSegment — sequential-after-first tfdt anchoring. First
+// segment lands on wallclock-since-AST so the MPD timeline is wallclock-
+// anchored at its origin; subsequent segments are cumulative on media
+// time so adjacent <S t=...> entries are contiguous (zero inter-segment
+// gap).
+func TestTfdtForSegment(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("video_first_seg_uses_wallclock_anchor", func(t *testing.T) {
+		// No entries → seeds onto wallclockTicks(now, AST). At now=AST,
+		// wallclockTicks = 0.
+		got := videoTfdtForSegment(nil, t0, t0)
+		if got != 0 {
+			t.Errorf("first segment tfdt at now==AST → %d, want 0", got)
+		}
+	})
+
+	t.Run("video_first_seg_seeded_late", func(t *testing.T) {
+		// AST set, but first emit happens 3 s after. tfdt should reflect
+		// that wallclock offset so the MPD timeline starts at the right
+		// place.
+		got := videoTfdtForSegment(nil, t0.Add(3*time.Second), t0)
+		want := uint64(3) * uint64(VideoTimescale)
+		if got != want {
+			t.Errorf("first segment tfdt at now=AST+3s → %d, want %d", got, want)
+		}
+	})
+
+	t.Run("video_subsequent_seg_uses_prev_end", func(t *testing.T) {
+		entries := []SegmentEntry{
+			{StartTicks: 0, DurTicks: 6 * uint64(VideoTimescale)},      // ends at 6s
+			{StartTicks: 6 * uint64(VideoTimescale), DurTicks: 540000}, // ends at 12s
+		}
+		// now is irrelevant for subsequent segments — should NOT influence tfdt.
+		got := videoTfdtForSegment(entries, t0.Add(time.Hour), t0)
+		want := uint64(12) * uint64(VideoTimescale)
+		if got != want {
+			t.Errorf("subsequent seg tfdt = %d, want %d (= prev.Start + prev.Dur)", got, want)
+		}
+	})
+
+	t.Run("audio_first_seg_uses_wallclock_anchor_with_sr_timescale", func(t *testing.T) {
+		// Audio timescale = sample rate. At 48 kHz, wallclockTicks(now=AST, AST) = 0.
+		got := audioTfdtForSegment(nil, t0, t0, 48000)
+		if got != 0 {
+			t.Errorf("first audio seg tfdt at now==AST → %d, want 0", got)
+		}
+	})
+
+	t.Run("audio_subsequent_uses_prev_end", func(t *testing.T) {
+		entries := []SegmentEntry{
+			{StartTicks: 0, DurTicks: 2 * 48000},     // 2 s @ 48 kHz
+			{StartTicks: 2 * 48000, DurTicks: 96000}, // ends at 4 s
+		}
+		got := audioTfdtForSegment(entries, t0.Add(time.Hour), t0, 48000)
+		want := uint64(4) * 48000
+		if got != want {
+			t.Errorf("subsequent audio seg tfdt = %d, want %d", got, want)
+		}
+	})
+}
+
 // TestComputeVideoSegDurTicks — dur math must cover [first.PTS,
 // next.PTS] so the segment doesn't visibly under-report by one
 // inter-frame interval (the player-visible 1-frame stutter at every
