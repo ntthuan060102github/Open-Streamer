@@ -320,6 +320,82 @@ func TestProcess_InterleavedVAEmitsBothInFirstPMT(t *testing.T) {
 	}
 }
 
+// TestProcess_LazyAddStream188ByteChunks — mimic file.go's exact
+// production pattern: lazy AddStream (video added on first video Write,
+// audio added on first audio Write), and the source emits 188-byte TS
+// chunks one at a time (matching FileReader.Read returning one packet
+// per call). Stream a 200 ms span (many V+A frames; well within
+// gomedia's 400 ms PMT-refresh window for early frames) into tsnorm
+// and verify that BOTH H264 and AAC frames survive the roundtrip —
+// the audio loss reproducer for test2 (mp4 file source).
+func TestProcess_LazyAddStream188ByteChunks(t *testing.T) {
+	// Source muxer: lazy AddStream just like file.go's mp4Handler.
+	src := gompeg2.NewTSMuxer()
+	var chunks [][]byte
+	src.OnPacket = func(b []byte) {
+		// Mimic file.go: copy each 188-byte packet into its own chunk
+		// so the downstream Process() runs once per source TS packet.
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		chunks = append(chunks, cp)
+	}
+	vpid := src.AddStream(gompeg2.TS_STREAM_H264)
+	_ = src.Write(vpid, buildH264IDR(), 0, 0)
+	apid := src.AddStream(gompeg2.TS_STREAM_AAC) // late, just like file.go's mp4Handler
+	// Span >500 ms so gomedia's 400 ms PMT-refresh fires at least once
+	// and emits a PMT update listing BOTH streams — that's how file.go
+	// recovers in production (and what gives tsnorm.demuxer a chance to
+	// learn the AAC PID once it's announced).
+	for i := 1; i < 30; i++ {
+		audioPTS := uint64(i) * 21 // ~48 kHz frame interval
+		videoPTS := uint64(i) * 40 // 25 fps frame interval
+		_ = src.Write(apid, []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}, audioPTS, audioPTS)
+		_ = src.Write(vpid, buildH264NonIDR(), videoPTS, videoPTS)
+	}
+
+	n := tsnorm.New(timeline.DefaultConfig())
+	var collected bytes.Buffer
+	for _, ch := range chunks {
+		out, err := n.Process(ch)
+		if err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		collected.Write(out)
+	}
+
+	demux := gompeg2.NewTSDemuxer()
+	sawH264 := 0
+	sawAAC := 0
+	var firstAACBytes []byte
+	demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, frame []byte, _, _ uint64) {
+		switch cid { //nolint:exhaustive // test only counts H264 / AAC.
+		case gompeg2.TS_STREAM_H264:
+			sawH264++
+		case gompeg2.TS_STREAM_AAC:
+			sawAAC++
+			if firstAACBytes == nil {
+				firstAACBytes = bytes.Clone(frame)
+			}
+		}
+	}
+	if err := demux.Input(bytes.NewReader(collected.Bytes())); err != nil {
+		t.Fatalf("output demux: %v", err)
+	}
+	if sawH264 == 0 {
+		t.Error("output yielded no H264 frames")
+	}
+	if sawAAC == 0 {
+		t.Fatal("output yielded no AAC frames — file.go's lazy AddStream + 188-byte chunks reproduce test2's missing audio")
+	}
+	// Audio init segment in DASH packager requires parseADTS(av.Data)
+	// to succeed on the first AAC frame. Verify the roundtrip preserves
+	// the ADTS sync word so the downstream init build can pick up
+	// sample rate / channel config.
+	if len(firstAACBytes) < 2 || firstAACBytes[0] != 0xFF || firstAACBytes[1]&0xF0 != 0xF0 {
+		t.Errorf("first AAC frame lost its ADTS prefix in the lazy-AddStream roundtrip: %x", firstAACBytes[:min(len(firstAACBytes), 10)])
+	}
+}
+
 // ─── helpers ────────────────────────────────────────────────────────
 
 // muxSingleH264 builds a TS chunk containing one IDR with the given

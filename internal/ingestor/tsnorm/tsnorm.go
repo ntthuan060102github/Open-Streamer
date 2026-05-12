@@ -64,13 +64,20 @@ type Normaliser struct {
 	demuxer *gompeg2.TSDemuxer
 
 	// Per-codec PIDs registered eagerly at construction. Pre-registering
-	// all three means the very first PAT/PMT pair the muxer writes
-	// lists every PID downstream may encounter; codec frames that
+	// H.264 + AAC (the canonical AV pair) means the very first PAT/PMT
+	// pair the muxer writes lists both PIDs — second-codec frames that
 	// arrive after the first PMT write get demuxed correctly on the
 	// receiver side instead of being dropped on an unannounced PID.
+	//
+	// H.265 is registered ONLY when the first H.265 frame arrives (see
+	// onFrame), to avoid putting a phantom HEVC PID in PMT that ffprobe
+	// and strict demuxers surface as a second video stream — which
+	// breaks DASH packagers that assume one video adaptation set per
+	// stream.
 	pidH264 uint16
 	pidH265 uint16
 	pidAAC  uint16
+	hasH265 bool
 
 	// outBuf collects 188-byte TS packets emitted by the muxer during
 	// the current Process call. Reset on every Process entry.
@@ -98,7 +105,6 @@ func New(cfg timeline.Config) *Normaliser {
 		demuxer: gompeg2.NewTSDemuxer(),
 	}
 	n.pidH264 = n.muxer.AddStream(gompeg2.TS_STREAM_H264)
-	n.pidH265 = n.muxer.AddStream(gompeg2.TS_STREAM_H265)
 	n.pidAAC = n.muxer.AddStream(gompeg2.TS_STREAM_AAC)
 	n.muxer.OnPacket = func(b []byte) {
 		n.outBuf.Write(b)
@@ -148,8 +154,8 @@ func (n *Normaliser) OnSession(sess *domain.StreamSession) {
 	n.norm.OnSession(sess)
 	n.muxer = gompeg2.NewTSMuxer()
 	n.pidH264 = n.muxer.AddStream(gompeg2.TS_STREAM_H264)
-	n.pidH265 = n.muxer.AddStream(gompeg2.TS_STREAM_H265)
 	n.pidAAC = n.muxer.AddStream(gompeg2.TS_STREAM_AAC)
+	n.hasH265 = false
 	n.muxer.OnPacket = func(b []byte) {
 		n.outBuf.Write(b)
 	}
@@ -182,12 +188,20 @@ func (n *Normaliser) onFrame(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts 
 }
 
 // pidForCodec routes a normalised AVPacket to the muxer PID registered
-// for that codec in New. Returns ok=false for codecs we don't carry.
+// for that codec. H.264 and AAC are pre-registered at construction.
+// H.265 is registered lazily on its first frame so a phantom HEVC PID
+// doesn't appear in PMT for sources that only carry H.264 (the empty
+// PID surfaces as a "second video stream" in strict demuxers like
+// ffprobe / dash.js, which then refuse to build the video init).
 func (n *Normaliser) pidForCodec(c domain.AVCodec) (uint16, bool) {
 	switch c { //nolint:exhaustive // unsupported codecs intentionally drop — see buildAVPacket.
 	case domain.AVCodecH264:
 		return n.pidH264, true
 	case domain.AVCodecH265:
+		if !n.hasH265 {
+			n.pidH265 = n.muxer.AddStream(gompeg2.TS_STREAM_H265)
+			n.hasH265 = true
+		}
 		return n.pidH265, true
 	case domain.AVCodecAAC:
 		return n.pidAAC, true
