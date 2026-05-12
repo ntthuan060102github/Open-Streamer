@@ -32,7 +32,9 @@ import (
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	goflv "github.com/yapingcat/gomedia/go-flv"
 	gomp4 "github.com/yapingcat/gomedia/go-mp4"
-	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 const (
@@ -199,13 +201,8 @@ type mp4Handler struct {
 	loop  bool
 	f     *os.File
 	demux *gomp4.MovDemuxer
-	mux   *gompeg2.TSMuxer
+	mux   *tsmux.FromAV
 	queue [][]byte
-
-	vpid uint16
-	apid uint16
-	vset bool
-	aset bool
 
 	// Continuous-PTS state. On loop reset, ptsOffset jumps forward by the
 	// duration of the just-finished iteration so the new iteration's
@@ -231,12 +228,7 @@ func newMP4Handler(path string, loop bool) (*mp4Handler, error) {
 	}
 
 	h := &mp4Handler{path: path, loop: loop, f: f}
-	h.mux = gompeg2.NewTSMuxer()
-	h.mux.OnPacket = func(pkg []byte) {
-		out := make([]byte, len(pkg))
-		copy(out, pkg)
-		h.queue = append(h.queue, out)
-	}
+	h.mux = tsmux.NewFromAV()
 
 	if err := h.reset(); err != nil {
 		_ = f.Close()
@@ -266,9 +258,12 @@ func (h *mp4Handler) reset() error {
 	h.maxDtsSeen = 0
 	h.firstDtsSeen = 0
 	h.hasFirstDts = false
-	// Keep vpid/apid + vset/aset across loops: same TSMuxer, same PIDs →
-	// downstream consumers don't see a stream-shape change. Resetting them
-	// would make AddStream allocate fresh PIDs and break the continuity.
+	// Keep the shared *tsmux.FromAV across loops: same PIDs and same
+	// continuity counters → downstream consumers don't see a fake
+	// stream-shape change at loop boundaries. astits's PSI emission
+	// resets automatically the next time a keyframe with
+	// RandomAccessIndicator lands, so a player joining mid-loop still
+	// gets a fresh PAT/PMT quickly.
 	h.paceOnce = false
 	slog.Info("file reader: mp4 loop reset",
 		"path", h.path,
@@ -332,32 +327,53 @@ func (h *mp4Handler) feedNextPacket(ctx context.Context) error {
 }
 
 func (h *mp4Handler) muxPacket(pkt *gomp4.AVPacket, adjPts, adjDts uint64) {
-	switch pkt.Cid {
-	case gomp4.MP4_CODEC_H264:
-		if !h.vset {
-			h.vpid = h.mux.AddStream(gompeg2.TS_STREAM_H264)
-			h.vset = true
-		}
-		_ = h.mux.Write(h.vpid, pkt.Data, adjPts, adjDts)
-
-	case gomp4.MP4_CODEC_H265:
-		if !h.vset {
-			h.vpid = h.mux.AddStream(gompeg2.TS_STREAM_H265)
-			h.vset = true
-		}
-		_ = h.mux.Write(h.vpid, pkt.Data, adjPts, adjDts)
-
-	case gomp4.MP4_CODEC_AAC:
-		if !h.aset {
-			h.apid = h.mux.AddStream(gompeg2.TS_STREAM_AAC)
-			h.aset = true
-		}
-		_ = h.mux.Write(h.apid, pkt.Data, adjPts, adjDts)
-
-	case gomp4.MP4_CODEC_G711A, gomp4.MP4_CODEC_G711U,
-		gomp4.MP4_CODEC_MP2, gomp4.MP4_CODEC_MP3, gomp4.MP4_CODEC_OPUS:
-		// unsupported audio codecs — skip
+	av := mp4PacketToAV(pkt, adjPts, adjDts)
+	if av == nil {
+		return
 	}
+	h.mux.Write(av, h.enqueueTS)
+}
+
+// enqueueTS is the OnPacket callback for tsmux.FromAV — each emitted
+// 188-byte TS packet is appended to the handler's queue (read() drains
+// it one packet at a time).
+func (h *mp4Handler) enqueueTS(pkt []byte) {
+	out := make([]byte, len(pkt))
+	copy(out, pkt)
+	h.queue = append(h.queue, out)
+}
+
+// mp4PacketToAV converts a gomp4 demuxer packet to an AVPacket the
+// tsmux layer accepts. Returns nil for codecs we don't re-mux to TS
+// (G.711, MP2/MP3, Opus — gomp4 surfaces them but Open-Streamer's
+// downstream path doesn't carry them on the AV side).
+func mp4PacketToAV(pkt *gomp4.AVPacket, adjPts, adjDts uint64) *domain.AVPacket {
+	switch pkt.Cid { //nolint:exhaustive // unsupported codecs intentionally drop — gomp4 emits G.711 / MP2 / MP3 / Opus but we don't carry them in TS pipelines
+	case gomp4.MP4_CODEC_H264:
+		return &domain.AVPacket{
+			Codec:    domain.AVCodecH264,
+			Data:     pkt.Data,
+			PTSms:    adjPts,
+			DTSms:    adjDts,
+			KeyFrame: tsmux.KeyFrameH264(pkt.Data),
+		}
+	case gomp4.MP4_CODEC_H265:
+		return &domain.AVPacket{
+			Codec:    domain.AVCodecH265,
+			Data:     pkt.Data,
+			PTSms:    adjPts,
+			DTSms:    adjDts,
+			KeyFrame: tsmux.KeyFrameH265(pkt.Data),
+		}
+	case gomp4.MP4_CODEC_AAC:
+		return &domain.AVPacket{
+			Codec: domain.AVCodecAAC,
+			Data:  pkt.Data,
+			PTSms: adjPts,
+			DTSms: adjDts,
+		}
+	}
+	return nil
 }
 
 func (h *mp4Handler) pace(ctx context.Context, dtsMS uint64) {
@@ -394,14 +410,9 @@ type flvHandler struct {
 	loop   bool
 	f      *os.File
 	reader *goflv.FlvReader
-	mux    *gompeg2.TSMuxer
+	mux    *tsmux.FromAV
 	queue  [][]byte
 	buf    []byte
-
-	vpid uint16
-	apid uint16
-	vset bool
-	aset bool
 
 	// Continuous-PTS state across loops — same rationale as mp4Handler.
 	// FLV PTS/DTS are 32-bit milliseconds, so the offset is uint32 too.
@@ -431,14 +442,18 @@ func newFLVHandler(path string, loop bool) (*flvHandler, error) {
 		f:    f,
 		buf:  make([]byte, flvReadBuf),
 	}
-	h.mux = gompeg2.NewTSMuxer()
-	h.mux.OnPacket = func(pkg []byte) {
-		out := make([]byte, len(pkg))
-		copy(out, pkg)
-		h.queue = append(h.queue, out)
-	}
+	h.mux = tsmux.NewFromAV()
 	h.buildReader()
 	return h, nil
+}
+
+// enqueueTS is the OnPacket callback for tsmux.FromAV — each emitted
+// 188-byte TS packet is appended to the handler's queue (read() drains
+// it one packet at a time).
+func (h *flvHandler) enqueueTS(pkt []byte) {
+	out := make([]byte, len(pkt))
+	copy(out, pkt)
+	h.queue = append(h.queue, out)
 }
 
 // buildReader creates (or recreates) the stateful FlvReader with all callbacks wired.
@@ -466,36 +481,48 @@ func (h *flvHandler) buildReader() {
 	h.reader = r
 }
 
-// muxFrame routes a decoded FLV frame to the MPEG-TS muxer, adding the stream
-// track on first use (lazy registration matches the MP4 handler pattern).
+// muxFrame routes a decoded FLV frame to the MPEG-TS muxer.
+// tsmux.FromAV handles per-codec elementary-stream registration and
+// PSI emit cadence (force PAT/PMT on H.264/H.265 keyframes).
 func (h *flvHandler) muxFrame(cid gocodec.CodecID, frame []byte, pts uint32, dts uint32) {
-	switch cid {
-	case gocodec.CODECID_VIDEO_H264:
-		if !h.vset {
-			h.vpid = h.mux.AddStream(gompeg2.TS_STREAM_H264)
-			h.vset = true
-		}
-		_ = h.mux.Write(h.vpid, frame, uint64(pts), uint64(dts))
-
-	case gocodec.CODECID_VIDEO_H265:
-		if !h.vset {
-			h.vpid = h.mux.AddStream(gompeg2.TS_STREAM_H265)
-			h.vset = true
-		}
-		_ = h.mux.Write(h.vpid, frame, uint64(pts), uint64(dts))
-
-	case gocodec.CODECID_AUDIO_AAC:
-		if !h.aset {
-			h.apid = h.mux.AddStream(gompeg2.TS_STREAM_AAC)
-			h.aset = true
-		}
-		_ = h.mux.Write(h.apid, frame, uint64(pts), uint64(dts))
-
-	case gocodec.CODECID_VIDEO_VP8,
-		gocodec.CODECID_AUDIO_G711A, gocodec.CODECID_AUDIO_G711U,
-		gocodec.CODECID_AUDIO_OPUS, gocodec.CODECID_AUDIO_MP3:
-		// unsupported codecs — skip
+	av := flvFrameToAV(cid, frame, pts, dts)
+	if av == nil {
+		return
 	}
+	h.mux.Write(av, h.enqueueTS)
+}
+
+// flvFrameToAV maps an FLV-demuxer codec ID + payload to an AVPacket.
+// Returns nil for codecs Open-Streamer's TS-path doesn't carry (VP8,
+// G.711, Opus, MP3 — gomedia's FlvReader surfaces them but downstream
+// pipelines aren't wired for them today).
+func flvFrameToAV(cid gocodec.CodecID, frame []byte, pts, dts uint32) *domain.AVPacket {
+	switch cid { //nolint:exhaustive // unsupported codecs intentionally drop — gomedia's FlvReader surfaces VP8 / G.711 / Opus / MP3 but Open-Streamer's TS-path doesn't carry them today
+	case gocodec.CODECID_VIDEO_H264:
+		return &domain.AVPacket{
+			Codec:    domain.AVCodecH264,
+			Data:     frame,
+			PTSms:    uint64(pts),
+			DTSms:    uint64(dts),
+			KeyFrame: tsmux.KeyFrameH264(frame),
+		}
+	case gocodec.CODECID_VIDEO_H265:
+		return &domain.AVPacket{
+			Codec:    domain.AVCodecH265,
+			Data:     frame,
+			PTSms:    uint64(pts),
+			DTSms:    uint64(dts),
+			KeyFrame: tsmux.KeyFrameH265(frame),
+		}
+	case gocodec.CODECID_AUDIO_AAC:
+		return &domain.AVPacket{
+			Codec: domain.AVCodecAAC,
+			Data:  frame,
+			PTSms: uint64(pts),
+			DTSms: uint64(dts),
+		}
+	}
+	return nil
 }
 
 func (h *flvHandler) reset() error {

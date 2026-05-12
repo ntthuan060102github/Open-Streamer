@@ -1,89 +1,191 @@
+// Package tsmux converts AVPackets into 188-byte MPEG-TS packets.
+//
+// The Muxer is built on github.com/asticode/go-astits. Unlike gomedia's
+// fixed 400 ms PAT/PMT cadence, astits emits PSI either every N PES
+// packets (MuxerOptTablesRetransmitPeriod) OR immediately before any
+// PES whose AdaptationField has RandomAccessIndicator=true on the
+// PCR PID. We set RAI on every H.264/H.265 keyframe so each IDR is
+// preceded by fresh PAT → PMT → IDR. This guarantees HLS / DASH
+// segments cut at an IDR start with the canonical PSI sequence —
+// without it, players hit "non-existing PPS 0 referenced" decoder
+// errors on segments where source-side PSI happened to land in the
+// middle of a previous GOP.
 package tsmux
 
 import (
+	"bytes"
+	"context"
+
 	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/asticode/go-astits"
 	gocodec "github.com/yapingcat/gomedia/go-codec"
-	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
-// FromAV wraps a gomedia TSMuxer and converts AVPackets into 188-byte MPEG-TS packets.
-// One instance per output pipeline (segmenter, publisher pump, transcoder stdin feeder, …).
-type FromAV struct {
-	mux *gompeg2.TSMuxer
+// PID convention. astits requires explicit elementary stream PIDs
+// (gomedia auto-assigned starting at 0x100). Mirror that convention so
+// the wire format stays familiar for diagnostic tools (Wireshark,
+// TSDuck) and so any downstream consumer that hard-coded a PID still
+// works after the migration.
+const (
+	videoPID = 0x100 // 256
+	audioPID = 0x101 // 257
+)
 
-	vpid uint16
-	apid uint16
+// tablesRetransmitPeriod is how often astits emits PAT/PMT in steady
+// state (counted in PES packets, not wallclock). The IDR-triggered
+// force-emit is the primary mechanism; this is the fallback for the
+// gap between IDRs. At 30 fps video, 40 PES packets ≈ 1.3 s — short
+// enough that a player joining mid-GOP catches PSI within typical
+// HLS segment latency.
+const tablesRetransmitPeriod = 40
+
+// FromAV is a per-pipeline TS muxer. One instance per output channel
+// (HLS segmenter, RTMP publisher pump, transcoder stdin feeder, …).
+type FromAV struct {
+	mux *astits.Muxer
+	buf bytes.Buffer // astits writes 188-byte packets into here
+
 	hasV bool
 	hasA bool
 }
 
 // NewFromAV creates an empty muxer; streams are added on first packet per codec.
 func NewFromAV() *FromAV {
-	return &FromAV{mux: gompeg2.NewTSMuxer()}
+	f := &FromAV{}
+	f.mux = astits.NewMuxer(
+		context.Background(),
+		bufWriter{buf: &f.buf},
+		astits.MuxerOptTablesRetransmitPeriod(tablesRetransmitPeriod),
+	)
+	return f
 }
 
-// Write converts one AVPacket to TS transport packets via OnPacket callback.
+// bufWriter is the io.Writer astits emits TS bytes into. Reset before
+// each WriteData call so we can collect the produced 188-byte packets
+// and forward them to the caller's onPacket without retaining state.
+type bufWriter struct{ buf *bytes.Buffer }
+
+func (w bufWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
+
+// Write converts one AVPacket to TS transport packets via onPacket.
+// onPacket may be called multiple times when a single PES spans more
+// than one 188-byte packet (the common case for video keyframes).
 func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 	if p == nil || len(p.Data) == 0 || onPacket == nil {
 		return
 	}
-	f.mux.OnPacket = onPacket
-	switch p.Codec {
-	case domain.AVCodecUnknown, domain.AVCodecRawTSChunk:
-		return // unsupported — RawTSChunk is forwarded as Packet.TS upstream, never reaches the muxer
-	case domain.AVCodecH264:
-		if !f.hasV {
-			f.vpid = f.mux.AddStream(gompeg2.TS_STREAM_H264)
-			f.hasV = true
-		}
-		_ = f.mux.Write(f.vpid, p.Data, p.PTSms, p.DTSms) //nolint:errcheck // mux logs internally
-	case domain.AVCodecH265:
-		if !f.hasV {
-			f.vpid = f.mux.AddStream(gompeg2.TS_STREAM_H265)
-			f.hasV = true
-		}
-		_ = f.mux.Write(f.vpid, p.Data, p.PTSms, p.DTSms) //nolint:errcheck
-	case domain.AVCodecAAC:
-		if !f.hasA {
-			f.apid = f.mux.AddStream(gompeg2.TS_STREAM_AAC)
-			f.hasA = true
-		}
-		dts := p.DTSms
-		if dts == 0 {
-			dts = p.PTSms
-		}
-		_ = f.mux.Write(f.apid, p.Data, p.PTSms, dts) //nolint:errcheck
-	case domain.AVCodecAC3, domain.AVCodecEAC3,
-		domain.AVCodecAV1, domain.AVCodecMPEG2Video:
-		// These codecs are recognised at the stats / config layer but we
-		// don't currently have a frame extractor that produces AVPackets
-		// for them — the existing gompeg2 demuxer drops their PES payload.
-		// Re-mux through this path therefore never triggers in practice
-		// today; the case exists for exhaustiveness so future contributors
-		// adding a custom frame extractor can wire muxing here without
-		// chasing a silent default-skip bug.
-		return
-	case domain.AVCodecMP2, domain.AVCodecMP3:
-		// MPEG-1/2 Audio Layer I/II/III — use stream_type 0x04 (MPEG-2
-		// audio) as the canonical container for both. The Layer is
-		// encoded in each frame header itself, not in the PMT, so a
-		// player decoding the resulting TS will pick up Layer III (MP3)
-		// or Layer II (MP2) automatically. gomedia's TSMuxer accepts
-		// both 0x03 and 0x04; 0x04 is the broader-compatibility choice.
-		if !f.hasA {
-			f.apid = f.mux.AddStream(gompeg2.TS_STREAM_AUDIO_MPEG2)
-			f.hasA = true
-		}
-		dts := p.DTSms
-		if dts == 0 {
-			dts = p.PTSms
-		}
-		_ = f.mux.Write(f.apid, p.Data, p.PTSms, dts) //nolint:errcheck
-	default:
+	pid, streamType, isVideo, ok := f.codecRouting(p.Codec)
+	if !ok {
 		return
 	}
+	if isVideo && !f.hasV {
+		if err := f.mux.AddElementaryStream(astits.PMTElementaryStream{
+			ElementaryPID: pid,
+			StreamType:    streamType,
+		}); err != nil {
+			return
+		}
+		// PCR rides on the video PID (canonical for AV streams). This is
+		// what gives RandomAccessIndicator on a keyframe its force-emit
+		// effect: astits checks `d.PID == m.pmt.PCRPID` before honouring
+		// RAI as a "force tables" signal.
+		f.mux.SetPCRPID(pid)
+		f.hasV = true
+	} else if !isVideo && !f.hasA {
+		if err := f.mux.AddElementaryStream(astits.PMTElementaryStream{
+			ElementaryPID: pid,
+			StreamType:    streamType,
+		}); err != nil {
+			return
+		}
+		// Fallback PCR PID for audio-only pipelines. Force-emit on
+		// keyframes won't fire for audio (no IDR concept on AAC), so
+		// audio-only pipelines rely on the retransmit period.
+		if !f.hasV {
+			f.mux.SetPCRPID(pid)
+		}
+		f.hasA = true
+	}
+
+	// PTS / DTS in 90 kHz ticks (MPEG-TS native).
+	ptsTicks := int64(p.PTSms) * 90 //nolint:gosec
+	dtsTicks := int64(p.DTSms) * 90 //nolint:gosec
+	if p.DTSms == 0 && p.PTSms != 0 {
+		dtsTicks = ptsTicks
+	}
+	pts := &astits.ClockReference{Base: ptsTicks}
+	dts := &astits.ClockReference{Base: dtsTicks}
+
+	// AdaptationField with RandomAccessIndicator on video keyframes
+	// triggers astits to emit PAT + PMT immediately before this PES.
+	// See package doc-comment for why this fixes the HLS IDR-alignment
+	// bug. Audio frames never get RAI — there's no IDR equivalent and
+	// astits ignores RAI on non-PCR PIDs anyway.
+	var af *astits.PacketAdaptationField
+	if isVideo && p.KeyFrame {
+		af = &astits.PacketAdaptationField{RandomAccessIndicator: true}
+	}
+
+	indicator := uint8(astits.PTSDTSIndicatorOnlyPTS)
+	if p.DTSms != 0 && p.DTSms != p.PTSms {
+		indicator = astits.PTSDTSIndicatorBothPresent
+	}
+
+	f.buf.Reset()
+	_, _ = f.mux.WriteData(&astits.MuxerData{
+		PID:             pid,
+		AdaptationField: af,
+		PES: &astits.PESData{
+			Data: p.Data,
+			Header: &astits.PESHeader{
+				OptionalHeader: &astits.PESOptionalHeader{
+					PTS:             pts,
+					DTS:             dts,
+					PTSDTSIndicator: indicator,
+				},
+			},
+		},
+	})
+
+	emitPerPacket(f.buf.Bytes(), onPacket)
+}
+
+// emitPerPacket splits a multi-packet buffer into individual 188-byte
+// callbacks, matching gomedia.TSMuxer's per-packet OnPacket cadence.
+// Tail bytes that don't form a full 188-byte packet (shouldn't happen
+// since astits pads with stuffing) are skipped.
+func emitPerPacket(buf []byte, onPacket func([]byte)) {
+	const tsPacketSize = 188
+	for i := 0; i+tsPacketSize <= len(buf); i += tsPacketSize {
+		// Copy out — caller may retain (e.g. HLS segBuf append) and
+		// astits reuses its internal buffer across WriteData calls.
+		pkt := make([]byte, tsPacketSize)
+		copy(pkt, buf[i:i+tsPacketSize])
+		onPacket(pkt)
+	}
+}
+
+// codecRouting maps a domain codec to its TS PID + StreamType. Returns
+// ok=false for codecs we don't currently re-mux (raw-TS marker,
+// unsupported audio variants, codecs without an AVPacket extractor).
+func (f *FromAV) codecRouting(c domain.AVCodec) (pid uint16, st astits.StreamType, isVideo, ok bool) {
+	switch c { //nolint:exhaustive // unsupported codecs intentionally drop — RawTSChunk is forwarded as Packet.TS upstream, never reaches the muxer; AC-3 / E-AC-3 / AV1 / MPEG-2 video have no AVPacket producer today
+	case domain.AVCodecH264:
+		return videoPID, astits.StreamTypeH264Video, true, true
+	case domain.AVCodecH265:
+		return videoPID, astits.StreamTypeH265Video, true, true
+	case domain.AVCodecAAC:
+		return audioPID, astits.StreamTypeAACAudio, false, true
+	case domain.AVCodecMP2, domain.AVCodecMP3:
+		// MPEG-1/2 Audio Layer I/II/III. astits's MPEG2Audio (0x04) is
+		// the broader-compatibility choice; the Layer is encoded in the
+		// frame header itself so a player picks Layer III (MP3) or
+		// Layer II (MP2) automatically.
+		return audioPID, astits.StreamTypeMPEG2Audio, false, true
+	}
+	return 0, 0, false, false
 }
 
 // KeyFrameH264 reports whether Annex-B H.264 payload contains an IDR slice.
@@ -118,12 +220,11 @@ func FeedWirePacket(ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]by
 //
 // Use case: the publisher's serve_rtmp pipeline needs SPS/PPS to build
 // the AVCDecoderConfigurationRecord seq header tag, but receives raw TS
-// from the buffer hub (no AV packets). gomedia's TSDemuxer should
-// preserve SPS/PPS in OnFrame access-unit bytes per its source, but
-// some upstream code paths or stream variations have produced frames
-// without parameter sets. Scanning raw TS bytes is a defensive
-// fallback that does NOT depend on the demuxer's frame-splitting
-// behaviour.
+// from the buffer hub (no AV packets). The TS demuxer should preserve
+// SPS/PPS in OnFrame access-unit bytes per its source, but some upstream
+// code paths or stream variations have produced frames without
+// parameter sets. Scanning raw TS bytes is a defensive fallback that
+// does NOT depend on the demuxer's frame-splitting behaviour.
 //
 // SPS validation: every candidate (byte after a start code with low-5
 // bits == 7) is parsed via mp4ff's avc.ParseSPSNALUnit. False

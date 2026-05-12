@@ -56,13 +56,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
-
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
@@ -150,10 +149,10 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 	p.tsBuf = tb
 	go p.feedLoop(ctx, sub, tb)
 
-	demux := mpeg2.NewTSDemuxer()
-	demux.OnFrame = p.onTSFrame
+	dmx := tsdemux.New()
+	dmx.OnFrame = p.onTSFrame
 	demuxDone := make(chan error, 1)
-	go func() { demuxDone <- demux.Input(tb) }()
+	go func() { demuxDone <- dmx.Input(tb) }()
 
 	select {
 	case <-ctx.Done():
@@ -321,32 +320,32 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 // tag (with proper composition_time for B-frames) and writes via lal.
 //
 //nolint:exhaustive // RTMP push only carries H.264 + AAC; H.265 needs Enhanced RTMP, MP3 unsupported by most ingest servers
-func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+func (p *rtmpPushPackager) onTSFrame(cid tsdemux.StreamType, frame []byte, pts, dts uint64) {
 	if p.connErr.Load() != nil || len(frame) == 0 {
 		return
 	}
 
 	if !p.baseDTSSet {
-		p.baseDTS = int64(dts)
+		p.baseDTS = int64(dts) //nolint:gosec
 		p.baseDTSSet = true
 	}
-	// mpeg2.TSDemuxer.OnFrame already converts MPEG-TS 90 kHz ticks to ms
-	// before calling us (see ts-demuxer.go: `stream.pkg.pts/90`). Do NOT
+	// tsdemux exposes PTS / DTS in milliseconds already (astits's raw
+	// 90 kHz tick value is divided by 90 in the wrapper). Do NOT
 	// divide again here.
-	relDTS := int64(dts) - p.baseDTS
+	relDTS := int64(dts) - p.baseDTS //nolint:gosec
 	if relDTS < 0 {
 		relDTS = 0
 	}
-	relPTS := int64(pts) - p.baseDTS
+	relPTS := int64(pts) - p.baseDTS //nolint:gosec
 	if relPTS < 0 {
 		relPTS = 0
 	}
 
 	var err error
-	switch cid {
-	case mpeg2.TS_STREAM_H264:
+	switch cid { //nolint:exhaustive // see top-of-function comment
+	case tsdemux.StreamTypeH264:
 		err = p.codec.FeedH264(frame, relDTS, relPTS)
-	case mpeg2.TS_STREAM_AAC:
+	case tsdemux.StreamTypeAAC:
 		err = p.codec.FeedAAC(frame, relDTS)
 	default:
 		return

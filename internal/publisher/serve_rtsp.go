@@ -53,10 +53,10 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg4audio"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
@@ -328,9 +328,9 @@ func runRTSPPipeline(
 		}
 		demuxBuf = newTSBuffer(streamCode)
 		demuxDone = make(chan error, 1)
-		demux := mpeg2.NewTSDemuxer()
-		demux.OnFrame = sess.onTSFrame
-		go func() { demuxDone <- demux.Input(demuxBuf) }()
+		dmx := tsdemux.New()
+		dmx.OnFrame = sess.onTSFrame
+		go func() { demuxDone <- dmx.Input(demuxBuf) }()
 	}
 	defer func() {
 		if demuxBuf != nil {
@@ -553,18 +553,15 @@ func (sess *rtspSession) handleAVPacket(av *domain.AVPacket) {
 // onTSFrame is the demuxer callback used only on the raw-TS fallback
 // path (sources that publish pre-muxed TS into the buffer hub). AV
 // sources reach handleVideo / handleAudio via handleAVPacket directly.
-func (sess *rtspSession) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+func (sess *rtspSession) onTSFrame(cid tsdemux.StreamType, frame []byte, pts, dts uint64) {
 	if len(frame) == 0 {
 		return
 	}
-	switch cid {
-	case mpeg2.TS_STREAM_H264:
+	switch cid { //nolint:exhaustive // H.265 / MPEG audio intentionally drop — RTSP serve carries only H.264 + AAC in this build
+	case tsdemux.StreamTypeH264:
 		sess.handleVideo(frame, pts, dts)
-	case mpeg2.TS_STREAM_AAC:
+	case tsdemux.StreamTypeAAC:
 		sess.handleAudio(frame, dts)
-	case mpeg2.TS_STREAM_H265,
-		mpeg2.TS_STREAM_AUDIO_MPEG1,
-		mpeg2.TS_STREAM_AUDIO_MPEG2:
 	default:
 	}
 }

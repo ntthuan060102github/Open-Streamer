@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/Eyevinn/mp4ff/aac"
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
@@ -233,7 +233,7 @@ func (p *Packager) onPacket(pkt buffer.Packet, tsCarry *[]byte, tb **tsBuffer) {
 // safe.
 //
 //nolint:exhaustive // unsupported codecs (PCM / MPEG audio L1/L2 / AC-3) intentionally drop
-func (p *Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+func (p *Packager) onTSFrame(cid tsdemux.StreamType, frame []byte, pts, dts uint64) {
 	if len(frame) == 0 {
 		return
 	}
@@ -244,15 +244,15 @@ func (p *Packager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts ui
 		KeyFrame: false,
 	}
 	switch cid {
-	case mpeg2.TS_STREAM_H264:
+	case tsdemux.StreamTypeH264:
 		av.Codec = domain.AVCodecH264
 		av.KeyFrame = tsmux.KeyFrameH264(frame)
 		p.onAVPacket(av)
-	case mpeg2.TS_STREAM_H265:
+	case tsdemux.StreamTypeH265:
 		av.Codec = domain.AVCodecH265
 		av.KeyFrame = tsmux.KeyFrameH265(frame)
 		p.onAVPacket(av)
-	case mpeg2.TS_STREAM_AAC:
+	case tsdemux.StreamTypeAAC:
 		av.Codec = domain.AVCodecAAC
 		p.onAVPacket(av)
 	}

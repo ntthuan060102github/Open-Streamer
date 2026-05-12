@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 )
 
 // demux.go — raw-TS chunk → AV frame demuxer.
@@ -151,16 +151,20 @@ func alignTS(carry *[]byte, chunk []byte) []byte {
 
 // onTSFrameFunc is the callback signature the demuxer fires per
 // extracted access unit. cid distinguishes H.264 / H.265 / AAC.
-type onTSFrameFunc func(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64)
+//
+// Type alias of tsdemux.OnFrameFunc so caller code in this package
+// stays grep-able under the historical name while the underlying
+// signature is the wrapper package's.
+type onTSFrameFunc = tsdemux.OnFrameFunc
 
 // startDemuxer launches the TSDemuxer goroutine consuming from tb.
 // The OnFrame callback fires synchronously from that goroutine.
 // Caller must Close(tb) to unblock the demuxer on shutdown.
 func startDemuxer(tb *tsBuffer, onFrame onTSFrameFunc) {
-	demux := mpeg2.NewTSDemuxer()
-	demux.OnFrame = onFrame
+	dmx := tsdemux.New()
+	dmx.OnFrame = onFrame
 	go func() {
-		if err := demux.Input(tb); err != nil && err != io.EOF {
+		if err := dmx.Input(tb); err != nil && err != io.EOF {
 			slog.Debug("dash: demuxer exit", "err", err)
 		}
 	}()

@@ -18,23 +18,43 @@
 // publishTime", and player freezes documented in
 // docs/DASH_OUTSTANDING_BUGS.md.
 //
-// Pipeline
+// # Pipeline
 //
-//	chunk → mpeg2.TSDemuxer    ─OnFrame→ domain.AVPacket
+//	chunk → gomedia.TSDemuxer    ─OnFrame→ domain.AVPacket
 //	                                          │
 //	                          timeline.Normaliser.Apply (drop if Apply=false)
 //	                                          │
-//	                                mpeg2.TSMuxer.Write
+//	                                astits.Muxer.WriteData
+//	                          (RandomAccessIndicator=true on H.264 / H.265 IDR
+//	                           forces PAT/PMT to be emitted IMMEDIATELY before
+//	                           the IDR PES — closes the HLS "non-existing PPS
+//	                           referenced" decoder-error window that gomedia's
+//	                           fixed 400 ms PSI cadence left open)
 //	                                          │
-//	                                ─OnPacket→ accumulated TS bytes → return
+//	                                ─io.Writer→ outBuf → return
 //
 // Per-stream state lives in Normaliser; one Process call is atomic
 // (mutex guarded so the demuxer / muxer / output buffer aren't shared
 // across concurrent calls).
 //
+// # Library split
+//
+// Input demux still uses gomedia/go-mpeg2.TSDemuxer because its
+// callback-style OnFrame fits the per-Process synchronous flow:
+// astits's pull-only NextData API requires either a long-lived
+// goroutine + chan-backed reader (complex sync) or a fresh demuxer
+// per chunk (which loses cross-chunk PES assembly state for sources
+// whose chunks aren't aligned to PES boundaries). Output mux uses
+// astits.Muxer because its `RandomAccessIndicator → force-tables`
+// path is the exact escape hatch gomedia's TSMuxer lacks. Migrating
+// the demuxer side to astits is tracked as future work; gomedia's
+// remaining footprint in this package is the input boundary only.
+//
+// # Session boundary
+//
 // On a stream-session boundary (failover, reconnect, stall recovery)
 // the caller should invoke OnSession to rebuild the muxer (fresh
-// continuity counters + PMT) and reset the Normaliser's per-track
+// continuity counters + PSI) and reset the Normaliser's per-track
 // anchors so the first post-boundary packet is rebased against the
 // new wallclock origin instead of being either dropped or hard
 // re-anchored against stale state.
@@ -42,15 +62,36 @@ package tsnorm
 
 import (
 	"bytes"
+	"context"
 	"sync"
 	"time"
 
+	"github.com/asticode/go-astits"
 	gocodec "github.com/yapingcat/gomedia/go-codec"
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
+
+// Output PID convention. Matches tsmux.FromAV so diagnostic tools see
+// the same PIDs across all our TS-emitting paths. H.265 sits on a
+// dedicated PID so it can be lazy-added when (and only when) an H.265
+// frame actually arrives — avoids a phantom HEVC entry in the PMT for
+// H.264-only sources (which strict demuxers like ffprobe surface as
+// a "second video stream" and which broke the DASH packager's
+// init-segment build state in early s3-s4 testing).
+const (
+	videoPID = 0x100 // H.264
+	audioPID = 0x101 // AAC
+	h265PID  = 0x102 // H.265 (lazy-added on first H.265 frame)
+)
+
+// muxerTablesRetransmitPeriod is the PAT/PMT retransmit cadence in PES
+// packets. The keyframe-triggered force-emit (RandomAccessIndicator
+// in the adaptation field) is the primary mechanism; this catches the
+// gap between IDRs for sources with very long GOPs.
+const muxerTablesRetransmitPeriod = 40
 
 // Normaliser wallclock-anchors the per-PES PTS / DTS values inside one
 // stream's MPEG-TS byte feed. NOT safe for concurrent Process calls —
@@ -60,58 +101,70 @@ type Normaliser struct {
 	mu sync.Mutex
 
 	norm    *timeline.Normaliser
-	muxer   *gompeg2.TSMuxer
 	demuxer *gompeg2.TSDemuxer
 
-	// Per-codec PIDs registered eagerly at construction. Pre-registering
-	// H.264 + AAC (the canonical AV pair) means the very first PAT/PMT
-	// pair the muxer writes lists both PIDs — second-codec frames that
-	// arrive after the first PMT write get demuxed correctly on the
-	// receiver side instead of being dropped on an unannounced PID.
-	//
-	// H.265 is registered ONLY when the first H.265 frame arrives (see
-	// onFrame), to avoid putting a phantom HEVC PID in PMT that ffprobe
-	// and strict demuxers surface as a second video stream — which
-	// breaks DASH packagers that assume one video adaptation set per
-	// stream.
-	pidH264 uint16
-	pidH265 uint16
-	pidAAC  uint16
-	hasH265 bool
-
-	// outBuf collects 188-byte TS packets emitted by the muxer during
-	// the current Process call. Reset on every Process entry.
+	// Mux pipeline state. The astits.Muxer writes to outBuf via the
+	// bufWriter; we drain outBuf at the end of each Process call.
+	muxer  *astits.Muxer
 	outBuf bytes.Buffer
+
+	// Tracks whether the canonical H.264 + AAC streams have been
+	// registered on the muxer (pre-registration happens in
+	// buildMuxer; this flag is just for symmetry with the H.265
+	// lazy-register path).
+	hasH265 bool
 }
 
 // New constructs a Normaliser with the given timeline config. The
 // caller usually passes timeline.DefaultConfig().
 //
-// Construction eagerly registers H.264 / H.265 / AAC streams on the
-// internal muxer. gomedia's TSMuxer only re-emits PAT/PMT every 400 ms
-// of source DTS; if we registered streams lazily on first-frame the
-// PMT emitted alongside the first video PES would NOT yet list the
-// audio PID (or vice versa), and any audio PES queued within the same
-// 400 ms PMT window would land on an un-announced PID. Downstream
-// demuxers silently drop PES on un-announced PIDs, so the audio
-// AdaptationSet would disappear from the DASH MPD entirely (root
-// cause of test2 audio loss after S4 wired tsnorm into the
-// raw-TS write path). Pre-registration costs a few extra bytes per
-// PMT (PIDs for codecs that never carry data) — harmless.
+// astits's RandomAccessIndicator on PCR-PID PES auto-emits PAT + PMT
+// immediately before that PES. We set RAI on every H.264 / H.265
+// keyframe so each IDR is preceded by fresh PSI — that's what fixes
+// the HLS "non-existing PPS 0 referenced" decode failures we hit when
+// gomedia's fixed 400 ms PAT cadence happened to land mid-GOP.
 func New(cfg timeline.Config) *Normaliser {
 	n := &Normaliser{
 		norm:    timeline.New(cfg),
-		muxer:   gompeg2.NewTSMuxer(),
 		demuxer: gompeg2.NewTSDemuxer(),
 	}
-	n.pidH264 = n.muxer.AddStream(gompeg2.TS_STREAM_H264)
-	n.pidAAC = n.muxer.AddStream(gompeg2.TS_STREAM_AAC)
-	n.muxer.OnPacket = func(b []byte) {
-		n.outBuf.Write(b)
-	}
+	n.buildMuxer()
 	n.demuxer.OnFrame = n.onFrame
 	return n
 }
+
+// buildMuxer (re)builds the astits.Muxer and pre-registers the
+// canonical H.264 + AAC elementary streams. Called from New and
+// after OnSession so post-boundary output starts with fresh
+// continuity counters + PSI version.
+//
+// H.264 + AAC are pre-registered (PMT lists them from byte 0). H.265
+// is registered lazily on first H.265 frame to avoid a phantom HEVC
+// PID confusing strict downstream demuxers on H.264-only sources.
+func (n *Normaliser) buildMuxer() {
+	n.outBuf.Reset()
+	n.muxer = astits.NewMuxer(
+		context.Background(),
+		bufWriter{buf: &n.outBuf},
+		astits.MuxerOptTablesRetransmitPeriod(muxerTablesRetransmitPeriod),
+	)
+	_ = n.muxer.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: videoPID,
+		StreamType:    astits.StreamTypeH264Video,
+	})
+	_ = n.muxer.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: audioPID,
+		StreamType:    astits.StreamTypeAACAudio,
+	})
+	n.muxer.SetPCRPID(videoPID)
+	n.hasH265 = false
+}
+
+// bufWriter is the io.Writer astits emits TS bytes into. Process()
+// drains it on every call so it never grows unbounded.
+type bufWriter struct{ buf *bytes.Buffer }
+
+func (w bufWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
 
 // Process feeds one upstream TS chunk through the demux → normalise →
 // mux pipeline and returns the remuxed bytes. The returned slice is
@@ -140,8 +193,8 @@ func (n *Normaliser) Process(chunk []byte) ([]byte, error) {
 // OnSession resets per-track timeline anchors so the first post-
 // boundary packet seeds against a fresh wallclock origin, and rebuilds
 // the muxer so output continuity counters + PSI restart cleanly.
-// Pre-registration of all three codecs is re-applied so the post-
-// boundary PMT lists every PID from the first PMT write.
+// Pre-registration of H.264 + AAC is re-applied so the post-boundary
+// PMT lists both PIDs from the first PMT write.
 //
 // nil session is a no-op (matches timeline.Normaliser.OnSession
 // semantics).
@@ -152,21 +205,15 @@ func (n *Normaliser) OnSession(sess *domain.StreamSession) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.norm.OnSession(sess)
-	n.muxer = gompeg2.NewTSMuxer()
-	n.pidH264 = n.muxer.AddStream(gompeg2.TS_STREAM_H264)
-	n.pidAAC = n.muxer.AddStream(gompeg2.TS_STREAM_AAC)
-	n.hasH265 = false
-	n.muxer.OnPacket = func(b []byte) {
-		n.outBuf.Write(b)
-	}
+	n.buildMuxer()
 }
 
 // onFrame is the TSDemuxer callback fired synchronously during
 // demuxer.Input. Caller holds n.mu through Process so this runs
 // inside that critical section.
 //
-// Dispatches the incoming PES payload to the correct pre-registered
-// muxer PID. Unsupported codecs (MP1/MP2/MP3 audio, AC-3, etc.) are
+// Dispatches the incoming PES payload to the correct astits muxer
+// PID. Unsupported codecs (MP1/MP2/MP3 audio, AC-3, etc.) are
 // silently dropped — buildAVPacket signals that via ok=false.
 func (n *Normaliser) onFrame(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
 	av, ok := buildAVPacket(cid, frame, pts, dts)
@@ -176,37 +223,75 @@ func (n *Normaliser) onFrame(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts 
 	if !n.norm.Apply(av, time.Now()) {
 		return
 	}
-	pid, ok := n.pidForCodec(av.Codec)
-	if !ok {
-		return
-	}
-	dtsOut := av.DTSms
-	if dtsOut == 0 {
-		dtsOut = av.PTSms
-	}
-	_ = n.muxer.Write(pid, av.Data, av.PTSms, dtsOut)
+	n.writeMuxed(av)
 }
 
-// pidForCodec routes a normalised AVPacket to the muxer PID registered
-// for that codec. H.264 and AAC are pre-registered at construction.
-// H.265 is registered lazily on its first frame so a phantom HEVC PID
-// doesn't appear in PMT for sources that only carry H.264 (the empty
-// PID surfaces as a "second video stream" in strict demuxers like
-// ffprobe / dash.js, which then refuse to build the video init).
-func (n *Normaliser) pidForCodec(c domain.AVCodec) (uint16, bool) {
-	switch c { //nolint:exhaustive // unsupported codecs intentionally drop — see buildAVPacket.
+// writeMuxed routes a normalised AVPacket to the astits muxer's
+// PID for its codec and sets RandomAccessIndicator on H.26x
+// keyframes (which triggers astits to emit fresh PAT/PMT before
+// this PES — the HLS fix this package exists for).
+//
+// H.265 PID is added lazily here so streams that never carry H.265
+// don't get a phantom HEVC entry in their PMT.
+func (n *Normaliser) writeMuxed(av *domain.AVPacket) {
+	var (
+		pid     uint16
+		isVideo bool
+	)
+	switch av.Codec { //nolint:exhaustive // buildAVPacket constrains the codec set; unreachable codecs return early
 	case domain.AVCodecH264:
-		return n.pidH264, true
+		pid = videoPID
+		isVideo = true
 	case domain.AVCodecH265:
 		if !n.hasH265 {
-			n.pidH265 = n.muxer.AddStream(gompeg2.TS_STREAM_H265)
+			_ = n.muxer.AddElementaryStream(astits.PMTElementaryStream{
+				ElementaryPID: h265PID,
+				StreamType:    astits.StreamTypeH265Video,
+			})
+			// Force PMT to refresh now so downstream demuxers learn the
+			// HEVC PID before the first H.265 PES bytes hit the wire.
+			// Without this the next PES would land on an unannounced PID
+			// (the existing PMT only listed H.264 + AAC at construction)
+			// and downstream demuxers silently drop it.
+			_, _ = n.muxer.WriteTables()
 			n.hasH265 = true
 		}
-		return n.pidH265, true
+		pid = h265PID
+		isVideo = true
 	case domain.AVCodecAAC:
-		return n.pidAAC, true
+		pid = audioPID
+	default:
+		return
 	}
-	return 0, false
+
+	indicator := uint8(astits.PTSDTSIndicatorOnlyPTS)
+	dts := av.DTSms
+	if dts == 0 {
+		dts = av.PTSms
+	}
+	if dts != av.PTSms {
+		indicator = astits.PTSDTSIndicatorBothPresent
+	}
+
+	var af *astits.PacketAdaptationField
+	if isVideo && av.KeyFrame {
+		af = &astits.PacketAdaptationField{RandomAccessIndicator: true}
+	}
+
+	_, _ = n.muxer.WriteData(&astits.MuxerData{
+		PID:             pid,
+		AdaptationField: af,
+		PES: &astits.PESData{
+			Data: av.Data,
+			Header: &astits.PESHeader{
+				OptionalHeader: &astits.PESOptionalHeader{
+					PTS:             &astits.ClockReference{Base: int64(av.PTSms) * 90}, //nolint:gosec
+					DTS:             &astits.ClockReference{Base: int64(dts) * 90},      //nolint:gosec
+					PTSDTSIndicator: indicator,
+				},
+			},
+		},
+	})
 }
 
 // buildAVPacket constructs a domain.AVPacket from a TSDemuxer frame
