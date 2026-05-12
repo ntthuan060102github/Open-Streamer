@@ -31,11 +31,16 @@ import (
 // downstream session-boundary signal.
 const (
 	// stallThreshold is the gap-since-last-write that the watchdog
-	// treats as a source stall. 3 s balances "real stall worth signalling"
-	// against "transient jitter we should ignore" — sources at 4 Mbps
-	// pause for 200–500 ms regularly during HLS chunk fetches; 3 s is
-	// well beyond that.
-	stallThreshold = 3 * time.Second
+	// treats as a source stall. Sources at 4 Mbps pause for 200–500 ms
+	// regularly during HLS chunk fetches, and bursty HLS-pull sources
+	// commonly deliver one ~6 s chunk per ~6 s of wallclock — between
+	// chunks there's a ~5 s legitimate silence. A 3 s threshold fired
+	// on every HLS chunk gap, producing `EXT-X-DISCONTINUITY` on every
+	// HLS segment and spurious `SessionStartStallRecovery` events.
+	// 15 s tolerates typical HLS-pull cadence (with margin) while still
+	// catching real stalls quickly enough to signal before the player's
+	// buffer underruns (timeShiftBufferDepth defaults to 24 s).
+	stallThreshold = 15 * time.Second
 	// stallCheckInterval is how often the watchdog ticks. Smaller than
 	// stallThreshold so the detection latency is bounded.
 	stallCheckInterval = 1 * time.Second

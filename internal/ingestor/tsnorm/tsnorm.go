@@ -24,9 +24,9 @@
 //	                                          │
 //	                          timeline.Normaliser.Apply (drop if Apply=false)
 //	                                          │
-//	                                  tsmux.FromAV.Write
+//	                                mpeg2.TSMuxer.Write
 //	                                          │
-//	                                ─onPacket→ accumulated TS bytes → return
+//	                                ─OnPacket→ accumulated TS bytes → return
 //
 // Per-stream state lives in Normaliser; one Process call is atomic
 // (mutex guarded so the demuxer / muxer / output buffer aren't shared
@@ -50,7 +50,6 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
-	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
 // Normaliser wallclock-anchors the per-PES PTS / DTS values inside one
@@ -61,8 +60,17 @@ type Normaliser struct {
 	mu sync.Mutex
 
 	norm    *timeline.Normaliser
-	muxer   *tsmux.FromAV
+	muxer   *gompeg2.TSMuxer
 	demuxer *gompeg2.TSDemuxer
+
+	// Per-codec PIDs registered eagerly at construction. Pre-registering
+	// all three means the very first PAT/PMT pair the muxer writes
+	// lists every PID downstream may encounter; codec frames that
+	// arrive after the first PMT write get demuxed correctly on the
+	// receiver side instead of being dropped on an unannounced PID.
+	pidH264 uint16
+	pidH265 uint16
+	pidAAC  uint16
 
 	// outBuf collects 188-byte TS packets emitted by the muxer during
 	// the current Process call. Reset on every Process entry.
@@ -71,11 +79,29 @@ type Normaliser struct {
 
 // New constructs a Normaliser with the given timeline config. The
 // caller usually passes timeline.DefaultConfig().
+//
+// Construction eagerly registers H.264 / H.265 / AAC streams on the
+// internal muxer. gomedia's TSMuxer only re-emits PAT/PMT every 400 ms
+// of source DTS; if we registered streams lazily on first-frame the
+// PMT emitted alongside the first video PES would NOT yet list the
+// audio PID (or vice versa), and any audio PES queued within the same
+// 400 ms PMT window would land on an un-announced PID. Downstream
+// demuxers silently drop PES on un-announced PIDs, so the audio
+// AdaptationSet would disappear from the DASH MPD entirely (root
+// cause of test2 audio loss after S4 wired tsnorm into the
+// raw-TS write path). Pre-registration costs a few extra bytes per
+// PMT (PIDs for codecs that never carry data) — harmless.
 func New(cfg timeline.Config) *Normaliser {
 	n := &Normaliser{
 		norm:    timeline.New(cfg),
-		muxer:   tsmux.NewFromAV(),
+		muxer:   gompeg2.NewTSMuxer(),
 		demuxer: gompeg2.NewTSDemuxer(),
+	}
+	n.pidH264 = n.muxer.AddStream(gompeg2.TS_STREAM_H264)
+	n.pidH265 = n.muxer.AddStream(gompeg2.TS_STREAM_H265)
+	n.pidAAC = n.muxer.AddStream(gompeg2.TS_STREAM_AAC)
+	n.muxer.OnPacket = func(b []byte) {
+		n.outBuf.Write(b)
 	}
 	n.demuxer.OnFrame = n.onFrame
 	return n
@@ -108,6 +134,8 @@ func (n *Normaliser) Process(chunk []byte) ([]byte, error) {
 // OnSession resets per-track timeline anchors so the first post-
 // boundary packet seeds against a fresh wallclock origin, and rebuilds
 // the muxer so output continuity counters + PSI restart cleanly.
+// Pre-registration of all three codecs is re-applied so the post-
+// boundary PMT lists every PID from the first PMT write.
 //
 // nil session is a no-op (matches timeline.Normaliser.OnSession
 // semantics).
@@ -118,12 +146,22 @@ func (n *Normaliser) OnSession(sess *domain.StreamSession) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.norm.OnSession(sess)
-	n.muxer = tsmux.NewFromAV()
+	n.muxer = gompeg2.NewTSMuxer()
+	n.pidH264 = n.muxer.AddStream(gompeg2.TS_STREAM_H264)
+	n.pidH265 = n.muxer.AddStream(gompeg2.TS_STREAM_H265)
+	n.pidAAC = n.muxer.AddStream(gompeg2.TS_STREAM_AAC)
+	n.muxer.OnPacket = func(b []byte) {
+		n.outBuf.Write(b)
+	}
 }
 
 // onFrame is the TSDemuxer callback fired synchronously during
 // demuxer.Input. Caller holds n.mu through Process so this runs
 // inside that critical section.
+//
+// Dispatches the incoming PES payload to the correct pre-registered
+// muxer PID. Unsupported codecs (MP1/MP2/MP3 audio, AC-3, etc.) are
+// silently dropped — buildAVPacket signals that via ok=false.
 func (n *Normaliser) onFrame(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
 	av, ok := buildAVPacket(cid, frame, pts, dts)
 	if !ok {
@@ -132,14 +170,34 @@ func (n *Normaliser) onFrame(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts 
 	if !n.norm.Apply(av, time.Now()) {
 		return
 	}
-	n.muxer.Write(av, func(b []byte) {
-		n.outBuf.Write(b)
-	})
+	pid, ok := n.pidForCodec(av.Codec)
+	if !ok {
+		return
+	}
+	dtsOut := av.DTSms
+	if dtsOut == 0 {
+		dtsOut = av.PTSms
+	}
+	_ = n.muxer.Write(pid, av.Data, av.PTSms, dtsOut)
+}
+
+// pidForCodec routes a normalised AVPacket to the muxer PID registered
+// for that codec in New. Returns ok=false for codecs we don't carry.
+func (n *Normaliser) pidForCodec(c domain.AVCodec) (uint16, bool) {
+	switch c { //nolint:exhaustive // unsupported codecs intentionally drop — see buildAVPacket.
+	case domain.AVCodecH264:
+		return n.pidH264, true
+	case domain.AVCodecH265:
+		return n.pidH265, true
+	case domain.AVCodecAAC:
+		return n.pidAAC, true
+	}
+	return 0, false
 }
 
 // buildAVPacket constructs a domain.AVPacket from a TSDemuxer frame
 // callback. Returns ok=false for stream types we don't currently
-// re-mux through tsmux.FromAV (every supported codec maps here).
+// re-mux (every supported codec maps here).
 //
 // Duplicated from ingestor/pull/tsdemux_packet_reader.go to avoid a
 // circular import — both packages live under internal/ingestor and
@@ -148,7 +206,7 @@ func (n *Normaliser) onFrame(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts 
 func buildAVPacket(cid gompeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) (*domain.AVPacket, bool) {
 	var cdc domain.AVCodec
 	var keyFrame bool
-	switch cid { //nolint:exhaustive // MPEG audio (MP1/MP2/MP3) and AC-3 variants intentionally drop — tsmux.FromAV doesn't accept them via the AVCodec switch and rebuilding a passthrough path purely for codec types we never re-mux isn't worth the complexity.
+	switch cid { //nolint:exhaustive // MPEG audio (MP1/MP2/MP3) and AC-3 variants intentionally drop — tsnorm's muxer pre-registers only H.264 / H.265 / AAC, and rebuilding a passthrough path purely for codec types we never re-mux isn't worth the complexity.
 	case gompeg2.TS_STREAM_H264:
 		cdc = domain.AVCodecH264
 		keyFrame = gocodec.IsH264IDRFrame(frame)

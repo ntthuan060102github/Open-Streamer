@@ -209,6 +209,117 @@ func TestOnSessionResetsAnchor(t *testing.T) {
 	}
 }
 
+// TestProcess_PreservesAACADTSPrefix — file-source (gomedia/go-mp4
+// MP4Demuxer) AAC samples arrive ADTS-prefixed. The DASH packager's
+// handleAAC requires the ADTS header to build the audio init segment
+// (parseADTS on av.Data). If the demux/remux roundtrip strips or
+// mangles the ADTS prefix, downstream DASH never builds audioInit and
+// the audio AdaptationSet disappears from the MPD entirely —
+// reproduced on staging with test2 (mp4 file source) after S4 wired
+// tsnorm into writeRawTSChunk.
+func TestProcess_PreservesAACADTSPrefix(t *testing.T) {
+	// 7-byte ADTS header for AAC LC @ 16 kHz mono, frame_length=8
+	// (header 7 + 1 payload byte). Same shape as testADTSFrame in
+	// dash/packager_test.go. Mux it into a TS chunk via gomedia, run
+	// it through tsnorm, then re-demux the output and verify the
+	// emitted frame still starts with the ADTS sync word (0xFFF).
+	adtsFrame := []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}
+	srcMuxer := tsmux.NewFromAV()
+	var srcBuf bytes.Buffer
+	srcMuxer.Write(&domain.AVPacket{
+		Codec: domain.AVCodecAAC,
+		Data:  adtsFrame,
+		PTSms: 0,
+		DTSms: 0,
+	}, func(b []byte) { srcBuf.Write(b) })
+	if srcBuf.Len() == 0 {
+		t.Fatal("source muxer produced no TS bytes for AAC")
+	}
+
+	n := tsnorm.New(timeline.DefaultConfig())
+	out, err := n.Process(srcBuf.Bytes())
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("Process returned no bytes — AAC frame was dropped")
+	}
+
+	// Demux the output and check the first AAC frame still starts with
+	// the ADTS sync word (0xFFF in the first 12 bits = 0xFF 0xFx).
+	demux := gompeg2.NewTSDemuxer()
+	var firstAAC []byte
+	demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, frame []byte, _, _ uint64) {
+		if cid == gompeg2.TS_STREAM_AAC && firstAAC == nil {
+			firstAAC = bytes.Clone(frame)
+		}
+	}
+	if err := demux.Input(bytes.NewReader(out)); err != nil {
+		t.Fatalf("output demux: %v", err)
+	}
+	if firstAAC == nil {
+		t.Fatal("output demux did not yield any AAC frames")
+	}
+	if len(firstAAC) < 2 {
+		t.Fatalf("AAC frame too short: %x", firstAAC)
+	}
+	// ADTS sync word: 0xFFF in first 12 bits.
+	if firstAAC[0] != 0xFF || firstAAC[1]&0xF0 != 0xF0 {
+		t.Errorf("AAC frame lost its ADTS prefix\n  got:  %x\n  want: starts with 0xFF 0xFx", firstAAC[:min(len(firstAAC), 10)])
+	}
+}
+
+// TestProcess_InterleavedVAEmitsBothInFirstPMT — verifies that
+// pre-registration of all three codecs in tsnorm.New makes the very
+// first PMT the muxer emits list every PID. Without pre-registration,
+// gomedia's TSMuxer would emit PAT+PMT on the first frame's codec
+// only; the second codec's PES (arriving within the 400 ms PMT-refresh
+// window) would land on a PID downstream demuxers haven't announced
+// and get silently dropped. This was the root cause of test2 mp4
+// source losing its entire audio AdaptationSet after S4.
+//
+// Source built via gomedia directly with BOTH streams pre-registered
+// (so the input PMT has both PIDs from the start) — that mimics
+// file.go's behaviour AFTER its second-codec AddStream + the 400 ms
+// PMT-refresh tick has fired. The test then verifies tsnorm preserves
+// both codecs in the output.
+func TestProcess_InterleavedVAEmitsBothInFirstPMT(t *testing.T) {
+	src := gompeg2.NewTSMuxer()
+	var srcBuf bytes.Buffer
+	src.OnPacket = func(b []byte) { srcBuf.Write(b) }
+	vpid := src.AddStream(gompeg2.TS_STREAM_H264)
+	apid := src.AddStream(gompeg2.TS_STREAM_AAC)
+	_ = src.Write(vpid, buildH264IDR(), 0, 0)
+	_ = src.Write(apid, []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}, 50, 50)
+
+	n := tsnorm.New(timeline.DefaultConfig())
+	out, err := n.Process(srcBuf.Bytes())
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	demux := gompeg2.NewTSDemuxer()
+	sawH264 := false
+	sawAAC := false
+	demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, _ []byte, _, _ uint64) {
+		switch cid { //nolint:exhaustive // test only checks H264 / AAC presence; other codecs irrelevant.
+		case gompeg2.TS_STREAM_H264:
+			sawH264 = true
+		case gompeg2.TS_STREAM_AAC:
+			sawAAC = true
+		}
+	}
+	if err := demux.Input(bytes.NewReader(out)); err != nil {
+		t.Fatalf("demux: %v", err)
+	}
+	if !sawH264 {
+		t.Error("output did not yield H264 frame")
+	}
+	if !sawAAC {
+		t.Error("output did not yield AAC frame — the bug: PMT didn't announce AAC PID before audio PES")
+	}
+}
+
 // ─── helpers ────────────────────────────────────────────────────────
 
 // muxSingleH264 builds a TS chunk containing one IDR with the given
