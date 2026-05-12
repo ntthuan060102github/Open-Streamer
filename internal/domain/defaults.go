@@ -132,29 +132,6 @@ const (
 	// minor RTP jitter without firing on normal live latency.
 	DefaultPTSMaxBehindMs int64 = 3000
 
-	// DefaultPTSWallclockAheadCapMs is the cumulative forward-drift cap
-	// vs wallclock. The Normaliser's existing JumpThresholdMs uses
-	// max(actualNow, lastOutputDts) as its baseline — once a track has
-	// drifted forward of wallclock, drift collapses to the per-packet
-	// frame interval (~40 ms) and the threshold never fires. This cap
-	// is computed against actual wallclock so cumulative drift IS
-	// caught, regardless of source type. Tightens the timeline
-	// invariant from "monotonic-per-track" to "wallclock-bounded-
-	// per-track", which is what every downstream consumer (HLS / DASH
-	// segmenter, RTSP / RTMP publisher, player) actually assumes.
-	//
-	// 3 s is wide enough to tolerate legitimate B-frame CTO (≤200 ms
-	// typical), small source jitter, and the initial CrossTrackSnap
-	// gap; tight enough to catch the May 12 production drift classes:
-	//   - mixer:// initial-burst (test_mixer: bac_ninh transcoder
-	//     startup flush → V output 42 s ahead of A, stable),
-	//   - source clock running fast (test3: RTSP republish V at
-	//     1.16× wallclock → 16 s/min cumulative),
-	//   - file source loop-wrap and HLS-pull chunk-arrival burst.
-	// All three exhaust the cap within one or two re-anchor cycles
-	// and converge back to wallclock.
-	DefaultPTSWallclockAheadCapMs int64 = 3000
-
 	// DefaultSRTLatencyMS is the SRT ARQ latency window (milliseconds) when
 	// SRTListenerConfig.LatencyMS is zero. 120ms matches Haivision's
 	// reference for low-latency contribution links.

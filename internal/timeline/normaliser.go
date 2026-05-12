@@ -70,25 +70,6 @@ type Config struct {
 	// last emitted DTS. Mirrors ptsrebaser.crossTrackSnapMs (1000 ms),
 	// exposed here as a knob so tests can vary it.
 	CrossTrackSnapMs int64
-
-	// WallclockAheadCapMs is the maximum forward drift of a track's
-	// emitted DTS relative to wallclock — once exceeded, the track is
-	// hard-re-anchored back to the wallclock floor. The existing drift
-	// check uses max(actualNow, lastOutputDts), which masks cumulative
-	// forward drift once a track is ahead: drift then collapses to the
-	// per-packet input increment and never re-converges. This cap is
-	// computed against actual wallclock and catches:
-	//   - mixer:// initial-burst flush after upstream warmup delay
-	//     (e.g. bac_ninh+test2 producing a 4 s V-burst → 40+s
-	//     V-leads-A gap that stayed forever),
-	//   - sources whose PTS clock runs slightly faster than wallclock
-	//     (RTSP-republish video at 1.16× wallclock → ~16s/min drift),
-	//   - file source loop-wrap and HLS-pull chunk accumulation.
-	// Zero disables the branch. Recommended production default 3000
-	// (3 s) — wide enough to tolerate legitimate B-frame CTO and small
-	// source jitter, tight enough to catch pathological drift within
-	// one segment window.
-	WallclockAheadCapMs int64
 }
 
 // DefaultConfig matches ptsrebaser.DefaultConfig so a side-by-side run
@@ -327,19 +308,7 @@ func (n *Normaliser) Apply(p *domain.AVPacket, now time.Time) bool {
 	regressed := expectedDts < track.lastOutputDts
 	tooFarBehind := n.cfg.MaxBehindMs > 0 && drift < -n.cfg.MaxBehindMs
 
-	// Cumulative wallclock-ahead cap. The per-packet drift above uses
-	// max(actualNow, lastOutputDts) which collapses to the input
-	// frame-interval once a track has drifted forward of wallclock —
-	// drift can grow unboundedly without ever triggering the
-	// JumpThreshold (per-packet ~40 ms < 2000 ms). wallDrift compares
-	// against ACTUAL wallclock so cumulative forward drift IS caught.
-	// See WallclockAheadCapMs's docstring for the source classes this
-	// protects against.
-	wallDrift := expectedDts - actualNowMs
-	tooFarAheadOfWall := n.cfg.WallclockAheadCapMs > 0 &&
-		wallDrift > n.cfg.WallclockAheadCapMs
-
-	if tooFarAhead || regressed || tooFarBehind || tooFarAheadOfWall {
+	if tooFarAhead || regressed || tooFarBehind {
 		target := actualNowMs
 		if target <= track.lastOutputDts {
 			target = track.lastOutputDts + 1
