@@ -345,6 +345,16 @@ func readLoop(
 		if stats != nil {
 			stats.Close()
 		}
+		// Drain any in-flight reassembled H.264 / H.265 access unit
+		// held back by tsNorm's coalesce-by-DTS — without this, the
+		// last frame of a stream (where no follow-up frame arrives to
+		// trigger the next-DTS flush) would be silently dropped when
+		// the worker exits on a clean source EOF.
+		if tsNorm != nil {
+			if tail := tsNorm.Flush(); len(tail) > 0 {
+				_ = buf.Write(bufferWriteID, buffer.Packet{TS: tail})
+			}
+		}
 	}()
 
 	// Stall watchdog: emits SessionStartStallRecovery on the buffer hub

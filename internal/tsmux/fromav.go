@@ -160,6 +160,18 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 		}
 	}
 
+	// Per-frame indicator: BothPresent only when DTS truly differs
+	// from PTS (B-frame reorder). For I/P-frames where DTS == PTS,
+	// OnlyPTS saves 5 bytes and players treat the absent DTS as
+	// "DTS = PTS" implicitly.
+	//
+	// We tried "always BothPresent for video" to fix test2's hls.js
+	// playback (mixed indicator was suspected to confuse the player),
+	// but that EXPOSED non-monotonic DTS values previously masked
+	// by OnlyPTS in test_puhser / test5 / test_mixer — sources that
+	// emit duplicate or near-duplicate DTS get tolerated when DTS
+	// is implicit but rejected when explicit. Net effect was: test2
+	// improved marginally, other streams regressed. Reverted.
 	indicator := uint8(astits.PTSDTSIndicatorOnlyPTS)
 	if p.DTSms != 0 && p.DTSms != p.PTSms {
 		indicator = astits.PTSDTSIndicatorBothPresent

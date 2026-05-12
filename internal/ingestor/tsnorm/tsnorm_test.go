@@ -50,6 +50,10 @@ func TestProcess_PreservesH264KeyframePayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
+	// Drain any reassembled access unit held back across Process calls
+	// — see Normaliser.Flush doc-comment for why production relies on
+	// the next-frame trigger and tests need an explicit drain instead.
+	out = append(out, n.Flush()...)
 	if len(out) == 0 {
 		t.Fatal("Process returned no bytes for non-empty chunk")
 	}
@@ -105,6 +109,7 @@ func TestProcess_AnchorsPTSToWallclock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
+	out = append(out, n.Flush()...)
 
 	demux := gompeg2.NewTSDemuxer()
 	var ptsValues []uint64
@@ -152,6 +157,7 @@ func TestProcess_DisabledConfigPassesThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
+	out = append(out, n.Flush()...)
 
 	demux := gompeg2.NewTSDemuxer()
 	var ptsValues []uint64
@@ -184,6 +190,10 @@ func TestOnSessionResetsAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process 1: %v", err)
 	}
+	// Drain pulse 1 before OnSession — OnSession drops pendingVideo
+	// to prevent the old-timeline tail leaking into the new session,
+	// so we must commit pulse 1's bytes via Flush first.
+	out1 = append(out1, n.Flush()...)
 	pts1 := firstH264PTS(t, out1)
 	if pts1 > 1000 {
 		t.Errorf("pulse 1 first frame PTS = %d, expected near 0", pts1)
@@ -203,6 +213,7 @@ func TestOnSessionResetsAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process 2: %v", err)
 	}
+	out2 = append(out2, n.Flush()...)
 	pts2 := firstH264PTS(t, out2)
 	if pts2 > 1000 {
 		t.Errorf("pulse 2 first frame PTS after OnSession reset = %d, expected near 0", pts2)
@@ -424,6 +435,7 @@ func TestProcess_PreservesH265KeyframePayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Process: %v", err)
 	}
+	out = append(out, n.Flush()...)
 	if len(out) == 0 {
 		t.Fatal("Process returned no bytes for H.265 input — lazy AddStream failed")
 	}
