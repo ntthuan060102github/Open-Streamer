@@ -13,6 +13,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/tsnorm"
 	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
 
@@ -21,6 +22,15 @@ import (
 // matches the existing test expectations on PTS/DTS.
 func disabledNormaliser() *timeline.Normaliser {
 	return timeline.New(timeline.Config{})
+}
+
+// disabledTSNormaliser mirrors disabledNormaliser for the raw-TS path:
+// a Normaliser whose underlying timeline.Config is Enabled=false so
+// PTS/DTS pass through untouched. The demux/mux roundtrip still runs
+// (so writeRawTSChunk exercises its normal code path) but the timeline
+// re-anchor does nothing.
+func disabledTSNormaliser() *tsnorm.Normaliser {
+	return tsnorm.New(timeline.Config{})
 }
 
 // ---- mock PacketReader ----
@@ -113,7 +123,7 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser())
+		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser())
 	}()
 
 	var received [][]byte
@@ -149,7 +159,7 @@ func TestReadLoop_ContextCancelled(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		cancel()
-		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser())
+		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser())
 	}()
 
 	select {
@@ -178,7 +188,7 @@ func TestReadLoop_SkipsEmptyPackets(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser())
+		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser())
 	}()
 
 	select {
