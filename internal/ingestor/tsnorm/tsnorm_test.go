@@ -396,6 +396,104 @@ func TestProcess_LazyAddStream188ByteChunks(t *testing.T) {
 	}
 }
 
+// TestProcess_PreservesH265KeyframePayload — regression for the lazy
+// H.265 PID-register fix (commit 2a66a32). H.264 sources had a phantom
+// HEVC PID in PMT when H.265 was pre-registered; the fix made H.265
+// register lazily on its first frame. This test verifies the lazy path
+// actually works: feed an H.265 IDR through tsnorm and confirm a
+// downstream demuxer sees the H.265 frame back. Without the lazy
+// AddStream call the H.265 PID would never appear in output PMT and
+// the frame would be dropped on an unannounced PID.
+func TestProcess_PreservesH265KeyframePayload(t *testing.T) {
+	idrPayload := buildH265IDR()
+	srcMuxer := tsmux.NewFromAV()
+	var srcBuf bytes.Buffer
+	srcMuxer.Write(&domain.AVPacket{
+		Codec:    domain.AVCodecH265,
+		Data:     idrPayload,
+		PTSms:    1000,
+		DTSms:    1000,
+		KeyFrame: true,
+	}, func(b []byte) { srcBuf.Write(b) })
+	if srcBuf.Len() == 0 {
+		t.Fatal("source muxer produced no TS bytes for H.265")
+	}
+
+	n := tsnorm.New(timeline.DefaultConfig())
+	out, err := n.Process(srcBuf.Bytes())
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("Process returned no bytes for H.265 input — lazy AddStream failed")
+	}
+
+	demux := gompeg2.NewTSDemuxer()
+	var gotPayloads [][]byte
+	demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, frame []byte, _, _ uint64) {
+		if cid == gompeg2.TS_STREAM_H265 {
+			gotPayloads = append(gotPayloads, bytes.Clone(frame))
+		}
+	}
+	if err := demux.Input(bytes.NewReader(out)); err != nil {
+		t.Fatalf("output demux: %v", err)
+	}
+	if len(gotPayloads) == 0 {
+		t.Fatal("output demux yielded no H.265 frames — tsnorm lost the payload")
+	}
+	if !bytes.Equal(gotPayloads[0], idrPayload) {
+		t.Errorf("H.265 roundtrip mutated payload\n  got:  %x\n  want: %x", gotPayloads[0], idrPayload)
+	}
+}
+
+// TestProcess_NoH265InOutputForH264OnlySource — negative regression for
+// commit 2a66a32. Before the fix, H.265 was pre-registered on the
+// muxer at construction so PMT advertised an HEVC PID even when the
+// source carried only H.264. ffprobe / dash.js surfaced that as a
+// "second video stream" and broke the audio AdaptationSet on the DASH
+// packager downstream. After the fix the H.265 PID is registered
+// lazily on first H.265 frame, so an H.264-only roundtrip must NOT
+// produce any HEVC PES in the output. We re-demux the bytes and
+// assert no OnFrame fires with TS_STREAM_H265.
+func TestProcess_NoH265InOutputForH264OnlySource(t *testing.T) {
+	src := gompeg2.NewTSMuxer()
+	var srcBuf bytes.Buffer
+	src.OnPacket = func(b []byte) { srcBuf.Write(b) }
+	vpid := src.AddStream(gompeg2.TS_STREAM_H264)
+	apid := src.AddStream(gompeg2.TS_STREAM_AAC)
+	// Span enough wallclock that the muxer emits multiple PMT refreshes
+	// (every 400 ms in gomedia) so the test exercises the steady-state
+	// PMT shape, not just the first emission.
+	for i := 0; i < 30; i++ {
+		basePTS := uint64(i) * 40
+		_ = src.Write(vpid, buildH264NonIDR(), basePTS, basePTS)
+		_ = src.Write(apid, []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}, basePTS, basePTS)
+	}
+
+	n := tsnorm.New(timeline.DefaultConfig())
+	out, err := n.Process(srcBuf.Bytes())
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("Process returned no bytes")
+	}
+
+	demux := gompeg2.NewTSDemuxer()
+	hevcFrames := 0
+	demux.OnFrame = func(cid gompeg2.TS_STREAM_TYPE, _ []byte, _, _ uint64) {
+		if cid == gompeg2.TS_STREAM_H265 {
+			hevcFrames++
+		}
+	}
+	if err := demux.Input(bytes.NewReader(out)); err != nil {
+		t.Fatalf("output demux: %v", err)
+	}
+	if hevcFrames != 0 {
+		t.Errorf("H.264-only source produced %d HEVC frames in output — lazy H.265 fix regressed", hevcFrames)
+	}
+}
+
 // ─── helpers ────────────────────────────────────────────────────────
 
 // muxSingleH264 builds a TS chunk containing one IDR with the given
@@ -463,5 +561,39 @@ func buildH264NonIDR() []byte {
 	out := make([]byte, 0, 4+len(testH264Slice))
 	out = append(out, startCode()...)
 	out = append(out, testH264Slice...)
+	return out
+}
+
+// H.265 NAL header byte values (NAL type in upper 6 bits of byte 0).
+// Borrowed from rtmp_msg_converter_test.go so the test fixtures stay
+// consistent across the codebase.
+const (
+	h265VPSByte = byte(32 << 1) // 0x40 — VPS_NUT
+	h265SPSByte = byte(33 << 1) // 0x42 — SPS_NUT
+	h265PPSByte = byte(34 << 1) // 0x44 — PPS_NUT
+	h265IDRByte = byte(19 << 1) // 0x26 — IDR_W_RADL
+)
+
+// buildH265IDR returns an H.265 IDR access unit prefixed with VPS +
+// SPS + PPS in Annex-B form (start code 00 00 00 01 between NALs).
+// Mirrors buildH264IDR's shape so the H.265 test path is symmetric.
+// Each NAL carries a 2-byte H.265 NAL header (type + layer_id +
+// temporal_id) followed by a few arbitrary payload bytes — enough
+// for gomedia's IsH265IDRFrame detector and TSMuxer.Write to accept.
+func buildH265IDR() []byte {
+	vps := []byte{h265VPSByte, 0x01, 0x0C, 0x01}
+	sps := []byte{h265SPSByte, 0x01, 0x60, 0x33}
+	pps := []byte{h265PPSByte, 0xC1, 0x72, 0xB4}
+	idr := []byte{h265IDRByte, 0x01, 0xAF, 0x06, 0x20}
+
+	out := make([]byte, 0, 4*4+len(vps)+len(sps)+len(pps)+len(idr))
+	out = append(out, startCode()...)
+	out = append(out, vps...)
+	out = append(out, startCode()...)
+	out = append(out, sps...)
+	out = append(out, startCode()...)
+	out = append(out, pps...)
+	out = append(out, startCode()...)
+	out = append(out, idr...)
 	return out
 }

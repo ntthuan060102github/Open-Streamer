@@ -11,6 +11,9 @@ Status of issues discovered during the DASH refactor work on branch
 | First-IDR-past-segDur (was: trailing IDR) | `refactor(dash): pick first IDR past segDur, not latest in window` — [segmenter.go](../internal/publisher/dash/segmenter.go) `findIDRCutPoint`. Limits segment frame-span to ~segDur+GOP. |
 | Audio under-emission ~20 % rate on raw-TS streams | `fix(dash): split bundled ADTS frames in handleAAC` — [packager.go](../internal/publisher/dash/packager.go) `splitADTSBundle` + integration into `handleAAC`. Root cause: gomedia's TSDemuxer delivers 4–8 ADTS frames per AAC PES; `writeAudioSegment` declared each AudioFrame as 1024 samples so a bundled PES collapsed the sample count by the bundling factor. Post-fix audio rate ~100 % on bac_ninh, test_copy, test1, test_mixer. |
 | Video dur off-by-one-frame (per-segment 1-frame stutter) | Uncommitted (deployed via `-dirty` build) — [packager.go](../internal/publisher/dash/packager.go) `writeSegments` peeks `videoPTSAt(d.VideoCount)` before `PopVideo` and passes `nextPTSms` into `computeVideoSegDurTicks`. Field-verified: dur values moved from 5.96 → 6.00 s (bac_ninh), 7.88 → 8.00 s (bac_ninh_raw), 4.87 → 5.00 s (test2). |
+| Backward-drift re-anchor disabled by default (test3 audio 229 s lag) | `fix(timeline): enable MaxBehindMs by default to catch lagging-track A/V split` — sets `DefaultPTSMaxBehindMs = 3000` in [defaults.go](../internal/domain/defaults.go) and wires it into both `normaliserConfig()` (ingestor) and `abrMixerNormaliserConfig()` (coordinator). Re-anchor jumps forward onto wallclock, no stuck-state pathology. |
+| Raw-TS path bypassed the Normaliser | Merged from `refactor/architecture-with-s3-s4`: new [internal/ingestor/tsnorm](../internal/ingestor/tsnorm/tsnorm.go) package demuxes raw-TS chunks, runs each PES through `timeline.Normaliser.Apply`, remuxes back to TS bytes. Wired into `writeRawTSChunk` so UDP / HLS-pull / SRT / file / copy:// / mixer:// sources now get the same wallclock anchoring as the AV path. |
+| Stall handling without explicit boundary | Merged from `refactor/architecture-with-s3-s4`: new [stall_watchdog.go](../internal/ingestor/stall_watchdog.go) goroutine spawned alongside `readLoop` ticks every 1 s, emits `SessionStartStallRecovery` via `buf.SetSession` when no write for > 15 s (configurable). Downstream consumers handle through the existing `onSessionBoundary` path — no consumer-side change. |
 
 ## In progress (this branch)
 
@@ -40,40 +43,80 @@ mixer sources.
 
 **Not yet shipped — pending user decision.**
 
+## Open — limitations of the tsnorm raw-TS path
+
+The merged `tsnorm` package closes the bypass gap but inherits some
+gomedia / MPEG-TS PMT trade-offs that callers should be aware of.
+
+### tsnorm pre-registers H.264 + AAC PIDs — phantom PIDs for non-canonical sources
+
+`tsnorm.New` and `OnSession` eagerly call `muxer.AddStream` for H.264
+and AAC so the very first PMT lists both PIDs (avoids the 400 ms
+PMT-refresh window where a second-codec PES would land on an
+unannounced PID — root cause of the test2 missing-audio incident
+addressed in commit `cc93780`). H.265 is registered lazily on first
+H.265 frame (commit `2a66a32`) to avoid a phantom HEVC PID breaking
+H.264-only sources.
+
+Trade-off: sources that carry only one of the canonical pair (e.g.
+audio-only AAC stream, video-only H.264 stream, or an H.265 + AAC
+source) still get a phantom PID for the unused codec in their output
+PMT. Most players ignore unannounced/empty PIDs; strict demuxers
+(ffprobe `-loglevel verbose`, dash.js in dev mode) surface them as
+warnings. No correctness impact on Open-Streamer's canonical H.264+AAC
+pipeline.
+
+A more robust fix would build the PMT dynamically from observed
+codecs (no pre-registration), but that requires either contributing to
+gomedia or maintaining a fork. Tracked as future work; current
+behaviour is acceptable for production.
+
+### First ~400 ms of audio dropped on file:// + similar lazy-AddStream sources
+
+gomedia's source-side TSMuxer refreshes PMT every 400 ms. When a
+file:// source uses lazy AddStream (audio added on first audio frame,
+after one or more video frames have already written), the first PMT
+emitted by the SOURCE lists only video. tsnorm's demuxer doesn't
+learn the audio PID until the source emits a refreshed PMT — so any
+audio PES that arrives in that first 400 ms window is dropped on an
+unrecognised PID.
+
+For live sources this manifests as a brief silent gap at startup
+(imperceptible). For short VOD files it's an audible click. Test
+coverage via `TestProcess_LazyAddStream188ByteChunks` verifies the
+recovery (audio appears after PMT refresh) but does not assert "no
+drop" — explicitly accepted as a known limitation.
+
+### Mixer V/A still split across PTS axes for clock-independent sources
+
+`tsnorm` wallclock-anchors each track independently via the per-track
+Normaliser. When a `mixer://` source combines two upstreams running on
+independent clocks (e.g. `mixer://bac_ninh,test2` — HLS-pull video +
+file VOD audio), the cross-track snap fires at seed time but each
+track's later progress is driven by its own input PES rate. If audio
+runs sub-realtime (file pace lagging), audio's output PTS structurally
+trails video's PTS by the seed-time lag. `MaxBehindMs = 3000` clamps
+this to ~3 s of drift in the steady state, but cannot align V and A
+within a single HLS segment when source clocks diverge mid-stream.
+
+Documented at the package level in [mixer.go](../internal/ingestor/pull/mixer.go):
+> "AV sync is best-effort … lip-sync-critical scenarios are out of
+> scope for v1."
+
+For lip-sync-critical use cases, operators should transcode (let
+FFmpeg correct V/A timestamps) rather than copy the mixed stream.
+
+### Continuity counter discontinuity on OnSession
+
+`tsnorm.OnSession` rebuilds the muxer from scratch (line 155). Output
+TS continuity counters reset to 0 on every PID after a session
+boundary. ITU-T H.222.0 strictly requires the `discontinuity_indicator`
+in the adaptation field on the first packet after a CC reset; whether
+gomedia sets this is not yet verified. Modern demuxers (hls.js,
+Shaka, ffmpeg) tolerate the reset and just log a warning; TSDuck and
+ffprobe `-loglevel verbose` may flag it. No observed playback impact.
+
 ## Open — separate bugs not in this branch's scope
-
-### Stall handling without explicit boundary
-
-When a raw-TS source stalls > `timeShiftBufferDepth` (24 s default), no
-new segments are emitted, the sliding window drains, and the player
-buffer underruns. Production servers (Flussonic, Shaka) emit an
-explicit DASH `<Period>` boundary or HLS `EXT-X-DISCONTINUITY` on
-source stall so the player resets cleanly. Open-Streamer has the
-plumbing (`buffer.Packet.SessionStart` flows through to the packager's
-`onSessionBoundary`) but **the ingestor doesn't trigger it on raw-TS
-stall** — only on full reader reconnect.
-
-Future work: add stall detection in the raw-TS reader (e.g. no packets
-for 3 s while context still alive → emit `SetSession` with a "stall
-recovery" reason).
-
-### Raw-TS path bypasses the Normaliser
-
-`internal/timeline.Normaliser` covers AV-path only ([worker.go:396](../internal/ingestor/worker.go#L396)
-comment: `// nil-safe; only acts on AV path`). Raw-TS chunks
-(`AVCodecRawTSChunk`) pass through `writeRawTSChunk` unchanged so any
-upstream source drift / jitter / PTS jump propagates straight to the
-DASH packager's queue.
-
-Future work (Phase-4 of the
-[REFACTOR_PROPOSAL.md](./REFACTOR_PROPOSAL.md) roadmap): demux at
-ingest, run frames through the Normaliser, remux back to TS chunks
-before the buffer-hub write. The Normaliser already implements the
-production-grade pacing (forward-drift drop via `MaxAheadMs`,
-backward-drift re-anchor via `MaxBehindMs`, cross-track snap,
-session-boundary reset) — just needs wiring for the raw-TS adaptor.
-
-Scope estimate: ~1000–1300 LOC + tests; 1–2 weeks of focused work.
 
 ### Large segment durations on test3 + bac_ninh_raw
 
