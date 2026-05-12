@@ -504,11 +504,12 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 // change, change the constants in domain/defaults.go.
 func (s *Service) normaliserConfig() timeline.Config {
 	return timeline.Config{
-		Enabled:          true,
-		JumpThresholdMs:  domain.DefaultPTSJumpThresholdMs,
-		MaxAheadMs:       domain.DefaultPTSMaxAheadMs,
-		MaxBehindMs:      domain.DefaultPTSMaxBehindMs,
-		CrossTrackSnapMs: 1000,
+		Enabled:             true,
+		JumpThresholdMs:     domain.DefaultPTSJumpThresholdMs,
+		MaxAheadMs:          domain.DefaultPTSMaxAheadMs,
+		MaxBehindMs:         domain.DefaultPTSMaxBehindMs,
+		CrossTrackSnapMs:    1000,
+		WallclockAheadCapMs: domain.DefaultPTSWallclockAheadCapMs,
 	}
 }
 
