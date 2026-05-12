@@ -83,6 +83,17 @@ const (
 	// AAC ADTS header sample-rate flip). The source stayed up, but the
 	// elementary stream's track config changed.
 	SessionStartConfigChange
+
+	// SessionStartStallRecovery is fired when the worker's stall watchdog
+	// observed >stallThreshold seconds of no writes (source went silent
+	// while the connection / context was still alive) and a write just
+	// resumed. The underlying TCP / UDP / HTTP session never dropped, so
+	// the ingestor never reconnected; but downstream consumers (DASH
+	// packager, HLS segmenter, RTSP / RTMP re-stream) need to treat the
+	// gap as a session boundary so their accumulated state (segmenter
+	// queues, normaliser anchors, mp4 timeline) resets cleanly instead of
+	// emitting a giant per-sample dur or an audio-vs-video skew.
+	SessionStartStallRecovery
 )
 
 // String returns the stable text form of the reason. Used in log fields
@@ -101,6 +112,8 @@ func (r SessionStartReason) String() string {
 		return "mixer_cycle"
 	case SessionStartConfigChange:
 		return "config_change"
+	case SessionStartStallRecovery:
+		return "stall_recovery"
 	default:
 		return "unknown"
 	}
