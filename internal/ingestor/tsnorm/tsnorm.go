@@ -273,9 +273,19 @@ func (n *Normaliser) writeMuxed(av *domain.AVPacket) {
 		indicator = astits.PTSDTSIndicatorBothPresent
 	}
 
+	// AdaptationField carries two HLS-critical signals on the video
+	// PID: RAI on keyframes (which is what triggers astits's
+	// force-PAT-emit-before-IDR fix) and PCR on every video PES (so
+	// strict players like hls.js get a wall-clock anchor every < 100 ms
+	// per ITU-T H.222.0 § 2.4.2.2 — astits does NOT emit PCR
+	// automatically, the muxer's SetPCRPID only marks the source PID).
 	var af *astits.PacketAdaptationField
-	if isVideo && av.KeyFrame {
-		af = &astits.PacketAdaptationField{RandomAccessIndicator: true}
+	if isVideo {
+		af = &astits.PacketAdaptationField{
+			HasPCR:                true,
+			PCR:                   &astits.ClockReference{Base: int64(dts) * 90}, //nolint:gosec
+			RandomAccessIndicator: av.KeyFrame,
+		}
 	}
 
 	_, _ = n.muxer.WriteData(&astits.MuxerData{

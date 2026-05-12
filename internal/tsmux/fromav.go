@@ -133,14 +133,31 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 	pts := &astits.ClockReference{Base: ptsTicks}
 	dts := &astits.ClockReference{Base: dtsTicks}
 
-	// AdaptationField with RandomAccessIndicator on video keyframes
-	// triggers astits to emit PAT + PMT immediately before this PES.
-	// See package doc-comment for why this fixes the HLS IDR-alignment
-	// bug. Audio frames never get RAI — there's no IDR equivalent and
-	// astits ignores RAI on non-PCR PIDs anyway.
+	// AdaptationField carries two HLS-critical signals:
+	//
+	// 1. RandomAccessIndicator on video keyframes triggers astits to
+	//    emit PAT + PMT immediately before this PES (see package
+	//    doc-comment for why this fixes HLS IDR alignment).
+	//
+	// 2. PCR (Program Clock Reference) on every video PES gives
+	//    players a wall-clock anchor for A/V sync. astits does NOT
+	//    emit PCR automatically; the muxer's SetPCRPID only marks
+	//    which PID to LOOK for PCR in. Without PCR every < 100 ms
+	//    (ITU-T H.222.0 § 2.4.2.2) strict HLS players (hls.js most
+	//    notably) refuse to play. Emitting PCR on every video PES
+	//    keeps the cadence at ~33 ms for 30 fps sources, well under
+	//    the spec ceiling.
+	//
+	// Audio frames carry neither RAI (no IDR concept) nor PCR
+	// (per-spec PCR rides on the elementary stream that owns the
+	// PCR PID, which we set to video).
 	var af *astits.PacketAdaptationField
-	if isVideo && p.KeyFrame {
-		af = &astits.PacketAdaptationField{RandomAccessIndicator: true}
+	if isVideo {
+		af = &astits.PacketAdaptationField{
+			HasPCR:                true,
+			PCR:                   &astits.ClockReference{Base: dtsTicks},
+			RandomAccessIndicator: p.KeyFrame,
+		}
 	}
 
 	indicator := uint8(astits.PTSDTSIndicatorOnlyPTS)
