@@ -609,3 +609,80 @@ func buildH265IDR() []byte {
 	out = append(out, idr...)
 	return out
 }
+
+// hasDiscontinuityIndicatorOn scans `data` for a 188-byte TS packet on
+// the given PID whose adaptation_field has discontinuity_indicator=1.
+// Returns true on the FIRST such packet. Helper for verifying that the
+// rebuilt muxer's CC=0 packet is correctly flagged per ISO/IEC 13818-1
+// §2.4.3.4. PID parse: bits 12-0 of bytes 1-2 of the TS header.
+func hasDiscontinuityIndicatorOn(data []byte, pid uint16) bool {
+	for i := 0; i+188 <= len(data); i += 188 {
+		pkt := data[i : i+188]
+		if pkt[0] != 0x47 {
+			continue
+		}
+		pktPID := uint16(pkt[1]&0x1F)<<8 | uint16(pkt[2])
+		if pktPID != pid {
+			continue
+		}
+		afCtrl := (pkt[3] >> 4) & 0x3
+		if afCtrl&0x2 == 0 {
+			continue
+		}
+		if pkt[4] == 0 {
+			continue
+		}
+		if pkt[5]&0x80 != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// TestProcess_DiscontinuityIndicatorOnFirstEmit — first H.264 PES after
+// New() must carry discontinuity_indicator=1 on the video PID so strict
+// analyzers don't flag the fresh CC=0 start as packet loss.
+func TestProcess_DiscontinuityIndicatorOnFirstEmit(t *testing.T) {
+	n := tsnorm.New(timeline.DefaultConfig())
+	src := muxSingleH264(t, 100_000)
+	out, err := n.Process(src)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	out = append(out, n.Flush()...)
+	if !hasDiscontinuityIndicatorOn(out, 0x100) {
+		t.Fatal("first video packet after New() must carry discontinuity_indicator=1")
+	}
+}
+
+// TestProcess_DiscontinuityIndicatorReseedsOnSession — after OnSession
+// the muxer is rebuilt and CC resets, so the NEXT video packet must
+// re-flag. Without re-seed, downstream TSDuck would log a CC error on
+// every session boundary.
+func TestProcess_DiscontinuityIndicatorReseedsOnSession(t *testing.T) {
+	n := tsnorm.New(timeline.DefaultConfig())
+	// First pulse consumes the initial pendingDisc[videoPID]=true seed.
+	src1 := muxSingleH264(t, 100_000)
+	out1, err := n.Process(src1)
+	if err != nil {
+		t.Fatalf("Process 1: %v", err)
+	}
+	out1 = append(out1, n.Flush()...)
+	if !hasDiscontinuityIndicatorOn(out1, 0x100) {
+		t.Fatal("first pulse must carry discontinuity_indicator=1 on video PID")
+	}
+
+	// Cross a session boundary. OnSession rebuilds the muxer and must
+	// re-seed pendingDisc so the next pulse's first emit re-flags.
+	n.OnSession(&domain.StreamSession{ID: 7, Reason: domain.SessionStartReconnect})
+
+	src2 := muxSingleH264(t, 200_000)
+	out2, err := n.Process(src2)
+	if err != nil {
+		t.Fatalf("Process 2: %v", err)
+	}
+	out2 = append(out2, n.Flush()...)
+	if !hasDiscontinuityIndicatorOn(out2, 0x100) {
+		t.Fatal("post-OnSession pulse must carry discontinuity_indicator=1 on video PID")
+	}
+}

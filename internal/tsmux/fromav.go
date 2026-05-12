@@ -49,11 +49,20 @@ type FromAV struct {
 
 	hasV bool
 	hasA bool
+
+	// pendingDisc tracks PIDs whose NEXT emitted packet needs
+	// adaptation_field.discontinuity_indicator=1. Each PID is added on
+	// AddElementaryStream (CC starts at 0 from a fresh muxer) and
+	// cleared after the first emit so the flag fires exactly once per
+	// PID per FromAV lifetime. Strict analyzers (TSDuck tsanalyze,
+	// DVB / ATSC compliance suites) flag a fresh CC=0 without the
+	// indicator as a stream-corruption event; modern players ignore.
+	pendingDisc map[uint16]bool
 }
 
 // NewFromAV creates an empty muxer; streams are added on first packet per codec.
 func NewFromAV() *FromAV {
-	f := &FromAV{}
+	f := &FromAV{pendingDisc: make(map[uint16]bool)}
 	f.mux = astits.NewMuxer(
 		context.Background(),
 		bufWriter{buf: &f.buf},
@@ -93,6 +102,7 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 		// RAI as a "force tables" signal.
 		f.mux.SetPCRPID(pid)
 		f.hasV = true
+		f.pendingDisc[pid] = true
 		// Force PSI emit NOW (rather than waiting for the next
 		// retransmit period or for an RAI=true on this WriteData) so
 		// downstream demuxers learn the freshly-added video PID before
@@ -116,6 +126,7 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 			f.mux.SetPCRPID(pid)
 		}
 		f.hasA = true
+		f.pendingDisc[pid] = true
 		// Force PSI emit so the new audio PID is announced before the
 		// first audio PES — see the video branch above for the full
 		// reasoning. This fix is the reason test2 (file:// MP4 source,
@@ -151,12 +162,29 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 	// Audio frames carry neither RAI (no IDR concept) nor PCR
 	// (per-spec PCR rides on the elementary stream that owns the
 	// PCR PID, which we set to video).
+	// Pull the discontinuity_indicator flag for THIS PID's next emit.
+	// pendingDisc was seeded when the stream was lazy-added; cleared
+	// on the first emit so the flag fires exactly once per PID per
+	// FromAV lifetime.
+	needDisc := f.pendingDisc[pid]
+	if needDisc {
+		delete(f.pendingDisc, pid)
+	}
+
 	var af *astits.PacketAdaptationField
 	if isVideo {
 		af = &astits.PacketAdaptationField{
-			HasPCR:                true,
-			PCR:                   &astits.ClockReference{Base: dtsTicks},
-			RandomAccessIndicator: p.KeyFrame,
+			HasPCR:                 true,
+			PCR:                    &astits.ClockReference{Base: dtsTicks},
+			RandomAccessIndicator:  p.KeyFrame,
+			DiscontinuityIndicator: needDisc,
+		}
+	} else if needDisc {
+		// Audio has no PCR / RAI but still needs the discontinuity
+		// flag on its first packet so strict analyzers don't flag the
+		// CC=0 start.
+		af = &astits.PacketAdaptationField{
+			DiscontinuityIndicator: true,
 		}
 	}
 

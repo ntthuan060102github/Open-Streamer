@@ -147,6 +147,16 @@ type Normaliser struct {
 	// dropped (matches the spec: PES on PIDs not announced in PMT
 	// must not be processed).
 	pidStream map[uint16]astits.StreamType
+
+	// pendingDisc tracks which output PIDs need
+	// adaptation_field.discontinuity_indicator=1 on their NEXT emitted
+	// packet. Set on every OnSession (because buildMuxer resets each
+	// PID's continuity_counter to 0) and cleared per-PID after the flag
+	// has been written once. Per ISO/IEC 13818-1 §2.4.3.4 a strict
+	// demuxer (TSDuck tsanalyze, ATSC / DVB compliance suites) flags a
+	// CC discontinuity without the indicator as a stream-corruption
+	// event; modern players tolerate it but compliance reports fail.
+	pendingDisc map[uint16]bool
 }
 
 // New constructs a Normaliser with the given timeline config. The
@@ -160,8 +170,9 @@ type Normaliser struct {
 // happened to land mid-GOP.
 func New(cfg timeline.Config) *Normaliser {
 	n := &Normaliser{
-		norm:      timeline.New(cfg),
-		pidStream: make(map[uint16]astits.StreamType),
+		norm:        timeline.New(cfg),
+		pidStream:   make(map[uint16]astits.StreamType),
+		pendingDisc: make(map[uint16]bool),
 	}
 	n.buildMuxer()
 	return n
@@ -175,6 +186,14 @@ func New(cfg timeline.Config) *Normaliser {
 // H.264 + AAC are pre-registered (PMT lists them from byte 0). H.265
 // is registered lazily on first H.265 frame to avoid a phantom HEVC
 // PID confusing strict downstream demuxers on H.264-only sources.
+//
+// Discontinuity flag: the fresh muxer resets every PID's
+// continuity_counter to 0. Per ISO/IEC 13818-1 §2.4.3.4 the next
+// packet on each PID with a payload must carry
+// adaptation_field.discontinuity_indicator=1 so strict analyzers
+// (TSDuck, DVB compliance) don't flag the CC reset as packet loss.
+// pendingDisc is seeded for the canonical PIDs here; lazy-registered
+// PIDs (H.265) are added when their stream is registered.
 func (n *Normaliser) buildMuxer() {
 	n.outBuf.Reset()
 	n.muxer = astits.NewMuxer(
@@ -192,6 +211,15 @@ func (n *Normaliser) buildMuxer() {
 	})
 	n.muxer.SetPCRPID(videoPID)
 	n.hasH265 = false
+	if n.pendingDisc == nil {
+		n.pendingDisc = make(map[uint16]bool)
+	} else {
+		for k := range n.pendingDisc {
+			delete(n.pendingDisc, k)
+		}
+	}
+	n.pendingDisc[videoPID] = true
+	n.pendingDisc[audioPID] = true
 }
 
 // bufWriter is the io.Writer astits emits TS bytes into. Process()
@@ -413,6 +441,10 @@ func (n *Normaliser) writeMuxed(av *domain.AVPacket, isVideo bool) {
 			// HEVC PID before the first H.265 PES bytes hit the wire.
 			_, _ = n.muxer.WriteTables()
 			n.hasH265 = true
+			// Lazy-added PID also starts at CC=0 → first packet on this
+			// PID needs the discontinuity_indicator for strict
+			// analyzers (§2.4.3.4).
+			n.pendingDisc[h265PID] = true
 		}
 		pid = h265PID
 	case domain.AVCodecAAC:
@@ -435,12 +467,27 @@ func (n *Normaliser) writeMuxed(av *domain.AVPacket, isVideo bool) {
 		indicator = astits.PTSDTSIndicatorBothPresent
 	}
 
+	// Pull the discontinuity_indicator flag for THIS PID's next emit.
+	// pendingDisc is seeded on buildMuxer / lazy-add and cleared on
+	// first emit so the flag fires exactly once per PID per session.
+	needDisc := n.pendingDisc[pid]
+	if needDisc {
+		delete(n.pendingDisc, pid)
+	}
+
 	var af *astits.PacketAdaptationField
 	if isVideo {
 		af = &astits.PacketAdaptationField{
-			HasPCR:                true,
-			PCR:                   &astits.ClockReference{Base: int64(dts) * 90}, //nolint:gosec
-			RandomAccessIndicator: av.KeyFrame,
+			HasPCR:                 true,
+			PCR:                    &astits.ClockReference{Base: int64(dts) * 90}, //nolint:gosec
+			RandomAccessIndicator:  av.KeyFrame,
+			DiscontinuityIndicator: needDisc,
+		}
+	} else if needDisc {
+		// Audio has no PCR / RAI but still needs the discontinuity
+		// flag on its first post-rebuild packet.
+		af = &astits.PacketAdaptationField{
+			DiscontinuityIndicator: true,
 		}
 	}
 

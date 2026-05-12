@@ -394,3 +394,114 @@ func TestFindH264ParameterSetsRejectsOversizedPPS(t *testing.T) {
 		t.Errorf("oversized PPS (%d bytes) must be rejected", len(gotPPS))
 	}
 }
+
+// hasDiscontinuityIndicator returns true when the given 188-byte TS
+// packet has an adaptation field with discontinuity_indicator=1.
+// Layout: byte 3 has adaptation_field_control in bits 5-4; AF present
+// when bit 5 is set. byte 4 = adaptation_field_length; byte 5 holds
+// the flags, with discontinuity_indicator in bit 7.
+func hasDiscontinuityIndicator(pkt []byte) bool {
+	if len(pkt) < 188 || pkt[0] != 0x47 {
+		return false
+	}
+	afCtrl := (pkt[3] >> 4) & 0x3
+	if afCtrl&0x2 == 0 {
+		return false
+	}
+	if pkt[4] == 0 {
+		return false
+	}
+	return pkt[5]&0x80 != 0
+}
+
+// firstPacketByPID returns the first TS packet whose PID matches.
+func firstPacketByPID(packets [][]byte, pid uint16) []byte {
+	for _, p := range packets {
+		if len(p) < 188 || p[0] != 0x47 {
+			continue
+		}
+		pktPID := uint16(p[1]&0x1F)<<8 | uint16(p[2])
+		if pktPID == pid {
+			return p
+		}
+	}
+	return nil
+}
+
+// TestFromAV_DiscontinuityIndicatorOnFirstVideoEmit — the first 188-
+// byte packet emitted on the video PID after lazy AddStream must carry
+// adaptation_field.discontinuity_indicator=1 so strict analyzers
+// (TSDuck tsanalyze) don't flag the CC=0 start as a packet-loss event.
+func TestFromAV_DiscontinuityIndicatorOnFirstVideoEmit(t *testing.T) {
+	f := NewFromAV()
+	annexB := []byte{
+		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f,
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80,
+		0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00,
+	}
+	var emitted [][]byte
+	f.Write(
+		&domain.AVPacket{Codec: domain.AVCodecH264, Data: annexB, PTSms: 100, DTSms: 100, KeyFrame: true},
+		func(b []byte) { emitted = append(emitted, append([]byte(nil), b...)) },
+	)
+	firstV := firstPacketByPID(emitted, videoPID)
+	if firstV == nil {
+		t.Fatal("expected at least one packet on the video PID")
+	}
+	if !hasDiscontinuityIndicator(firstV) {
+		t.Fatal("first video packet must carry discontinuity_indicator=1")
+	}
+}
+
+// TestFromAV_DiscontinuityIndicatorClearedAfterFirstEmit — subsequent
+// video packets must NOT carry the flag (it's a per-CC-reset signal,
+// not a persistent attribute). pendingDisc clears the bit after the
+// first emit per PID.
+func TestFromAV_DiscontinuityIndicatorClearedAfterFirstEmit(t *testing.T) {
+	f := NewFromAV()
+	annexB := []byte{
+		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f,
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80,
+		0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00,
+	}
+	// First emit consumes the pending flag.
+	f.Write(
+		&domain.AVPacket{Codec: domain.AVCodecH264, Data: annexB, PTSms: 100, DTSms: 100, KeyFrame: true},
+		func(_ []byte) {},
+	)
+	// Second emit must not re-flag.
+	var emitted [][]byte
+	f.Write(
+		&domain.AVPacket{Codec: domain.AVCodecH264, Data: annexB, PTSms: 140, DTSms: 140, KeyFrame: false},
+		func(b []byte) { emitted = append(emitted, append([]byte(nil), b...)) },
+	)
+	firstV := firstPacketByPID(emitted, videoPID)
+	if firstV == nil {
+		t.Fatal("expected at least one packet from the second emit")
+	}
+	if hasDiscontinuityIndicator(firstV) {
+		t.Fatal("subsequent video packet must NOT carry discontinuity_indicator=1")
+	}
+}
+
+// TestFromAV_DiscontinuityIndicatorOnFirstAudioEmit — the lazy-added
+// audio PID also gets the flag on its first emit, independent of
+// video. AAC packets have no PCR or RAI so the adaptation field
+// exists ONLY to carry this flag — verifies the audio branch's
+// "discontinuity-only AF" path.
+func TestFromAV_DiscontinuityIndicatorOnFirstAudioEmit(t *testing.T) {
+	f := NewFromAV()
+	aac := []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0x21, 0x00, 0x00}
+	var emitted [][]byte
+	f.Write(
+		&domain.AVPacket{Codec: domain.AVCodecAAC, Data: aac, PTSms: 50},
+		func(b []byte) { emitted = append(emitted, append([]byte(nil), b...)) },
+	)
+	firstA := firstPacketByPID(emitted, audioPID)
+	if firstA == nil {
+		t.Fatal("expected at least one packet on the audio PID")
+	}
+	if !hasDiscontinuityIndicator(firstA) {
+		t.Fatal("first audio packet must carry discontinuity_indicator=1")
+	}
+}
