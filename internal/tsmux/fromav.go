@@ -93,6 +93,15 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 		// RAI as a "force tables" signal.
 		f.mux.SetPCRPID(pid)
 		f.hasV = true
+		// Force PSI emit NOW (rather than waiting for the next
+		// retransmit period or for an RAI=true on this WriteData) so
+		// downstream demuxers learn the freshly-added video PID before
+		// the PES bytes hit the wire. Without this, audio that already
+		// got a PMT emit earlier would carry on; video PES would land
+		// on a PID downstream hasn't announced. Same reasoning the
+		// audio branch below — adding a stream MID-stream is the
+		// trigger that needs an explicit WriteTables.
+		_, _ = f.mux.WriteTables()
 	} else if !isVideo && !f.hasA {
 		if err := f.mux.AddElementaryStream(astits.PMTElementaryStream{
 			ElementaryPID: pid,
@@ -107,6 +116,12 @@ func (f *FromAV) Write(p *domain.AVPacket, onPacket func([]byte)) {
 			f.mux.SetPCRPID(pid)
 		}
 		f.hasA = true
+		// Force PSI emit so the new audio PID is announced before the
+		// first audio PES — see the video branch above for the full
+		// reasoning. This fix is the reason test2 (file:// MP4 source,
+		// video emitted before audio) now produces an AAC track in the
+		// downstream DASH MPD instead of a silent stream.
+		_, _ = f.mux.WriteTables()
 	}
 
 	// PTS / DTS in 90 kHz ticks (MPEG-TS native).
