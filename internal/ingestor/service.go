@@ -507,6 +507,7 @@ func (s *Service) normaliserConfig() timeline.Config {
 		Enabled:          true,
 		JumpThresholdMs:  domain.DefaultPTSJumpThresholdMs,
 		MaxAheadMs:       domain.DefaultPTSMaxAheadMs,
+		MaxBehindMs:      domain.DefaultPTSMaxBehindMs,
 		CrossTrackSnapMs: 1000,
 	}
 }

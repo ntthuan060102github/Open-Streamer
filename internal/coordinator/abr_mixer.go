@@ -59,14 +59,15 @@ type abrMixerEntry struct {
 
 // abrMixerNormaliserConfig returns the per-forward-cycle Normaliser
 // settings for the abr_mixer pipeline. Same defaults as the ingestor
-// (JumpThresholdMs = 2 s, MaxAheadMs = 0) so V from the video upstream
-// and A from the audio upstream collapse onto a single wallclock-
-// anchored timeline driven by entry.t0.
+// (JumpThresholdMs = 2 s, MaxAheadMs = 0, MaxBehindMs = 3 s) so V
+// from the video upstream and A from the audio upstream collapse onto
+// a single wallclock-anchored timeline driven by entry.t0.
 func abrMixerNormaliserConfig() timeline.Config {
 	return timeline.Config{
 		Enabled:          true,
 		JumpThresholdMs:  domain.DefaultPTSJumpThresholdMs,
 		MaxAheadMs:       domain.DefaultPTSMaxAheadMs,
+		MaxBehindMs:      domain.DefaultPTSMaxBehindMs,
 		CrossTrackSnapMs: 1000,
 	}
 }
