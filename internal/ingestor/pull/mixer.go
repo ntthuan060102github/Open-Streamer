@@ -134,13 +134,28 @@ func NewMixerReader(input domain.Input, bufSvc *buffer.Service, lookup StreamLoo
 	// for ABR ladders AND for raw-TS sources (UDP / HLS / SRT / File).
 	// Direct AV mode is reserved for RTSP / RTMP single-stream upstreams
 	// whose main buffer still carries AVPackets.
+	//
+	// Wallclock pacing on both inner readers: mixer combines two
+	// clock-independent upstreams whose playback buffers may burst
+	// (HLS-pull chunk arrivals, transcoder FFmpeg warmup flush, file
+	// pre-read). Without pacing, V or A bursts forward in PTS at the
+	// mixer egress; downstream Normaliser then preserves the burst-
+	// elevated PTS as a permanent V/A offset (test_mixer: bac_ninh
+	// transcoder produced 4 s of V in ~100 ms when mixer's TS demuxer
+	// finally got its PMT, baking a stable 40+s V-leads-A gap). The
+	// TSDemuxPacketReader's per-instance pace() throttles emit by
+	// DTS-vs-wallclock — V and A independently align to wallclock at
+	// the mixer boundary, source-side bursts absorbed in the inner
+	// chunk reader's bounded queue. Mixer is the architecturally
+	// correct place to enforce this invariant: it owns the clock-
+	// domain boundary between two independent upstreams.
 	if streamHasRenditions(upV) || domain.StreamMainBufferIsTS(upV) {
 		r.videoChunk = newBufferTSChunkReader(bufSvc, r.videoBufID)
-		r.videoInner = NewTSDemuxPacketReader(r.videoChunk)
+		r.videoInner = NewTSDemuxPacketReader(r.videoChunk, WithRealtimePacing())
 	}
 	if streamHasRenditions(upA) || domain.StreamMainBufferIsTS(upA) {
 		r.audioChunk = newBufferTSChunkReader(bufSvc, r.audioBufID)
-		r.audioInner = NewTSDemuxPacketReader(r.audioChunk)
+		r.audioInner = NewTSDemuxPacketReader(r.audioChunk, WithRealtimePacing())
 	}
 	return r, nil
 }
