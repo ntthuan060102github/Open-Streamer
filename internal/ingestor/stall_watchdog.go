@@ -29,8 +29,11 @@ import (
 // Normaliser's MaxBehindMs re-anchor; AV-path streams already get a
 // per-track re-anchor via the Normaliser but still benefit from the
 // downstream session-boundary signal.
+// Production defaults for the watchdog timing knobs. Pass these into
+// runStallWatchdog from production call sites; tests pass shorter
+// values so they don't have to sleep > 15 s of real time per case.
 const (
-	// stallThreshold is the gap-since-last-write that the watchdog
+	// DefaultStallThreshold is the gap-since-last-write that the watchdog
 	// treats as a source stall. Sources at 4 Mbps pause for 200–500 ms
 	// regularly during HLS chunk fetches, and bursty HLS-pull sources
 	// commonly deliver one ~6 s chunk per ~6 s of wallclock — between
@@ -40,24 +43,30 @@ const (
 	// 15 s tolerates typical HLS-pull cadence (with margin) while still
 	// catching real stalls quickly enough to signal before the player's
 	// buffer underruns (timeShiftBufferDepth defaults to 24 s).
-	stallThreshold = 15 * time.Second
-	// stallCheckInterval is how often the watchdog ticks. Smaller than
-	// stallThreshold so the detection latency is bounded.
-	stallCheckInterval = 1 * time.Second
+	DefaultStallThreshold = 15 * time.Second
+	// DefaultStallCheckInterval is how often the watchdog ticks. Smaller
+	// than DefaultStallThreshold so detection latency is bounded.
+	DefaultStallCheckInterval = 1 * time.Second
 )
 
 // runStallWatchdog blocks until ctx is cancelled, emitting a session
 // boundary on `buf` for `streamID` whenever the gap since lastWriteAt
-// exceeds stallThreshold. Safe to run as a goroutine alongside the
+// exceeds `threshold`. Safe to run as a goroutine alongside the
 // worker's read loop; the readLoop bumps lastWriteAt on every
 // successful buffer.Write.
+//
+// Production callers pass DefaultStallThreshold + DefaultStallCheckInterval;
+// tests pass shorter values to avoid > 15 s real-time waits. Passing the
+// knobs in rather than reading shared vars keeps the goroutine race-free
+// across tests that override them.
 func runStallWatchdog(
 	ctx context.Context,
 	streamID, bufferWriteID domain.StreamCode,
 	buf *buffer.Service,
 	lastWriteAt *atomic.Int64,
+	threshold, interval time.Duration,
 ) {
-	ticker := time.NewTicker(stallCheckInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	stallSignaled := false
@@ -69,15 +78,15 @@ func runStallWatchdog(
 			last := time.Unix(0, lastWriteAt.Load())
 			gap := time.Since(last)
 			switch {
-			case gap >= stallThreshold && !stallSignaled:
+			case gap >= threshold && !stallSignaled:
 				slog.Info("ingestor: source stall detected, signalling session boundary",
 					"stream_code", streamID,
 					"gap_ms", gap.Milliseconds(),
-					"threshold_ms", stallThreshold.Milliseconds(),
+					"threshold_ms", threshold.Milliseconds(),
 				)
 				buf.SetSession(bufferWriteID, domain.SessionStartStallRecovery, nil, nil)
 				stallSignaled = true
-			case gap < stallThreshold && stallSignaled:
+			case gap < threshold && stallSignaled:
 				// A fresh write reset the clock — clear the latch so a
 				// later stall on the same readLoop can fire again.
 				stallSignaled = false

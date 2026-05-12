@@ -357,7 +357,8 @@ func readLoop(
 	lastWriteAt.Store(time.Now().UnixNano())
 	watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
 	defer cancelWatchdog()
-	go runStallWatchdog(watchdogCtx, streamID, bufferWriteID, buf, &lastWriteAt)
+	go runStallWatchdog(watchdogCtx, streamID, bufferWriteID, buf, &lastWriteAt,
+		DefaultStallThreshold, DefaultStallCheckInterval)
 
 	for {
 		batch, err := r.ReadPackets(ctx)

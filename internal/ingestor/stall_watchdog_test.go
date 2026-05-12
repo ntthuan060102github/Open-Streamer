@@ -10,6 +10,18 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
+// testStallThreshold and testStallCheckInterval are the shortened
+// timing knobs every stall_watchdog test passes into runStallWatchdog
+// — small enough that the watchdog fires within a few hundred ms
+// (vs. the 15 s production threshold). Kept as test-local constants
+// rather than mutating package vars so the goroutine sees stable
+// values across the test's lifetime and the race detector stays
+// happy.
+const (
+	testStallThreshold     = 200 * time.Millisecond
+	testStallCheckInterval = 50 * time.Millisecond
+)
+
 // TestStallWatchdog_EmitsBoundaryAfterStallThreshold verifies the
 // watchdog fires SessionStartStallRecovery on the buffer hub when no
 // write has happened for more than stallThreshold and that the
@@ -28,22 +40,19 @@ func TestStallWatchdog_EmitsBoundaryAfterStallThreshold(t *testing.T) {
 	}
 	defer buf.Unsubscribe(streamID, sub)
 
-	// Seed lastWriteAt comfortably in the past so the very first tick
-	// (1 s after Run) sees gap > 3 s and emits without waiting 3 real
-	// seconds. The watchdog itself doesn't read time.Now() against
-	// stallThreshold from a fixed origin — it uses the gap from
-	// lastWriteAt, so we can fast-forward virtually here.
+	// Seed lastWriteAt comfortably in the past — gap when the watchdog
+	// ticks will exceed (the test-shortened) stallThreshold and emit
+	// immediately without waiting real wallclock seconds.
 	var lastWriteAt atomic.Int64
 	lastWriteAt.Store(time.Now().Add(-10 * time.Second).UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runStallWatchdog(ctx, streamID, streamID, buf, &lastWriteAt)
+	go runStallWatchdog(ctx, streamID, streamID, buf, &lastWriteAt, testStallThreshold, testStallCheckInterval)
 
-	// Wait long enough for the watchdog's first tick (≤1 s) to fire,
-	// then send a packet so the auto-stamped SessionStart surfaces on
-	// sub.Recv().
-	time.Sleep(stallCheckInterval + 100*time.Millisecond)
+	// Wait for the watchdog's first tick to fire, then send a packet
+	// so the auto-stamped SessionStart surfaces on sub.Recv().
+	time.Sleep(testStallCheckInterval + 100*time.Millisecond)
 	if err := buf.Write(streamID, buffer.TSPacket([]byte{0x47, 0x00, 0x00, 0x00})); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -85,11 +94,11 @@ func TestStallWatchdog_DoesNotFireWhenWritesAreFresh(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runStallWatchdog(ctx, streamID, streamID, buf, &lastWriteAt)
+	go runStallWatchdog(ctx, streamID, streamID, buf, &lastWriteAt, testStallThreshold, testStallCheckInterval)
 
 	// Let two watchdog ticks pass while we keep lastWriteAt fresh.
 	for i := 0; i < 3; i++ {
-		time.Sleep(stallCheckInterval / 2)
+		time.Sleep(testStallCheckInterval / 2)
 		lastWriteAt.Store(time.Now().UnixNano())
 	}
 
@@ -126,11 +135,11 @@ func TestStallWatchdog_LatchClearsAfterRecovery(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go runStallWatchdog(ctx, streamID, streamID, buf, &lastWriteAt)
+	go runStallWatchdog(ctx, streamID, streamID, buf, &lastWriteAt, testStallThreshold, testStallCheckInterval)
 
 	// First stall.
 	lastWriteAt.Store(time.Now().Add(-10 * time.Second).UnixNano())
-	time.Sleep(stallCheckInterval + 100*time.Millisecond)
+	time.Sleep(testStallCheckInterval + 100*time.Millisecond)
 	if err := buf.Write(streamID, buffer.TSPacket([]byte{0x47, 0x01})); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -141,11 +150,11 @@ func TestStallWatchdog_LatchClearsAfterRecovery(t *testing.T) {
 
 	// Recovery: a fresh write resets the lastWriteAt clock. Latch should clear.
 	lastWriteAt.Store(time.Now().UnixNano())
-	time.Sleep(stallCheckInterval + 100*time.Millisecond)
+	time.Sleep(testStallCheckInterval + 100*time.Millisecond)
 
 	// Second stall: same as first.
 	lastWriteAt.Store(time.Now().Add(-10 * time.Second).UnixNano())
-	time.Sleep(stallCheckInterval + 100*time.Millisecond)
+	time.Sleep(testStallCheckInterval + 100*time.Millisecond)
 	if err := buf.Write(streamID, buffer.TSPacket([]byte{0x47, 0x02})); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
