@@ -63,6 +63,27 @@ type AudioFrame struct {
 //   - VideoSpanMS / AudioSpanMS: ptsMS span between oldest and newest
 //     queued frame on the track. Used by the segmenter to decide when
 //     there's a full segDur of content available.
+//
+// Bounded retention: Push* enforces maxVideoFrames / maxAudioFrames by
+// dropping the oldest frames when the cap is exceeded. Without this,
+// pathological run-loop states — e.g. the DASH packager's
+// behindPrevSegEnd gate blocking cuts while the per-segment dur drifts
+// ahead of wallclock — let the queue grow without bound and pin tens
+// of MB of AnnexB / ADTS bytes per stream. Production hit ~692 MB
+// across 14 streams (May 12 incident: dash.handleH264 = 83% of heap),
+// which the cap converts into a bounded drop instead.
+const (
+	// maxVideoFrames bounds per-track video retention. At 30 fps a
+	// reasonable upper limit on un-popped video is ~30 s — enough to
+	// absorb a few segments' worth of pending frames during pacing-gate
+	// holds, well short of multi-minute accumulation that causes OOM.
+	maxVideoFrames = 900
+	// maxAudioFrames bounds per-track audio retention. AAC at 48 kHz
+	// runs ~47 frames/s, so 900 frames ≈ 19 s of audio — paired with
+	// the video cap, keeps both tracks roughly aligned in retention.
+	maxAudioFrames = 900
+)
+
 type FrameQueue struct {
 	video []VideoFrame
 	audio []AudioFrame
@@ -75,13 +96,32 @@ func NewFrameQueue() *FrameQueue {
 
 // PushVideo appends a video frame. The queue takes ownership of f.AnnexB
 // — callers must not retain a reference.
-func (q *FrameQueue) PushVideo(f VideoFrame) {
+//
+// Drops the oldest frame(s) when the queue would exceed maxVideoFrames.
+// Returns the number of frames dropped (≥ 0). Production should normally
+// see 0 here; non-zero indicates the segmenter has fallen too far behind
+// and downstream MPD timeline integrity is already compromised — the
+// drop is the lesser evil that prevents OOM.
+func (q *FrameQueue) PushVideo(f VideoFrame) int {
+	dropped := 0
+	if len(q.video) >= maxVideoFrames {
+		dropped = len(q.video) - maxVideoFrames + 1
+		q.video = dropFrontVideo(q.video, dropped)
+	}
 	q.video = append(q.video, f)
+	return dropped
 }
 
-// PushAudio appends an audio frame.
-func (q *FrameQueue) PushAudio(f AudioFrame) {
+// PushAudio appends an audio frame. Drops the oldest when over the cap;
+// see PushVideo for the rationale.
+func (q *FrameQueue) PushAudio(f AudioFrame) int {
+	dropped := 0
+	if len(q.audio) >= maxAudioFrames {
+		dropped = len(q.audio) - maxAudioFrames + 1
+		q.audio = dropFrontAudio(q.audio, dropped)
+	}
 	q.audio = append(q.audio, f)
+	return dropped
 }
 
 // VideoLen returns the number of queued video frames.

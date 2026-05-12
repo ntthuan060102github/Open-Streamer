@@ -134,6 +134,13 @@ type Packager struct {
 	onDiskA     []string
 	vSegEntries []SegmentEntry
 	aSegEntries []SegmentEntry
+
+	// Overflow-drop counters surface whenever PushVideo / PushAudio hit
+	// the queue cap and shed the oldest frame to bound memory. Logged
+	// at first occurrence and every 1000 drops so operators see when
+	// the packager's segmenter has fallen permanently behind.
+	videoOverflowDropCount int
+	audioOverflowDropCount int
 }
 
 // NewPackager constructs a Packager from cfg. Validates required
@@ -284,12 +291,27 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 	}
 	// Queue the frame regardless — once init is built, the queue's
 	// existing contents are still valid (Normaliser-anchored PTS).
-	p.queue.PushVideo(VideoFrame{
+	if dropped := p.queue.PushVideo(VideoFrame{
 		AnnexB: cloneBytes(av.Data),
 		PTSms:  av.PTSms,
 		DTSms:  av.DTSms,
 		IsIDR:  av.KeyFrame,
-	})
+	}); dropped > 0 {
+		p.videoOverflowDropCount += dropped
+		// Log on transition (every 1000th drop to bound spam). Persistent
+		// drops here indicate the segmenter is unable to cut — typically
+		// the pacing gate is permanently behind because cumulative per-
+		// segment dur has drifted ahead of wallclock (V at >1× wallclock,
+		// hard re-anchors not catching it). MPD timeline integrity is
+		// already lost at this point; the drop is the lesser evil.
+		if p.videoOverflowDropCount == 1 || p.videoOverflowDropCount%1000 == 0 {
+			slog.Warn("dash: video frame queue overflow — dropping oldest",
+				"stream_id", p.cfg.StreamID,
+				"total_dropped", p.videoOverflowDropCount,
+				"queue_after_drop", p.queue.VideoLen(),
+			)
+		}
+	}
 	if p.videoInit != nil {
 		p.state.OpenPairingWindow(time.Now())
 	}
@@ -322,7 +344,16 @@ func (p *Packager) handleAAC(av *domain.AVPacket) {
 		}
 	}
 	for _, f := range frames {
-		p.queue.PushAudio(f)
+		if dropped := p.queue.PushAudio(f); dropped > 0 {
+			p.audioOverflowDropCount += dropped
+			if p.audioOverflowDropCount == 1 || p.audioOverflowDropCount%1000 == 0 {
+				slog.Warn("dash: audio frame queue overflow — dropping oldest",
+					"stream_id", p.cfg.StreamID,
+					"total_dropped", p.audioOverflowDropCount,
+					"queue_after_drop", p.queue.AudioLen(),
+				)
+			}
+		}
 	}
 	if p.audioInit != nil {
 		p.state.OpenPairingWindow(time.Now())
