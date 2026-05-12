@@ -121,14 +121,14 @@ func (q *FrameQueue) TruncateBefore(thresholdMS uint64) (int, int) {
 		vDropped++
 	}
 	if vDropped > 0 {
-		q.video = q.video[vDropped:]
+		q.video = dropFrontVideo(q.video, vDropped)
 	}
 	aDropped := 0
 	for aDropped < len(q.audio) && q.audio[aDropped].PTSms < thresholdMS {
 		aDropped++
 	}
 	if aDropped > 0 {
-		q.audio = q.audio[aDropped:]
+		q.audio = dropFrontAudio(q.audio, aDropped)
 	}
 	return vDropped, aDropped
 }
@@ -145,7 +145,7 @@ func (q *FrameQueue) PopVideo(n int) []VideoFrame {
 	}
 	out := make([]VideoFrame, n)
 	copy(out, q.video[:n])
-	q.video = q.video[n:]
+	q.video = dropFrontVideo(q.video, n)
 	return out
 }
 
@@ -159,8 +159,61 @@ func (q *FrameQueue) PopAudio(n int) []AudioFrame {
 	}
 	out := make([]AudioFrame, n)
 	copy(out, q.audio[:n])
-	q.audio = q.audio[n:]
+	q.audio = dropFrontAudio(q.audio, n)
 	return out
+}
+
+// dropFrontVideo removes the first n elements of s WITHOUT the
+// slice-forward leak: a plain `s[n:]` keeps the underlying array
+// alive, so the dropped VideoFrame structs at indices [0, n) — and
+// the AnnexB byte slices they reference — stay reachable through the
+// backing memory until the next append-induced array growth. Under
+// steady-state DASH frame rates this can pin tens of MB of keyframe
+// payloads per stream and was the root cause of the May 12 memory
+// climb to 95% after the b90eab7 deploy.
+//
+// We shift the remaining elements to the front, zero the (now
+// duplicate) tail slots so their AnnexB references are released, and
+// return a slice header of the smaller length. Capacity stays — that
+// part is bounded by peak queue depth and doesn't accumulate.
+func dropFrontVideo(s []VideoFrame, n int) []VideoFrame {
+	if n <= 0 {
+		return s
+	}
+	if n >= len(s) {
+		clearVideoSlots(s)
+		return s[:0]
+	}
+	remain := len(s) - n
+	copy(s, s[n:])
+	clearVideoSlots(s[remain:])
+	return s[:remain]
+}
+
+func dropFrontAudio(s []AudioFrame, n int) []AudioFrame {
+	if n <= 0 {
+		return s
+	}
+	if n >= len(s) {
+		clearAudioSlots(s)
+		return s[:0]
+	}
+	remain := len(s) - n
+	copy(s, s[n:])
+	clearAudioSlots(s[remain:])
+	return s[:remain]
+}
+
+func clearVideoSlots(s []VideoFrame) {
+	for i := range s {
+		s[i] = VideoFrame{}
+	}
+}
+
+func clearAudioSlots(s []AudioFrame) {
+	for i := range s {
+		s[i] = AudioFrame{}
+	}
 }
 
 // VideoSpanMS returns PTSms of the newest queued video frame minus

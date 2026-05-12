@@ -738,25 +738,66 @@ func computeVideoSegDurTicks(frames []VideoFrame, nextPTSms uint64, hasNext bool
 }
 
 // trimWindow removes old segments from disk past Window + History.
+//
+// Uses dropFrontN-style compaction (copy-to-front + zero-tail) rather
+// than a naive `s = s[1:]` slice-forward: the latter keeps the backing
+// array alive with every popped element still pinned, so over a long-
+// running stream the dropped filenames + SegmentEntry structs
+// accumulate inside the array until the next append-induced growth.
+// Bounded but unnecessary memory; the compaction releases them
+// immediately so a 24-hour stream stays at "window + history" worth
+// of entries instead of growing slowly.
 func (p *Packager) trimWindow() {
 	maxKeep := p.cfg.Window + p.cfg.History
 	if !p.cfg.Ephemeral {
 		return
 	}
-	for len(p.onDiskV) > maxKeep {
-		_ = os.Remove(filepath.Join(p.cfg.StreamDir, p.onDiskV[0]))
-		p.onDiskV = p.onDiskV[1:]
-		if len(p.vSegEntries) > 0 {
-			p.vSegEntries = p.vSegEntries[1:]
+	if len(p.onDiskV) > maxKeep {
+		drop := len(p.onDiskV) - maxKeep
+		for i := 0; i < drop; i++ {
+			_ = os.Remove(filepath.Join(p.cfg.StreamDir, p.onDiskV[i]))
 		}
+		p.onDiskV = dropFrontStrings(p.onDiskV, drop)
+		p.vSegEntries = dropFrontSegEntries(p.vSegEntries, drop)
 	}
-	for len(p.onDiskA) > maxKeep {
-		_ = os.Remove(filepath.Join(p.cfg.StreamDir, p.onDiskA[0]))
-		p.onDiskA = p.onDiskA[1:]
-		if len(p.aSegEntries) > 0 {
-			p.aSegEntries = p.aSegEntries[1:]
+	if len(p.onDiskA) > maxKeep {
+		drop := len(p.onDiskA) - maxKeep
+		for i := 0; i < drop; i++ {
+			_ = os.Remove(filepath.Join(p.cfg.StreamDir, p.onDiskA[i]))
 		}
+		p.onDiskA = dropFrontStrings(p.onDiskA, drop)
+		p.aSegEntries = dropFrontSegEntries(p.aSegEntries, drop)
 	}
+}
+
+func dropFrontStrings(s []string, n int) []string {
+	if n <= 0 || len(s) == 0 {
+		return s
+	}
+	if n >= len(s) {
+		for i := range s {
+			s[i] = ""
+		}
+		return s[:0]
+	}
+	remain := len(s) - n
+	copy(s, s[n:])
+	for i := remain; i < len(s); i++ {
+		s[i] = ""
+	}
+	return s[:remain]
+}
+
+func dropFrontSegEntries(s []SegmentEntry, n int) []SegmentEntry {
+	if n <= 0 || len(s) == 0 {
+		return s
+	}
+	if n >= len(s) {
+		return s[:0]
+	}
+	remain := len(s) - n
+	copy(s, s[n:])
+	return s[:remain]
 }
 
 // publishManifest writes the per-stream MPD (when ManifestPath is set)
