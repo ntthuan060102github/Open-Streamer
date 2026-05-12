@@ -237,8 +237,8 @@ func TestBuildManifest_DurationsAdaptToObserved(t *testing.T) {
 	data, _ := BuildManifest(in)
 	s := string(data)
 	for _, want := range []string{
-		`minBufferTime="PT10S"`,        // = max(2×2, 10) = 10
-		`maxSegmentDuration="PT10S"`,   // = max(3×2, 10) = 10
+		`minBufferTime="PT10S"`,             // = max(2×2, 10) = 10
+		`maxSegmentDuration="PT10S"`,        // = max(3×2, 10) = 10
 		`suggestedPresentationDelay="PT6S"`, // unchanged at 3 × segDur
 	} {
 		if !strings.Contains(s, want) {

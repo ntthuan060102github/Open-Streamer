@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
@@ -331,6 +332,19 @@ func readLoop(
 			stats.Close()
 		}
 	}()
+
+	// Stall watchdog: emits SessionStartStallRecovery on the buffer hub
+	// when no packet has been written for stallThreshold seconds while
+	// ctx is still alive (source went silent without the reader
+	// returning an error). The watchdog goroutine is scoped to this
+	// readLoop invocation; cancelling watchdogCtx on return stops it
+	// before the readLoop's defer chain races with a final write.
+	var lastWriteAt atomic.Int64
+	lastWriteAt.Store(time.Now().UnixNano())
+	watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
+	defer cancelWatchdog()
+	go runStallWatchdog(watchdogCtx, streamID, bufferWriteID, buf, &lastWriteAt)
+
 	for {
 		batch, err := r.ReadPackets(ctx)
 		if err != nil {
@@ -349,6 +363,7 @@ func readLoop(
 				cb:            cb,
 				stats:         stats,
 				normaliser:    norm,
+				lastWriteAt:   &lastWriteAt,
 			}
 			if writeErr := writeOnePacket(wctx, &p); writeErr != nil {
 				return writeErr
@@ -394,6 +409,12 @@ type writeContext struct {
 	cb            *pullWorkerCallbacks
 	stats         *pull.StatsDemuxer
 	normaliser    *timeline.Normaliser // nil-safe; only acts on AV path
+	// lastWriteAt is bumped on every successful buffer write so the
+	// stall watchdog (started alongside readLoop) can detect "source
+	// silent for >stallThreshold seconds while ctx is alive" and emit
+	// a session boundary. Atomic so the watchdog goroutine can read
+	// without locking the writer.
+	lastWriteAt *atomic.Int64
 }
 
 // writeOnePacket forwards one source packet into the buffer, dispatching on
@@ -430,6 +451,9 @@ func writeOnePacket(wctx writeContext, p *domain.AVPacket) error {
 		)
 		return err
 	}
+	if wctx.lastWriteAt != nil {
+		wctx.lastWriteAt.Store(time.Now().UnixNano())
+	}
 	cb := wctx.cb
 	if cb != nil && cb.onPacket != nil {
 		cb.onPacket(wctx.streamID, wctx.input.Priority)
@@ -460,6 +484,9 @@ func writeRawTSChunk(wctx writeContext, chunk []byte) error {
 			"err", err,
 		)
 		return err
+	}
+	if wctx.lastWriteAt != nil {
+		wctx.lastWriteAt.Store(time.Now().UnixNano())
 	}
 	cb := wctx.cb
 	if cb != nil && cb.onPacket != nil {
