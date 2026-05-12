@@ -3,7 +3,7 @@ module github.com/ntt0601zcoder/open-streamer
 go 1.25.10
 
 require (
-	github.com/Eyevinn/mp4ff v0.51.0
+	github.com/Eyevinn/mp4ff v0.52.0
 	github.com/bluenviron/gortsplib/v5 v5.5.2
 	github.com/bluenviron/mediacommon/v2 v2.8.3
 	github.com/datarhei/gosrt v0.10.0
