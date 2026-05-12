@@ -170,10 +170,12 @@ func feedFFmpegTS(
 			if first {
 				_ = buf.Write(streamCode, buffer.Packet{
 					AV: &domain.AVPacket{
-						Codec:         domain.AVCodecH264,
-						Data:          []byte{0},
-						Discontinuity: true,
+						Codec: domain.AVCodecH264,
+						Data:  []byte{0},
 					},
+					// Session-boundary cue migrated from AVPacket.Discontinuity
+					// (deleted Phase 5) to buffer.Packet.SessionStart.
+					SessionStart: true,
 				})
 				first = false
 			}
@@ -255,13 +257,14 @@ func TestRTMPPushInputSwitch(t *testing.T) {
 	t.Log("Simulating input switch...")
 	cancelFeed1()
 
-	// Discontinuity marker.
+	// Session-boundary marker (migrated from AVPacket.Discontinuity
+	// in Phase 5 of the refactor).
 	_ = buf.Write(streamCode, buffer.Packet{
 		AV: &domain.AVPacket{
-			Codec:         domain.AVCodecH264,
-			Data:          []byte{0},
-			Discontinuity: true,
+			Codec: domain.AVCodecH264,
+			Data:  []byte{0},
 		},
+		SessionStart: true,
 	})
 
 	// ── 7. Feed source-2 ────────────────────────────────────────────────────

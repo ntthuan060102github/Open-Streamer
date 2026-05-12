@@ -262,7 +262,8 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 // for flushing the current segment and emitting EXT-X-DISCONTINUITY on the
 // next one. It fires identically across AV-path and raw-TS-path sources,
 // replacing the two parallel mechanisms used previously (in-band
-// AVPacket.Discontinuity for AV, event-bus failoverGen for TS).
+// AVPacket-flag for AV, event-bus generation counter for TS — both removed
+// in Phase 3 of the refactor).
 func (p *hlsSegmenter) handleIncoming(
 	pkt buffer.Packet,
 	segDur time.Duration,
@@ -379,9 +380,9 @@ func (p *hlsSegmenter) maybeFlushAtKeyframe(av *domain.AVPacket, segDur time.Dur
 //   - TS-path time-based segmenting (transcoder output, GOP-aligned)
 //   - Fallback force-flush for stuck AV paths
 //
-// Session boundaries are now signalled via buffer.Packet.SessionStart and
-// handled in onSessionBoundary at packet-receive time — tickFlush no
-// longer polls a separate failoverGen counter.
+// Session boundaries are signalled via buffer.Packet.SessionStart and
+// handled in onSessionBoundary at packet-receive time — tickFlush only
+// runs the segment-cadence safety net.
 func (p *hlsSegmenter) tickFlush(maxDur, segDur time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

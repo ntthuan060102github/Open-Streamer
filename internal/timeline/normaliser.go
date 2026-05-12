@@ -1,35 +1,26 @@
 // Package timeline owns the single, authoritative PTS/DTS anchor for
 // every elementary-stream packet that reaches the buffer hub.
 //
-// The Normaliser is the unification of three independent state machines
-// that previously each owned a slice of "the stream's clock":
+// The Normaliser unified three legacy state machines that previously
+// each owned a slice of "the stream's clock":
 //
-//   - internal/ingestor/ptsrebaser — the AV-path wallclock anchor used
-//     by pull readers and the push RTMP server.
-//   - internal/ingestor/pull/mixer — videoPTSBase / audioPTSBase, re-
-//     anchored on the in-band `Discontinuity` flag.
-//   - internal/coordinator/abr_mixer — its own ptsRebaser with pause-
-//     detection re-anchoring, scoped per forward-cycle.
+//   - internal/ingestor/ptsrebaser (deleted) — AV-path wallclock anchor.
+//   - internal/ingestor/pull/mixer's videoPTSBase / audioPTSBase
+//     (deleted).
+//   - internal/coordinator/abr_mixer's ptsRebaser (deleted) — replaced
+//     by per-cycle Normaliser instances seeded from entry.t0.
 //
-// Those three each set the `AVPacket.Discontinuity` flag with different
-// meanings (see docs/REFACTOR_PROPOSAL.md §2.2). Downstream consumers
-// (DASH packager, HLS segmenter, RTSP/RTMP serve) cannot tell them apart
-// and accumulate timeline bugs as a result.
+// All three used to set a `AVPacket.Discontinuity` flag with different
+// meanings (see docs/REFACTOR_PROPOSAL.md §2.2). That flag is also gone:
+// session-boundary signalling moved to `buffer.Packet.SessionStart` and
+// rebaser-internal re-anchor events surface only via Stats /
+// LastDiagnostic for telemetry. Consumers never re-normalise.
 //
-// The Normaliser replaces all three with one wallclock-anchored,
-// session-aware, V/A-pair-aware, monotonic-floored, drift-capped
-// transform. The OWNER is the ingestor: each stream has exactly one
-// Normaliser; the buffer hub guarantees PTS/DTS are anchored when a
-// consumer reads them and that a `SessionStart=true` marker fronts every
-// new lifetime. Consumers never re-normalise.
-//
-// Phase 2 dual-path: this package is wired into the ingestor as an
-// OBSERVER only (config knob `IngestorConfig.TimelineNormaliserObserve`).
-// The existing ptsrebaser still owns the data path. The observer runs
-// against the same input, compares outputs, and logs divergences. After
-// production observation validates parity (and any deliberate semantic
-// improvements), Phase 3 (per REFACTOR_PROPOSAL.md numbering: 4) will
-// switch the data path and delete ptsrebaser.
+// The Normaliser is wallclock-anchored, session-aware, V/A-pair-aware,
+// monotonic-floored, drift-capped. The OWNER is the ingestor: each
+// stream has exactly one Normaliser; the buffer hub guarantees PTS/DTS
+// are anchored when a consumer reads them and that `SessionStart=true`
+// fronts every new lifetime.
 package timeline
 
 import (
@@ -239,8 +230,10 @@ func (n *Normaliser) Reset() {
 // is disabled, the packet is nil, the codec is the raw-TS marker, or
 // the codec doesn't classify as V or A.
 //
-// May set p.Discontinuity=true on a hard re-anchor; existing
-// Discontinuity flags on the packet are preserved.
+// Hard re-anchor events (jump-threshold, regression, behind-cap) do NOT
+// propagate to consumers via the packet — they surface only via Stats
+// and LastDiagnostic for telemetry. Consumers learn about session
+// boundaries from buffer.Packet.SessionStart instead.
 func (n *Normaliser) Apply(p *domain.AVPacket, now time.Time) bool {
 	if n == nil || !n.cfg.Enabled || p == nil {
 		return true
@@ -317,7 +310,6 @@ func (n *Normaliser) Apply(p *domain.AVPacket, now time.Time) bool {
 		track.outputAnchor = target
 		track.lastOutputDts = target
 		assignTimes(p, target, cto)
-		p.Discontinuity = true
 		n.totalReanch++
 		n.lastDiag = Diagnostic{
 			Track:          tk,

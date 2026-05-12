@@ -36,10 +36,10 @@ package publisher
 // Each packager builds a fresh remuxer, so SPS/PPS / ASC are re-emitted on
 // every reconnect — no codec state needs to survive across sessions.
 //
-// Input switching: when the ingestor switches input source, the first packet
-// of the new source is flagged Discontinuity=true. feedLoop signals the
-// packager to end via errDiscontinuity. serveRTMPPush starts a fresh session
-// with no retry delay so the new source can take over with minimum gap.
+// Input switching: when the ingestor switches input source, the next
+// buffer.Packet carries SessionStart=true. feedLoop signals the packager
+// to end via errDiscontinuity. serveRTMPPush starts a fresh session with
+// no retry delay so the new source can take over with minimum gap.
 //
 // RTMPS: rtmps:// URLs are handled natively by lal via PushSessionOption.TlsConfig.
 // Default TLS config uses ServerName from the URL host.
@@ -115,9 +115,11 @@ type rtmpPushPackager struct {
 	// connection failure to unblock the demuxer.
 	tsBuf *tsBuffer
 
-	// gotDiscontinuity is set by feedLoop when it sees Discontinuity=true on
-	// an established session. run() then returns errDiscontinuity and
-	// serveRTMPPush starts a fresh session with no backoff delay.
+	// gotDiscontinuity is set by feedLoop when it sees
+	// buffer.Packet.SessionStart=true on an established session. run()
+	// then returns errDiscontinuity and serveRTMPPush starts a fresh
+	// session with no backoff delay. (Naming kept for historical
+	// continuity with the original AVPacket.Discontinuity-based design.)
 	gotDiscontinuity atomic.Bool
 }
 

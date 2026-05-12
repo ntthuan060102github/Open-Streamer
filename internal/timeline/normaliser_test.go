@@ -21,8 +21,8 @@ func aPkt(pts, dts uint64) *domain.AVPacket {
 }
 
 // TestPassthroughCases groups the no-op shapes: disabled, nil, raw-TS,
-// unknown codec. Each must leave PTS/DTS untouched and never flag
-// Discontinuity.
+// unknown codec. Each must leave PTS/DTS untouched and never record a
+// HardReanchored diagnostic.
 func TestPassthroughCases(t *testing.T) {
 	cases := []struct {
 		name string
@@ -56,8 +56,8 @@ func TestPassthroughCases(t *testing.T) {
 				t.Fatalf("pass-through mutated packet: pts %d→%d dts %d→%d",
 					origPTS, tc.p.PTSms, origDTS, tc.p.DTSms)
 			}
-			if tc.p.Discontinuity {
-				t.Fatalf("pass-through must not set Discontinuity")
+			if tc.n.LastDiagnostic().HardReanchored {
+				t.Fatalf("pass-through must not record HardReanchored")
 			}
 		})
 	}
@@ -80,8 +80,8 @@ func TestPassthroughCases(t *testing.T) {
 
 // TestSeed verifies the seed semantics: the very first packet of each
 // track anchors at elapsed-wallclock (0 ms for the wallclock-seed track,
-// >0 for tracks arriving later), CTO is preserved, and no Discontinuity
-// is flagged.
+// >0 for tracks arriving later), CTO is preserved, and the seed never
+// records a HardReanchored diagnostic.
 func TestSeed(t *testing.T) {
 	n := New(DefaultConfig())
 	p := vPkt(12350, 12345) // CTO = 5
@@ -90,19 +90,19 @@ func TestSeed(t *testing.T) {
 	if p.DTSms != 0 || p.PTSms != 5 {
 		t.Fatalf("seed: want dts=0 pts=5, got dts=%d pts=%d", p.DTSms, p.PTSms)
 	}
-	if p.Discontinuity {
-		t.Fatal("seed packet must not flag Discontinuity")
+	if n.LastDiagnostic().HardReanchored {
+		t.Fatal("seed packet must not record HardReanchored")
 	}
 
 	// Audio first packet 5 ms later — anchored at elapsed (5), independent
-	// timebase preserved (no Discontinuity, no shared origin clobber).
+	// timebase preserved (no re-anchor, no shared origin clobber).
 	a := aPkt(50_000_000, 50_000_000)
 	n.Apply(a, startWall.Add(5*time.Millisecond))
 	if a.DTSms != 5 {
 		t.Fatalf("audio seed at +5ms: want dts=5, got %d", a.DTSms)
 	}
-	if a.Discontinuity {
-		t.Fatal("audio seed must not flag Discontinuity")
+	if n.LastDiagnostic().HardReanchored {
+		t.Fatal("audio seed must not record HardReanchored")
 	}
 }
 
@@ -117,15 +117,15 @@ func TestSteadyState(t *testing.T) {
 		if p.DTSms != want {
 			t.Fatalf("steady frame %d: want dts=%d, got %d", i, want, p.DTSms)
 		}
-		if p.Discontinuity {
-			t.Fatalf("steady frame %d: Discontinuity should not fire", i)
+		if n.LastDiagnostic().HardReanchored {
+			t.Fatalf("steady frame %d: HardReanchored should not fire", i)
 		}
 	}
 }
 
 // TestMonotonicFloor — feed a backward-jumping input PTS that lands
 // below the running output floor. Output must still be strictly
-// monotonic (≥ lastOutputDts+1) and Discontinuity must fire.
+// monotonic (≥ lastOutputDts+1) and HardReanchored must record.
 func TestMonotonicFloor(t *testing.T) {
 	n := New(Config{Enabled: true, JumpThresholdMs: 500, CrossTrackSnapMs: 1000})
 
@@ -138,8 +138,8 @@ func TestMonotonicFloor(t *testing.T) {
 	jump := vPkt(uint64(1_000_960-500), uint64(1_000_960-500))
 	n.Apply(jump, startWall.Add(1040*time.Millisecond))
 
-	if !jump.Discontinuity {
-		t.Fatal("backward jump must flag Discontinuity")
+	if !n.LastDiagnostic().HardReanchored {
+		t.Fatal("backward jump must record HardReanchored")
 	}
 	// Monotonic floor: output > 960 (the 25th frame's emit).
 	if jump.DTSms <= 960 {
@@ -193,8 +193,8 @@ func TestDriftCapBehind(t *testing.T) {
 	if !keep {
 		t.Fatal("behind-drift packet must NOT be dropped (only ahead-drift drops)")
 	}
-	if !lag.Discontinuity {
-		t.Fatal("behind-drift cap must flag Discontinuity on re-anchor")
+	if !n.LastDiagnostic().HardReanchored {
+		t.Fatal("behind-drift cap must record HardReanchored on re-anchor")
 	}
 	// Output anchored at actualNow = 2080 ms (≈), clamped above last emit.
 	if lag.DTSms < 2000 {
@@ -203,8 +203,8 @@ func TestDriftCapBehind(t *testing.T) {
 }
 
 // TestJumpAhead — input PTS leaps forward past JumpThresholdMs. Must
-// hard-re-anchor to wallclock (not blindly trust the source) and flag
-// Discontinuity.
+// hard-re-anchor to wallclock (not blindly trust the source) and record
+// HardReanchored.
 func TestJumpAhead(t *testing.T) {
 	n := New(Config{Enabled: true, JumpThresholdMs: 500, CrossTrackSnapMs: 1000})
 	n.Apply(vPkt(0, 0), startWall)
@@ -214,8 +214,8 @@ func TestJumpAhead(t *testing.T) {
 	jump := vPkt(10_040, 10_040)
 	n.Apply(jump, startWall.Add(80*time.Millisecond))
 
-	if !jump.Discontinuity {
-		t.Fatal("forward jump past threshold must flag Discontinuity")
+	if !n.LastDiagnostic().HardReanchored {
+		t.Fatal("forward jump past threshold must record HardReanchored")
 	}
 	// Anchored to actualNow ≈ 80 ms, not to the upstream's claimed 10_040.
 	if jump.DTSms > 200 {
@@ -240,8 +240,8 @@ func TestCrossTrackSnap(t *testing.T) {
 	if a.DTSms < 3900 {
 		t.Fatalf("cross-track snap: A should anchor onto V's progression (≈3960), got %d", a.DTSms)
 	}
-	if a.Discontinuity {
-		t.Fatal("cross-track snap must NOT flag Discontinuity (it's a clean seed, not a jump)")
+	if n.LastDiagnostic().HardReanchored {
+		t.Fatal("cross-track snap must NOT record HardReanchored (it's a clean seed, not a jump)")
 	}
 }
 
@@ -262,8 +262,8 @@ func TestIndependentVATimelines(t *testing.T) {
 	if a.DTSms != 5 {
 		t.Fatalf("A seed (5ms later): want dts=5, got %d", a.DTSms)
 	}
-	if a.Discontinuity {
-		t.Fatal("independent A seed must not flag Discontinuity")
+	if n.LastDiagnostic().HardReanchored {
+		t.Fatal("independent A seed must not record HardReanchored")
 	}
 
 	v2 := vPkt(1_000_040, 1_000_040)
@@ -313,8 +313,8 @@ func TestOnSessionResetsPerTrackButPreservesWallclock(t *testing.T) {
 	if v.DTSms < 1000 {
 		t.Fatalf("S2 first V must anchor past S1's last output for monotonicity; got DTS=%d", v.DTSms)
 	}
-	if v.Discontinuity {
-		t.Fatal("S2 first packet seed must not flag Discontinuity (caller sets SessionStart instead)")
+	if n.LastDiagnostic().HardReanchored {
+		t.Fatal("S2 first packet seed must not record HardReanchored (caller sets SessionStart instead)")
 	}
 
 	// S2 second V: 40 ms later upstream, 40 ms later wallclock — must

@@ -91,15 +91,16 @@ const (
 	// memory per stream when IngestorConfig.HLSMaxSegmentBuffer is zero.
 	DefaultHLSMaxSegmentBuffer = 8
 
-	// DefaultPTSJumpThresholdMs is the AV-path PTS rebaser's jump cap
-	// (ms). When the gap between an output PTS and local wallclock
-	// exceeds this, the rebaser re-anchors and emits a Discontinuity
-	// so downstream HLS / DASH segmenters land the boundary cleanly.
-	// 2 s tolerates frame-cadence jitter and minor encoder drift while
-	// catching the multi-second forward jumps (CDN playlist resync,
-	// transcoder restart) that otherwise bake permanent offsets into
-	// segment timelines. This is a server-level invariant — not exposed
-	// to operators.
+	// DefaultPTSJumpThresholdMs is the Normaliser's jump cap (ms). When
+	// the gap between an output PTS and local wallclock exceeds this,
+	// the Normaliser re-anchors. The re-anchor event is recorded in
+	// LastDiagnostic for telemetry but is NOT propagated to consumers
+	// (session boundaries reach consumers via buffer.Packet.SessionStart
+	// instead). 2 s tolerates frame-cadence jitter and minor encoder
+	// drift while catching the multi-second forward jumps (CDN playlist
+	// resync, transcoder restart) that otherwise bake permanent offsets
+	// into segment timelines. Server-level invariant — not operator-
+	// tunable.
 	DefaultPTSJumpThresholdMs int64 = 2000
 
 	// DefaultPTSMaxAheadMs is intentionally 0 (disabled). When non-zero

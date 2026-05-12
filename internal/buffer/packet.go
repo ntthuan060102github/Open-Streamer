@@ -7,11 +7,11 @@ import "github.com/ntt0601zcoder/open-streamer/internal/domain"
 //   - AV: one elementary-stream access unit (ingest pull after demux or native ES readers).
 //
 // SessionID and SessionStart are stamped by Service.Write from the
-// per-stream session table maintained via SetSession. Consumers may read
-// them to detect session boundaries explicitly (replaces the overloaded
-// `AVPacket.Discontinuity` flag); legacy consumers that ignore the fields
-// keep working unchanged. SessionID==0 means "no session metadata yet"
-// (legacy / synthetic packet).
+// per-stream session table maintained via SetSession. Consumers read
+// them to detect session boundaries explicitly — this is the SOLE
+// boundary cue (the legacy `AVPacket.Discontinuity` flag was deleted
+// in Phase 5 of the refactor). SessionID==0 means "no session metadata
+// yet" (synthetic packet from a code path that bypasses SetSession).
 type Packet struct {
 	TS []byte
 	AV *domain.AVPacket

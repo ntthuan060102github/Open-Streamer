@@ -85,13 +85,20 @@ func (c AVCodec) IsAudio() bool {
 
 // AVPacket is one decoded video access unit (Annex B H.264/H.265) or one AAC frame (ADTS in Data).
 // PTSms and DTSms are presentation / decode timestamps in milliseconds (MPEG-TS / gomedia convention).
+//
+// No Discontinuity flag — that field was the original per-packet boundary
+// cue, ambiguously meaning "first-after-reconnect" / "rebaser re-anchor" /
+// "mixer cycle restart" depending on writer. Phase 3 of the refactor
+// moved session-boundary signalling onto buffer.Packet.SessionStart;
+// Phase 5 deleted this field. Rebaser-internal re-anchor events surface
+// via Normaliser.LastDiagnostic().HardReanchored, scoped to telemetry
+// (not propagated to consumers).
 type AVPacket struct {
-	Codec         AVCodec
-	Data          []byte
-	PTSms         uint64
-	DTSms         uint64
-	KeyFrame      bool
-	Discontinuity bool
+	Codec    AVCodec
+	Data     []byte
+	PTSms    uint64
+	DTSms    uint64
+	KeyFrame bool
 }
 
 // Clone returns a deep copy suitable for buffer fan-out.

@@ -49,11 +49,12 @@ type abrMixerEntry struct {
 	audioUpstream     domain.StreamCode
 	lastPacketAtNanos atomic.Int64
 
-	// t0 is the shared wall-clock anchor used by ptsRebaser instances in the
-	// forward goroutines. Both video taps and the audio fan-out reference the
-	// same t0 so packets from the two unrelated upstream clocks land on a
-	// common timeline — without this, the player gets PTS values diverging
-	// by hours and renders black/silence.
+	// t0 is the shared wall-clock anchor used by the per-cycle
+	// timeline.Normaliser instances in the forward goroutines. Both
+	// video taps and the audio fan-out reference the same t0 so packets
+	// from the two unrelated upstream clocks land on a common timeline
+	// — without this, the player gets PTS values diverging by hours and
+	// renders black/silence.
 	t0 time.Time
 }
 
@@ -313,7 +314,7 @@ func (c *Coordinator) runABRMixerVideoTap(
 // abrMixerVideoForward runs one demux-and-forward cycle for a single rung.
 // Returns true on ctx cancellation (caller should not retry).
 //
-// PTS/DTS are rebased onto entry.t0 via a per-cycle ptsRebaser so that video
+// PTS/DTS are rebased onto entry.t0 via a per-cycle timeline.Normaliser so that video
 // from upstream A and audio from upstream B share a common timeline. The
 // rebaser is scoped to the cycle: when an upstream restart triggers a new
 // forward cycle, a fresh rebaser captures the current wall-clock offset, so

@@ -294,23 +294,24 @@ func TestMixerReader_CloseIdempotent(t *testing.T) {
 
 // videoPktTS / audioPktTS extend the helpers above with explicit PTS / DTS so
 // the normalisation tests can exercise the offset arithmetic directly.
-func videoPktTS(payload byte, pts, dts uint64, disco bool) *domain.AVPacket {
+// The `disco` parameter is kept on the helpers' signature for historical
+// continuity with the pre-Phase-5 tests but is now unused (Discontinuity
+// field deleted; session boundaries flow via buffer.Packet.SessionStart).
+func videoPktTS(payload byte, pts, dts uint64, _ bool) *domain.AVPacket {
 	return &domain.AVPacket{
-		Codec:         domain.AVCodecH264,
-		Data:          []byte{payload},
-		PTSms:         pts,
-		DTSms:         dts,
-		Discontinuity: disco,
+		Codec: domain.AVCodecH264,
+		Data:  []byte{payload},
+		PTSms: pts,
+		DTSms: dts,
 	}
 }
 
-func audioPktTS(payload byte, pts, dts uint64, disco bool) *domain.AVPacket {
+func audioPktTS(payload byte, pts, dts uint64, _ bool) *domain.AVPacket {
 	return &domain.AVPacket{
-		Codec:         domain.AVCodecAAC,
-		Data:          []byte{payload},
-		PTSms:         pts,
-		DTSms:         dts,
-		Discontinuity: disco,
+		Codec: domain.AVCodecAAC,
+		Data:  []byte{payload},
+		PTSms: pts,
+		DTSms: dts,
 	}
 }
 

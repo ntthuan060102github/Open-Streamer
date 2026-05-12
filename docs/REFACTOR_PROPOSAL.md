@@ -1,16 +1,17 @@
 # Refactor Proposal — Stream Session & Timeline Normalisation
 
-**Status**: Phases 1–3 implemented on `refactor/architecture` (2026-05).
-Phase 4 (Normaliser to raw-TS path) and Phase 5 (stall → Period boundary)
-remain — see [DASH_OUTSTANDING_BUGS.md](./DASH_OUTSTANDING_BUGS.md).
+**Status**: ALL FIVE PHASES implemented on `refactor/architecture`
+(2026-05). Branch remains separate from `main` pending final
+post-deploy soak; see [DASH_OUTSTANDING_BUGS.md](./DASH_OUTSTANDING_BUGS.md)
+for residual quality-of-service items unrelated to the refactor.
 
 | Phase | Status | Landed as |
 |---|---|---|
 | 1 — `StreamSession` dual-write across buffer hub | ✅ | `refactor(phase-1): introduce StreamSession dual-write across buffer hub` |
 | 2 — Collapse 3 PTS rebasers into `timeline.Normaliser` | ✅ | `refactor(phase-2): collapse 3 PTS rebasers into a single timeline.Normaliser` |
 | 3 — Publishers dispatch on `buffer.Packet.SessionStart` | ✅ | `refactor(phase-3): publishers dispatch on buffer.Packet.SessionStart` |
-| 4 — Extend Normaliser to cover raw-TS path | ⬜ Pending | — |
-| 5 — Stall detection → DASH `<Period>` boundary | ⬜ Pending | — |
+| 4 — Extend Normaliser to cover raw-TS path | ✅ | `internal/ingestor/tsnorm` wraps `timeline.Normaliser` for raw-TS chunks; `writeRawTSChunk` routes UDP / HLS-pull / SRT / file / `copy://` / `mixer://` through it. Plus stall watchdog → SessionStartStallRecovery for the silent-source case. |
+| 5 — Cleanup: remove `AVPacket.Discontinuity`, `hlsFailoverGen`, stale comments | ✅ | This commit. AVPacket field deleted; Normaliser no longer writes the flag; re-anchor events stay on `LastDiagnostic()` for telemetry; CLAUDE.md / package docs synced. |
 
 The text below is the original design doc kept for historical reference;
 the exact API names in the implementation may have evolved slightly. Always
@@ -432,14 +433,26 @@ specific reported bug.
 
 - **Risk**: none. Tests don't change behaviour.
 
-### Phase 5 — Cleanup
+### Phase 5 — Cleanup ✅
 
-- Remove `AVPacket.Discontinuity` (now redundant with `SessionStart` +
-  Normaliser-internal jump tracking)
-- Remove `hlsFailoverGen` event-bus channel
-- Update `CLAUDE.md`, `docs/ARCHITECTURE.md`
-- Update package comments that reference removed mechanisms
-- **Risk**: low.
+Done. Specifically:
+
+- `AVPacket.Discontinuity` field deleted from `internal/domain/avpacket.go`.
+  Normaliser no longer writes it; the lone telemetry consumer
+  (tests + `LastDiagnostic().HardReanchored`) reads from the
+  Normaliser's diagnostic instead.
+- `hlsFailoverGen` event-bus channel removed (HLS dispatches on
+  `pkt.SessionStart` for both AV and raw-TS paths via the unified
+  `handleIncoming` → `onSessionBoundary` route).
+- Stale package comments updated: `pull/mixer.go`, `serve_rtsp.go`,
+  `push_rtmp.go`, `coordinator/abr_mixer.go`, `buffer/packet.go`,
+  `domain/defaults.go`, `timeline/normaliser.go` (package doc),
+  `internal/publisher/hls.go`.
+- CLAUDE.md synced — Normaliser scope now describes raw-TS coverage
+  via tsnorm; the Discontinuity flag is documented as deleted.
+
+**Risk realised**: low. Tests migrated from `p.Discontinuity` to
+`n.LastDiagnostic().HardReanchored` without behavioural change.
 
 ---
 
