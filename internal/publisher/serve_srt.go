@@ -179,13 +179,16 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 			if !ok {
 				return
 			}
-			if pkt.AV != nil && pkt.AV.Discontinuity {
+			if pkt.SessionStart {
+				// Source switched. Drop stale muxer state, TS carry, and
+				// the half-filled batch so the new session's first bytes
+				// don't merge with the previous source's tail.
 				avMux = nil
 				tsCarry = nil
 				batch = batch[:0]
 			}
 			var writeErr error
-			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+			tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 				if writeErr != nil {
 					return
 				}

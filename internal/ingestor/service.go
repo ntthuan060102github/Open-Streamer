@@ -23,10 +23,10 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
-	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/ptsrebaser"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/push"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
 	"github.com/ntt0601zcoder/open-streamer/pkg/protocol"
 	"github.com/samber/do/v2"
@@ -178,7 +178,7 @@ func (s *Service) Run(ctx context.Context) error {
 		rtmpSrv, err := push.NewRTMPServer(
 			rtmpListenAddr(listeners.RTMP),
 			s.registry,
-			s.rebaserConfig(),
+			s.normaliserConfig(),
 		)
 		if err != nil {
 			return fmt.Errorf("ingestor: create rtmp server: %w", err)
@@ -427,7 +427,11 @@ func (s *Service) startPullWorker(ctx context.Context, streamID domain.StreamCod
 					prevCancel()
 				}
 			},
-			rebaserCfg: s.rebaserConfig(),
+			// A non-nil prevCancel at scheduling time means the manager
+			// is replacing an active worker — i.e. a failover. Otherwise
+			// this is a cold start.
+			firstSessionReason: firstSessionReasonFor(prevCancel),
+			normaliserCfg:      s.normaliserConfig(),
 		}
 		s.mu.Unlock()
 		runPullWorker(workerCtx, streamID, bufferWriteID, input, reader, s.buf, cb)
@@ -491,17 +495,20 @@ func (s *Service) startPushRegistration(streamID domain.StreamCode, input domain
 	return nil
 }
 
-// rebaserConfig returns the AV-path PTS rebaser settings used by both the
-// pull worker (per readLoop) and the push server (at construction).
-// PTS normalisation is a server-level invariant — operators don't tune it,
-// the server always anchors timestamps to local wallclock so upstream
-// clock skew can never poison the buffer hub. Threshold is a fixed
-// domain default; if it ever needs to change, change the constant.
-func (s *Service) rebaserConfig() ptsrebaser.Config {
-	return ptsrebaser.Config{
-		Enabled:         true,
-		JumpThresholdMs: domain.DefaultPTSJumpThresholdMs,
-		MaxAheadMs:      domain.DefaultPTSMaxAheadMs,
+// normaliserConfig returns the AV-path PTS Normaliser settings used by
+// both the pull worker (one Normaliser per worker lifetime) and the push
+// server (one per pub session). PTS normalisation is a server-level
+// invariant — operators don't tune it; the server always anchors
+// timestamps to local wallclock so upstream clock skew can never poison
+// the buffer hub. Thresholds are fixed domain defaults; if any need to
+// change, change the constants in domain/defaults.go.
+func (s *Service) normaliserConfig() timeline.Config {
+	return timeline.Config{
+		Enabled:          true,
+		JumpThresholdMs:  domain.DefaultPTSJumpThresholdMs,
+		MaxAheadMs:       domain.DefaultPTSMaxAheadMs,
+		MaxBehindMs:      domain.DefaultPTSMaxBehindMs,
+		CrossTrackSnapMs: 1000,
 	}
 }
 

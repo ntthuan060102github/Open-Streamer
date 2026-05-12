@@ -36,10 +36,10 @@ package publisher
 // Each packager builds a fresh remuxer, so SPS/PPS / ASC are re-emitted on
 // every reconnect — no codec state needs to survive across sessions.
 //
-// Input switching: when the ingestor switches input source, the first packet
-// of the new source is flagged Discontinuity=true. feedLoop signals the
-// packager to end via errDiscontinuity. serveRTMPPush starts a fresh session
-// with no retry delay so the new source can take over with minimum gap.
+// Input switching: when the ingestor switches input source, the next
+// buffer.Packet carries SessionStart=true. feedLoop signals the packager
+// to end via errDiscontinuity. serveRTMPPush starts a fresh session with
+// no retry delay so the new source can take over with minimum gap.
 //
 // RTMPS: rtmps:// URLs are handled natively by lal via PushSessionOption.TlsConfig.
 // Default TLS config uses ServerName from the URL host.
@@ -56,13 +56,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
-
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
@@ -116,9 +115,11 @@ type rtmpPushPackager struct {
 	// connection failure to unblock the demuxer.
 	tsBuf *tsBuffer
 
-	// gotDiscontinuity is set by feedLoop when it sees Discontinuity=true on
-	// an established session. run() then returns errDiscontinuity and
-	// serveRTMPPush starts a fresh session with no backoff delay.
+	// gotDiscontinuity is set by feedLoop when it sees
+	// buffer.Packet.SessionStart=true on an established session. run()
+	// then returns errDiscontinuity and serveRTMPPush starts a fresh
+	// session with no backoff delay. (Naming kept for historical
+	// continuity with the original AVPacket.Discontinuity-based design.)
 	gotDiscontinuity atomic.Bool
 }
 
@@ -150,10 +151,10 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 	p.tsBuf = tb
 	go p.feedLoop(ctx, sub, tb)
 
-	demux := mpeg2.NewTSDemuxer()
-	demux.OnFrame = p.onTSFrame
+	dmx := tsdemux.New()
+	dmx.OnFrame = p.onTSFrame
 	demuxDone := make(chan error, 1)
-	go func() { demuxDone <- demux.Input(tb) }()
+	go func() { demuxDone <- dmx.Input(ctx, tb) }()
 
 	select {
 	case <-ctx.Done():
@@ -282,11 +283,13 @@ func (p *rtmpPushPackager) connect(ctx context.Context) error {
 // feedLoop reads packets from sub, reassembles 188-byte TS packets via
 // alignedFeed, and pipes them into tb. Runs in its own goroutine.
 //
-// Discontinuity handling: the ingestor flags the first packet of every
-// (re)connect with Discontinuity=true — it has no notion of source switch vs.
-// initial start vs. transient reconnect, that's by design. Once we have an
-// active push session (connErr nil), any Discontinuity must restart the
-// session because remote codec params may have changed.
+// Session-boundary handling: every fresh StreamSession on the buffer hub
+// (cold start, reconnect, failover, mixer cycle, codec change) carries
+// buffer.Packet.SessionStart=true on its first packet. Once we have an
+// active push session (connErr nil), any SessionStart must restart the
+// downstream push session because the remote codec params and PCR base
+// may have changed. The first SessionStart of the worker (before connErr
+// is settled) is consumed by the initial setup path, not here.
 func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber, tb *tsBuffer) {
 	defer tb.Close()
 	var tsCarry []byte
@@ -300,11 +303,11 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 			if !ok {
 				return
 			}
-			if pkt.AV != nil && pkt.AV.Discontinuity && p.connErr.Load() == nil {
+			if pkt.SessionStart && p.connErr.Load() == nil {
 				p.gotDiscontinuity.Store(true)
 				return
 			}
-			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+			tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 				alignedFeed(b, &tsCarry, func(pkt188 []byte) bool {
 					_, err := tb.Write(pkt188)
 					return err == nil
@@ -319,32 +322,32 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 // tag (with proper composition_time for B-frames) and writes via lal.
 //
 //nolint:exhaustive // RTMP push only carries H.264 + AAC; H.265 needs Enhanced RTMP, MP3 unsupported by most ingest servers
-func (p *rtmpPushPackager) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+func (p *rtmpPushPackager) onTSFrame(cid tsdemux.StreamType, frame []byte, pts, dts uint64) {
 	if p.connErr.Load() != nil || len(frame) == 0 {
 		return
 	}
 
 	if !p.baseDTSSet {
-		p.baseDTS = int64(dts)
+		p.baseDTS = int64(dts) //nolint:gosec
 		p.baseDTSSet = true
 	}
-	// mpeg2.TSDemuxer.OnFrame already converts MPEG-TS 90 kHz ticks to ms
-	// before calling us (see ts-demuxer.go: `stream.pkg.pts/90`). Do NOT
+	// tsdemux exposes PTS / DTS in milliseconds already (astits's raw
+	// 90 kHz tick value is divided by 90 in the wrapper). Do NOT
 	// divide again here.
-	relDTS := int64(dts) - p.baseDTS
+	relDTS := int64(dts) - p.baseDTS //nolint:gosec
 	if relDTS < 0 {
 		relDTS = 0
 	}
-	relPTS := int64(pts) - p.baseDTS
+	relPTS := int64(pts) - p.baseDTS //nolint:gosec
 	if relPTS < 0 {
 		relPTS = 0
 	}
 
 	var err error
-	switch cid {
-	case mpeg2.TS_STREAM_H264:
+	switch cid { //nolint:exhaustive // see top-of-function comment
+	case tsdemux.StreamTypeH264:
 		err = p.codec.FeedH264(frame, relDTS, relPTS)
-	case mpeg2.TS_STREAM_AAC:
+	case tsdemux.StreamTypeAAC:
 		err = p.codec.FeedAAC(frame, relDTS)
 	default:
 		return

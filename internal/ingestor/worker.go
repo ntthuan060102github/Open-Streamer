@@ -8,12 +8,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
-	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/ptsrebaser"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
+	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/tsnorm"
+	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
 
 const (
@@ -37,11 +39,25 @@ type pullWorkerCallbacks struct {
 	// It is used by startPullWorker to cancel the previous source worker only after
 	// the new source has connected — eliminating the buffer gap during source transitions.
 	onHandoff func()
+	// onSession is called whenever the worker mints a new StreamSession on
+	// the buffer hub (first connect, reconnect, failover-handoff). The caller
+	// may publish a bus event or log the session for telemetry. The session
+	// argument is the live record returned by buffer.Service.SetSession;
+	// readers must not mutate it.
+	onSession func(streamID domain.StreamCode, sess *domain.StreamSession)
 
-	// rebaserCfg controls AV-path PTS normalisation. A fresh Rebaser is
-	// constructed per readLoop invocation (i.e. per source connection),
-	// so reconnects naturally re-anchor to the new wallclock.
-	rebaserCfg ptsrebaser.Config
+	// firstSessionReason is the SessionStartReason used the first time this
+	// worker successfully Opens its source. Caller picks Fresh for a cold
+	// start and Failover when this worker is taking over from a predecessor.
+	// Subsequent Open attempts within the same worker always mint a
+	// Reconnect session, since by then we have already handed off.
+	firstSessionReason domain.SessionStartReason
+
+	// normaliserCfg controls AV-path PTS anchoring. The Normaliser is
+	// constructed once per worker lifetime; OnSession resets per-track
+	// state at each new StreamSession boundary (cold start, reconnect,
+	// failover-handoff). See internal/timeline.
+	normaliserCfg timeline.Config
 }
 
 // runPullWorker reads from reader in a loop, writing each chunk to the buffer.
@@ -57,7 +73,23 @@ func runPullWorker(
 	cb pullWorkerCallbacks,
 ) {
 	delay := reconnectBaseDelay
-	handedOff := false // onHandoff fires at most once (first successful Open)
+	handedOff := false     // onHandoff fires at most once (first successful Open)
+	firstOpenDone := false // distinguishes first Open from subsequent Reconnect
+
+	// Normaliser lives for the whole worker lifetime — across every
+	// reconnect / readLoop iteration. State resets are explicit via
+	// OnSession (called from mintSessionForOpen below) so a reconnect
+	// re-anchors deterministically against the new StreamSession instead
+	// of relying on a fresh-construction-per-cycle implicit reset.
+	norm := timeline.New(cb.normaliserCfg)
+
+	// Raw-TS Normaliser: demux → timeline.Normaliser → remux on the
+	// AVCodecRawTSChunk write path. The AV-path Normaliser (`norm`
+	// above) covers RTSP / RTMP pull, RTMP push, copy://, mixer://;
+	// `tsNorm` is the parallel path for UDP / HLS-pull / HTTP-TS /
+	// SRT / file. Same wallclock anchoring semantics; lives on the
+	// same lifecycle so OnSession can fire on both from one call site.
+	tsNorm := tsnorm.New(ctx, cb.normaliserCfg)
 
 	for {
 		if !openSource(ctx, streamID, input, r, cb, &delay, &handedOff) {
@@ -70,11 +102,16 @@ func runPullWorker(
 			"url", input.URL,
 		)
 		delay = reconnectBaseDelay // reset on successful open
+		// Mint a StreamSession before any packet is written. On the very
+		// first open we honour cb.firstSessionReason (Fresh or Failover);
+		// every subsequent open within this worker is a Reconnect.
+		mintSessionForOpen(streamID, bufferWriteID, buf, &cb, firstOpenDone, norm, tsNorm)
+		firstOpenDone = true
 		if cb.onConnect != nil {
 			cb.onConnect(streamID, input.Priority)
 		}
 
-		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, &cb)
+		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, &cb, norm, tsNorm)
 		_ = r.Close()
 
 		if ctx.Err() != nil {
@@ -136,6 +173,65 @@ func fireHandoffOnce(cb pullWorkerCallbacks, handedOff *bool) {
 	*handedOff = true
 	if cb.onHandoff != nil {
 		cb.onHandoff()
+	}
+}
+
+// firstSessionReasonFor picks the SessionStartReason to use on a freshly
+// scheduled pull worker's first Open. A non-nil prevCancel means there's
+// an active predecessor being handed off — that is a failover by Stream
+// Manager. A nil prevCancel means this is the first worker for this stream
+// in this Service's lifetime — a fresh cold start.
+func firstSessionReasonFor(prevCancel context.CancelFunc) domain.SessionStartReason {
+	if prevCancel != nil {
+		return domain.SessionStartFailover
+	}
+	return domain.SessionStartFresh
+}
+
+// mintSessionForOpen tells the buffer hub that a new StreamSession is
+// starting AND resets the Normaliser's per-track anchor state to match.
+// firstOpenDone distinguishes the two cases: false means this is the very
+// first successful Open for this worker (use the caller-provided
+// firstSessionReason — Fresh or Failover); true means we are re-opening
+// within the same worker after a transient read error (always Reconnect).
+// The worker doesn't have init params on hand at this point — SPS/PPS / ASC
+// live inside the per-reader state and arrive on the first keyframe — so we
+// pass nil configs; downstream consumers fall back to in-band parsing
+// exactly as they do today.
+func mintSessionForOpen(
+	streamID, bufferWriteID domain.StreamCode,
+	buf *buffer.Service,
+	cb *pullWorkerCallbacks,
+	firstOpenDone bool,
+	norm *timeline.Normaliser,
+	tsNorm *tsnorm.Normaliser,
+) {
+	reason := domain.SessionStartReconnect
+	if !firstOpenDone {
+		reason = cb.firstSessionReason
+		if reason == domain.SessionStartUnknown {
+			reason = domain.SessionStartFresh
+		}
+	}
+	sess := buf.SetSession(bufferWriteID, reason, nil, nil)
+	if sess == nil {
+		return
+	}
+	// Reset both Normalisers' per-track anchor state in lockstep with
+	// the session boundary. The very next packet on each path re-seeds
+	// at elapsed=0 against the fresh wallclock origin.
+	norm.OnSession(sess)
+	if tsNorm != nil {
+		tsNorm.OnSession(sess)
+	}
+	slog.Debug("ingestor: stream session minted",
+		"stream_code", streamID,
+		"buffer_id", bufferWriteID,
+		"session_id", sess.ID,
+		"reason", sess.Reason.String(),
+	)
+	if cb.onSession != nil {
+		cb.onSession(streamID, sess)
 	}
 }
 
@@ -224,8 +320,10 @@ func handleReadError(
 }
 
 // readLoop reads from reader until error or ctx cancellation.
-// The first packet written in each call is marked Discontinuity=true so that
-// downstream consumers (HLS, DASH packager) know the source has just switched.
+//
+// PTS/DTS anchoring is delegated to the worker-scoped Normaliser (passed
+// in from runPullWorker). State resets between reconnects happen at the
+// session boundary, not at readLoop construction — see mintSessionForOpen.
 //
 // For raw-TS sources (AVCodecRawTSChunk) the data path bypasses demux/remux,
 // which leaves the manager's input "tracks" panel empty. A side-channel
@@ -239,24 +337,39 @@ func readLoop(
 	r PacketReader,
 	buf *buffer.Service,
 	cb *pullWorkerCallbacks,
+	norm *timeline.Normaliser,
+	tsNorm *tsnorm.Normaliser,
 ) error {
-	firstPacket := true
 	var stats *pull.StatsDemuxer
 	defer func() {
 		if stats != nil {
 			stats.Close()
 		}
+		// Drain any in-flight reassembled H.264 / H.265 access unit
+		// held back by tsNorm's coalesce-by-DTS — without this, the
+		// last frame of a stream (where no follow-up frame arrives to
+		// trigger the next-DTS flush) would be silently dropped when
+		// the worker exits on a clean source EOF.
+		if tsNorm != nil {
+			if tail := tsNorm.Flush(); len(tail) > 0 {
+				_ = buf.Write(bufferWriteID, buffer.Packet{TS: tail})
+			}
+		}
 	}()
-	// Per-connection rebaser: a reconnect drops this readLoop and a new
-	// one builds a fresh anchor against the new wallclock — that's the
-	// right invariant for live, since a reconnect implies the source
-	// clock relationship to ours has just changed. cb may be nil in
-	// tests; default to a disabled rebaser then.
-	var rebaserCfg ptsrebaser.Config
-	if cb != nil {
-		rebaserCfg = cb.rebaserCfg
-	}
-	rebaser := ptsrebaser.New(rebaserCfg)
+
+	// Stall watchdog: emits SessionStartStallRecovery on the buffer hub
+	// when no packet has been written for stallThreshold seconds while
+	// ctx is still alive (source went silent without the reader
+	// returning an error). The watchdog goroutine is scoped to this
+	// readLoop invocation; cancelling watchdogCtx on return stops it
+	// before the readLoop's defer chain races with a final write.
+	var lastWriteAt atomic.Int64
+	lastWriteAt.Store(time.Now().UnixNano())
+	watchdogCtx, cancelWatchdog := context.WithCancel(ctx)
+	defer cancelWatchdog()
+	go runStallWatchdog(watchdogCtx, streamID, bufferWriteID, buf, &lastWriteAt,
+		DefaultStallThreshold, DefaultStallCheckInterval)
+
 	for {
 		batch, err := r.ReadPackets(ctx)
 		if err != nil {
@@ -266,8 +379,6 @@ func readLoop(
 			if len(p.Data) == 0 {
 				continue
 			}
-			isFirst := firstPacket
-			firstPacket = false
 			ensureStatsDemuxer(&stats, &p, streamID, input.Priority, cb)
 			wctx := writeContext{
 				streamID:      streamID,
@@ -276,9 +387,11 @@ func readLoop(
 				buf:           buf,
 				cb:            cb,
 				stats:         stats,
-				rebaser:       rebaser,
+				normaliser:    norm,
+				tsNormaliser:  tsNorm,
+				lastWriteAt:   &lastWriteAt,
 			}
-			if writeErr := writeOnePacket(wctx, &p, isFirst); writeErr != nil {
+			if writeErr := writeOnePacket(wctx, &p); writeErr != nil {
 				return writeErr
 			}
 		}
@@ -321,7 +434,21 @@ type writeContext struct {
 	buf           *buffer.Service
 	cb            *pullWorkerCallbacks
 	stats         *pull.StatsDemuxer
-	rebaser       *ptsrebaser.Rebaser // nil-safe; only acts on AV path
+	normaliser    *timeline.Normaliser // nil-safe; only acts on AV path
+	// tsNormaliser anchors PTS/DTS on the raw-TS write path: demux the
+	// chunk, run each PES through timeline.Normaliser, remux back into
+	// TS bytes. Without it, raw-TS-path sources (UDP / HLS-pull /
+	// SRT / file / copy:// / mixer://) propagate upstream clock drift,
+	// burst delivery, and PTS jumps straight to consumers — root cause
+	// of MPD overlap, audio under-emit, player freezes (see
+	// docs/DASH_OUTSTANDING_BUGS.md).
+	tsNormaliser *tsnorm.Normaliser
+	// lastWriteAt is bumped on every successful buffer write so the
+	// stall watchdog (started alongside readLoop) can detect "source
+	// silent for >stallThreshold seconds while ctx is alive" and emit
+	// a session boundary. Atomic so the watchdog goroutine can read
+	// without locking the writer.
+	lastWriteAt *atomic.Int64
 }
 
 // writeOnePacket forwards one source packet into the buffer, dispatching on
@@ -330,23 +457,24 @@ type writeContext struct {
 // AV sources (RTSP/RTMP) write Packet.AV. Extracted from readLoop to keep
 // each function under the cognitive-complexity ceiling.
 //
+// The per-packet "first packet of a fresh source" cue is no longer set
+// on the AVPacket — downstream consumers read SessionStart=true from the
+// buffer.Packet wrapper, which buffer.Service auto-stamps after the
+// preceding SetSession call (see mintSessionForOpen).
+//
 // wctx.stats (raw-TS path) is supplied by readLoop so onMedia fires for raw
 // chunks too — without that, the manager's input "tracks" panel stays empty
 // for every UDP / HTTP-MPEG-TS / SRT / File source.
-func writeOnePacket(wctx writeContext, p *domain.AVPacket, isFirst bool) error {
+func writeOnePacket(wctx writeContext, p *domain.AVPacket) error {
 	if p.Codec == domain.AVCodecRawTSChunk {
 		return writeRawTSChunk(wctx, p.Data)
 	}
 	cl := p.Clone()
-	if isFirst {
-		cl.Discontinuity = true
-	}
-	// Anchor PTS/DTS to local wallclock so upstream clock drift never
-	// reaches the buffer hub. Returns false when the rebaser dropped
-	// the packet (input running ahead of wallclock past MaxAheadMs);
-	// in that case skip the buffer write so downstream consumers see
-	// a wallclock-paced stream.
-	if !wctx.rebaser.Apply(cl, time.Now()) {
+	// Anchor PTS/DTS via the Normaliser. Returns false when the
+	// Normaliser dropped the packet (input running ahead of wallclock
+	// past MaxAheadMs); in that case skip the buffer write so downstream
+	// consumers see a wallclock-paced stream.
+	if !wctx.normaliser.Apply(cl, time.Now()) {
 		return nil
 	}
 	if err := wctx.buf.Write(wctx.bufferWriteID, buffer.Packet{AV: cl}); err != nil {
@@ -356,6 +484,9 @@ func writeOnePacket(wctx writeContext, p *domain.AVPacket, isFirst bool) error {
 			"err", err,
 		)
 		return err
+	}
+	if wctx.lastWriteAt != nil {
+		wctx.lastWriteAt.Store(time.Now().UnixNano())
 	}
 	cb := wctx.cb
 	if cb != nil && cb.onPacket != nil {
@@ -373,32 +504,71 @@ func writeOnePacket(wctx writeContext, p *domain.AVPacket, isFirst bool) error {
 	return nil
 }
 
-// writeRawTSChunk handles the AVCodecRawTSChunk path — copies the chunk so
-// the source-side reader buffer can be reused, writes Packet.TS to the buffer
-// hub, fires the byte-count + packet-count observers, and tees a copy into
-// the side-channel stats demuxer so onMedia (codec / bitrate / resolution)
-// fires for raw-TS sources too.
+// writeRawTSChunk handles the AVCodecRawTSChunk path. The upstream
+// chunk is demuxed, every PES is wallclock-anchored via
+// timeline.Normaliser (wrapped by tsnorm.Normaliser), and the result
+// is remuxed back into TS bytes before reaching the buffer hub. Every
+// downstream consumer therefore reads a normalised stream regardless
+// of source protocol, matching the invariant the AV-path has always
+// upheld.
+//
+// stats receives the ORIGINAL chunk (pre-normalise) so the manager's
+// input "tracks" panel sees the source's actual codec / bitrate /
+// resolution rather than the re-muxed copy — the side-channel
+// existence is purely for telemetry and shouldn't be affected by our
+// remux.
+//
+// When tsNormaliser is nil (defensive fallback — tests, or a future
+// caller that skipped Normaliser construction) writeRawTSChunk
+// degrades to the legacy passthrough behaviour.
 func writeRawTSChunk(wctx writeContext, chunk []byte) error {
 	cp := append([]byte(nil), chunk...)
-	if err := wctx.buf.Write(wctx.bufferWriteID, buffer.Packet{TS: cp}); err != nil {
-		slog.Error("ingestor: buffer write failed (TS passthrough)",
+	// Best-effort: stats demuxer drops on backpressure, never blocks
+	// the data path. Feed the raw copy so source-level codec / bitrate
+	// telemetry isn't perturbed by our normalisation. The source
+	// reader can reuse `chunk`'s underlying buffer once Feed returns.
+	wctx.stats.Feed(cp)
+
+	payload := cp
+	if wctx.tsNormaliser != nil {
+		normalised, normErr := wctx.tsNormaliser.Process(cp)
+		if normErr != nil {
+			slog.Warn("ingestor: tsnorm demux failed, falling back to passthrough",
+				"stream_code", wctx.streamID,
+				"input_priority", wctx.input.Priority,
+				"err", normErr,
+			)
+		} else if len(normalised) > 0 {
+			payload = normalised
+		} else {
+			// All frames dropped (e.g. PSI-only chunk, or every PES
+			// failed Apply). Don't write an empty Packet.TS — that
+			// would still bump the consumer's last-recv timestamp
+			// while delivering nothing.
+			if wctx.lastWriteAt != nil {
+				wctx.lastWriteAt.Store(time.Now().UnixNano())
+			}
+			return nil
+		}
+	}
+	if err := wctx.buf.Write(wctx.bufferWriteID, buffer.Packet{TS: payload}); err != nil {
+		slog.Error("ingestor: buffer write failed (TS normalised)",
 			"stream_code", wctx.streamID,
 			"input_priority", wctx.input.Priority,
 			"err", err,
 		)
 		return err
 	}
+	if wctx.lastWriteAt != nil {
+		wctx.lastWriteAt.Store(time.Now().UnixNano())
+	}
 	cb := wctx.cb
 	if cb != nil && cb.onPacket != nil {
 		cb.onPacket(wctx.streamID, wctx.input.Priority)
 	}
 	if cb != nil && cb.onPacketBytes != nil {
-		cb.onPacketBytes(wctx.streamID, wctx.input.Priority, len(cp))
+		cb.onPacketBytes(wctx.streamID, wctx.input.Priority, len(payload))
 	}
-	// Best-effort: stats demuxer drops on backpressure, never blocks the
-	// data path. Feed the copy we already own so the source reader can
-	// reuse `chunk`'s underlying buffer.
-	wctx.stats.Feed(cp)
 	return nil
 }
 

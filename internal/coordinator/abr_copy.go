@@ -280,6 +280,11 @@ func (c *Coordinator) abrCopyTapForward(ctx context.Context, entry *abrCopyEntry
 	}
 	defer c.buf.Unsubscribe(upBufID, sub)
 
+	// Mint a StreamSession on the downstream rendition buffer for every
+	// (re)start of the tap. Same rationale as abrMixerVideoForward: an
+	// upstream cycle is the copy mirror's reconnect equivalent.
+	_ = c.buf.SetSession(downBufID, domain.SessionStartMixerCycle, nil, nil)
+
 	for {
 		select {
 		case <-ctx.Done():

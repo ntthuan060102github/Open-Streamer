@@ -34,6 +34,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 	"github.com/ntt0601zcoder/open-streamer/internal/manager"
+	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
 
 // abrMixerEntry holds the runtime handles needed to tear down an ABR-mixer
@@ -48,100 +49,39 @@ type abrMixerEntry struct {
 	audioUpstream     domain.StreamCode
 	lastPacketAtNanos atomic.Int64
 
-	// t0 is the shared wall-clock anchor used by ptsRebaser instances in the
-	// forward goroutines. Both video taps and the audio fan-out reference the
-	// same t0 so packets from the two unrelated upstream clocks land on a
-	// common timeline — without this, the player gets PTS values diverging
-	// by hours and renders black/silence.
+	// t0 is the shared wall-clock anchor used by the per-cycle
+	// timeline.Normaliser instances in the forward goroutines. Both
+	// video taps and the audio fan-out reference the same t0 so packets
+	// from the two unrelated upstream clocks land on a common timeline
+	// — without this, the player gets PTS values diverging by hours and
+	// renders black/silence.
 	t0 time.Time
 }
 
-// ptsRebaserBaseMs is the headroom added to every rebased timestamp so that a
-// packet whose DTS or PTS dips slightly below the anchor (out-of-order
-// delivery, brief network reorder) doesn't underflow uint64 when the mixer
-// has only just started and wallOffsetMs is near zero. 1 second is several
-// orders of magnitude larger than any realistic skew.
-const ptsRebaserBaseMs int64 = 1000
-
-// ptsRebaserPauseGapMs is the wall-clock gap above which we suspect the
-// source paused (silent audio source, encoder hiccup, network reorder buffer
-// drained). When true, we re-anchor the rebaser to the current wall-clock so
-// output PTS doesn't drift behind — without this, audio with frequent micro-
-// pauses falls 10s+ behind video over a 10-minute session and the player
-// either buffers indefinitely or refuses to A/V sync.
-const ptsRebaserPauseGapMs int64 = 500
-
-// ptsRebaserPauseSrcDeltaSlackMs is the headroom subtracted from the wall-
-// clock gap when comparing against source PTS delta. A real pause means the
-// source produced almost nothing during the wall-clock gap; a packet that
-// merely arrived a bit late (network jitter) will have srcDelta close to
-// wallDelta. This slack avoids re-anchoring on normal jitter.
-const ptsRebaserPauseSrcDeltaSlackMs int64 = 200
-
-// ptsRebaser maps an upstream's PTS/DTS sequence onto a shared wall-clock
-// timeline. The first packet of each cycle anchors itself at the elapsed
-// wall-clock time since t0; subsequent packets preserve their original
-// inter-frame deltas. One instance per source per forward cycle — re-creating
-// it on reconnect is what stitches a restarted upstream's new PCR base back
-// into a continuous downstream timeline.
-//
-// The rebaser also re-anchors mid-cycle when it detects a long pause in the
-// source — see apply() for the pause-detection rule. On every re-anchor (cycle
-// start OR pause re-anchor) the packet is marked Discontinuity so the
-// downstream HLS segmenter inserts #EXT-X-DISCONTINUITY and the player handles
-// the PTS jump cleanly instead of stuttering.
-type ptsRebaser struct {
-	t0           time.Time
-	has          bool
-	firstPTS     uint64
-	firstDTS     uint64
-	wallOffsetMs int64
-	lastSrcPTS   uint64 // for pause detection
-	lastWallMs   int64
+// abrMixerNormaliserConfig returns the per-forward-cycle Normaliser
+// settings for the abr_mixer pipeline. Same defaults as the ingestor
+// (JumpThresholdMs = 2 s, MaxAheadMs = 0, MaxBehindMs = 3 s) so V
+// from the video upstream and A from the audio upstream collapse onto
+// a single wallclock-anchored timeline driven by entry.t0.
+func abrMixerNormaliserConfig() timeline.Config {
+	return timeline.Config{
+		Enabled:          true,
+		JumpThresholdMs:  domain.DefaultPTSJumpThresholdMs,
+		MaxAheadMs:       domain.DefaultPTSMaxAheadMs,
+		MaxBehindMs:      domain.DefaultPTSMaxBehindMs,
+		CrossTrackSnapMs: 1000,
+	}
 }
 
-// apply rewrites p.PTSms / p.DTSms in place. Signed math + base offset
-// tolerate B-frame DTS<PTS, out-of-order packets, and packets briefly
-// preceding the anchor without uint underflow.
-//
-// Re-anchor conditions:
-//   - First packet of cycle (cold start or post-reconnect)
-//   - Wall-clock gap since last packet > ptsRebaserPauseGapMs AND source PTS
-//     advanced by less than (gap - slack) — i.e., source paused while wall-
-//     clock kept moving, so we slide the anchor forward to current wall-clock
-//     to keep output PTS aligned with real time
-//
-// On any re-anchor the packet's Discontinuity flag is set so the segmenter
-// emits an EXT-X-DISCONTINUITY for the resulting PTS jump.
-func (r *ptsRebaser) apply(p *domain.AVPacket) {
-	nowMs := time.Since(r.t0).Milliseconds()
-	if !r.has {
-		// First packet of cycle. Mark Discontinuity so reconnect-driven PTS
-		// jumps surface as an EXT-X-DISCONTINUITY in the HLS playlist; for
-		// the very first segment of life this is a harmless extra tag.
-		p.Discontinuity = true
-		r.firstPTS = p.PTSms
-		r.firstDTS = p.DTSms
-		r.wallOffsetMs = nowMs + ptsRebaserBaseMs
-		r.lastSrcPTS = p.PTSms
-		r.lastWallMs = nowMs
-		r.has = true
-	} else {
-		wallDelta := nowMs - r.lastWallMs
-		srcDelta := int64(p.PTSms) - int64(r.lastSrcPTS)
-		if wallDelta > ptsRebaserPauseGapMs &&
-			srcDelta < wallDelta-ptsRebaserPauseSrcDeltaSlackMs {
-			// Source fell behind wall-clock — re-anchor + signal discontinuity.
-			p.Discontinuity = true
-			r.firstPTS = p.PTSms
-			r.firstDTS = p.DTSms
-			r.wallOffsetMs = nowMs + ptsRebaserBaseMs
-		}
-		r.lastSrcPTS = p.PTSms
-		r.lastWallMs = nowMs
-	}
-	p.PTSms = uint64(r.wallOffsetMs + (int64(p.PTSms) - int64(r.firstPTS)))
-	p.DTSms = uint64(r.wallOffsetMs + (int64(p.DTSms) - int64(r.firstDTS)))
+// newCycleNormaliser builds a Normaliser pre-seeded with the entry's
+// shared wallclock origin so V tap and A fan-out outputs land on the
+// same timeline. Each forward cycle (each V tap goroutine and the A
+// fan-out goroutine) constructs its own Normaliser; the shared
+// SeedWallclock keeps them aligned across cycle restarts.
+func newCycleNormaliser(t0 time.Time) *timeline.Normaliser {
+	n := timeline.New(abrMixerNormaliserConfig())
+	n.SeedWallclock(t0)
+	return n
 }
 
 // detectABRMixer reports whether `s` should run on the ABR-mixer mirror
@@ -374,7 +314,7 @@ func (c *Coordinator) runABRMixerVideoTap(
 // abrMixerVideoForward runs one demux-and-forward cycle for a single rung.
 // Returns true on ctx cancellation (caller should not retry).
 //
-// PTS/DTS are rebased onto entry.t0 via a per-cycle ptsRebaser so that video
+// PTS/DTS are rebased onto entry.t0 via a per-cycle timeline.Normaliser so that video
 // from upstream A and audio from upstream B share a common timeline. The
 // rebaser is scoped to the cycle: when an upstream restart triggers a new
 // forward cycle, a fresh rebaser captures the current wall-clock offset, so
@@ -386,7 +326,15 @@ func (c *Coordinator) abrMixerVideoForward(ctx context.Context, entry *abrMixerE
 	}
 	defer func() { _ = demux.Close() }()
 
-	rebaser := ptsRebaser{t0: entry.t0}
+	// Mint a StreamSession on the downstream rendition buffer so downstream
+	// consumers see a fresh session whenever this forward cycle (re)starts.
+	// Cycles re-start on upstream tear-down — that is the mixer's equivalent
+	// of a reconnect. The Normaliser's per-track state resets via OnSession;
+	// its wallclock origin (entry.t0) is preserved so V and A stay aligned
+	// across cycle restarts.
+	sess := c.buf.SetSession(downBufID, domain.SessionStartMixerCycle, nil, nil)
+	norm := newCycleNormaliser(entry.t0)
+	norm.OnSession(sess)
 	for {
 		batch, err := demux.ReadPackets(ctx)
 		if err != nil {
@@ -396,7 +344,9 @@ func (c *Coordinator) abrMixerVideoForward(ctx context.Context, entry *abrMixerE
 			if !p.Codec.IsVideo() {
 				continue
 			}
-			rebaser.apply(&p)
+			if !norm.Apply(&p, time.Now()) {
+				continue
+			}
 			if err := c.buf.Write(downBufID, buffer.Packet{AV: &p}); err == nil {
 				entry.lastPacketAtNanos.Store(time.Now().UnixNano())
 			}
@@ -485,7 +435,7 @@ func (c *Coordinator) abrMixerAudioForwardABR(
 	}
 	defer func() { _ = demux.Close() }()
 
-	rebaser := ptsRebaser{t0: entry.t0}
+	norm := newCycleNormaliser(entry.t0)
 	for {
 		batch, err := demux.ReadPackets(ctx)
 		if err != nil {
@@ -495,7 +445,9 @@ func (c *Coordinator) abrMixerAudioForwardABR(
 			if !p.Codec.IsAudio() {
 				continue
 			}
-			rebaser.apply(&p)
+			if !norm.Apply(&p, time.Now()) {
+				continue
+			}
 			pkt := buffer.Packet{AV: &p}
 			c.fanOutToRenditions(downBufIDs, pkt, entry)
 		}
@@ -517,7 +469,7 @@ func (c *Coordinator) abrMixerAudioForwardDirect(
 	}
 	defer c.buf.Unsubscribe(audioBufID, sub)
 
-	rebaser := ptsRebaser{t0: entry.t0}
+	norm := newCycleNormaliser(entry.t0)
 	for {
 		select {
 		case <-ctx.Done():
@@ -531,7 +483,9 @@ func (c *Coordinator) abrMixerAudioForwardDirect(
 			}
 			// Subscriber receives a clone of the original Packet, so mutating
 			// AV in place here only affects this consumer's view — safe.
-			rebaser.apply(pkt.AV)
+			if !norm.Apply(pkt.AV, time.Now()) {
+				continue
+			}
 			c.fanOutToRenditions(downBufIDs, pkt, entry)
 		}
 	}

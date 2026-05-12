@@ -91,15 +91,16 @@ const (
 	// memory per stream when IngestorConfig.HLSMaxSegmentBuffer is zero.
 	DefaultHLSMaxSegmentBuffer = 8
 
-	// DefaultPTSJumpThresholdMs is the AV-path PTS rebaser's jump cap
-	// (ms). When the gap between an output PTS and local wallclock
-	// exceeds this, the rebaser re-anchors and emits a Discontinuity
-	// so downstream HLS / DASH segmenters land the boundary cleanly.
-	// 2 s tolerates frame-cadence jitter and minor encoder drift while
-	// catching the multi-second forward jumps (CDN playlist resync,
-	// transcoder restart) that otherwise bake permanent offsets into
-	// segment timelines. This is a server-level invariant — not exposed
-	// to operators.
+	// DefaultPTSJumpThresholdMs is the Normaliser's jump cap (ms). When
+	// the gap between an output PTS and local wallclock exceeds this,
+	// the Normaliser re-anchors. The re-anchor event is recorded in
+	// LastDiagnostic for telemetry but is NOT propagated to consumers
+	// (session boundaries reach consumers via buffer.Packet.SessionStart
+	// instead). 2 s tolerates frame-cadence jitter and minor encoder
+	// drift while catching the multi-second forward jumps (CDN playlist
+	// resync, transcoder restart) that otherwise bake permanent offsets
+	// into segment timelines. Server-level invariant — not operator-
+	// tunable.
 	DefaultPTSJumpThresholdMs int64 = 2000
 
 	// DefaultPTSMaxAheadMs is intentionally 0 (disabled). When non-zero
@@ -116,6 +117,21 @@ const (
 	// of publishTime. This knob stays in the codebase for tests and
 	// for operators willing to accept the trade-off explicitly.
 	DefaultPTSMaxAheadMs int64 = 0
+
+	// DefaultPTSMaxBehindMs caps how far behind (now − wallOrigin) the
+	// proposed output PTS may sit before the rebaser hard-re-anchors the
+	// track to wallclock. Symmetric counterpart of MaxAheadMs but safe
+	// to enable by default — re-anchoring on backward drift jumps the
+	// track FORWARD onto wallclock, closing the gap rather than racing
+	// further behind (the stuck-state pathology only applies to the
+	// ahead-side drop). Catches the long-runtime A/V split observed in
+	// the field on RTSP relays and HLS-pull passthroughs where one
+	// track seeds late or pauses while the other keeps flowing — left
+	// unbounded, the lagging track stays permanently offset (test3:
+	// audio anchored 229 s behind video and never recovered). 3 s
+	// leaves room for CrossTrackSnapMs (1 s), GOP-cadence jitter, and
+	// minor RTP jitter without firing on normal live latency.
+	DefaultPTSMaxBehindMs int64 = 3000
 
 	// DefaultSRTLatencyMS is the SRT ARQ latency window (milliseconds) when
 	// SRTListenerConfig.LatencyMS is zero. 120ms matches Haivision's

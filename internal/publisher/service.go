@@ -97,11 +97,6 @@ type Service struct {
 	m            *metrics.Metrics
 	ffmpegPath   string
 
-	// hlsFailoverGen: incremented on each input.failover so every ABR variant segmenter
-	// can tag exactly one EXT-X-DISCONTINUITY on its next flush.
-	hlsFailoverMu  sync.Mutex
-	hlsFailoverGen map[domain.StreamCode]uint64
-
 	mu      sync.Mutex
 	streams map[domain.StreamCode]*streamState
 
@@ -160,29 +155,22 @@ func New(i do.Injector) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:            pub,
-		buf:            buf,
-		bus:            bus,
-		tracker:        tracker,
-		m:              m,
-		ffmpegPath:     ffmpegPath,
-		hlsFailoverGen: make(map[domain.StreamCode]uint64),
-		streams:        make(map[domain.StreamCode]*streamState),
-		mediaBuffer:    make(map[domain.StreamCode]domain.StreamCode),
-		rtspMounts:     make(map[string]*gortsplib.ServerStream),
-		rtspSrvReady:   make(chan struct{}),
-		rtmpActive:     make(map[domain.StreamCode]struct{}),
-		srtActive:      make(map[domain.StreamCode]struct{}),
-		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
-		rtspSessions:   make(map[*gortsplib.ServerSession]*rtspClient),
+		cfg:          pub,
+		buf:          buf,
+		bus:          bus,
+		tracker:      tracker,
+		m:            m,
+		ffmpegPath:   ffmpegPath,
+		streams:      make(map[domain.StreamCode]*streamState),
+		mediaBuffer:  make(map[domain.StreamCode]domain.StreamCode),
+		rtspMounts:   make(map[string]*gortsplib.ServerStream),
+		rtspSrvReady: make(chan struct{}),
+		rtmpActive:   make(map[domain.StreamCode]struct{}),
+		srtActive:    make(map[domain.StreamCode]struct{}),
+		pushStates:   make(map[domain.StreamCode]map[string]*pushState),
+		rtspSessions: make(map[*gortsplib.ServerSession]*rtspClient),
 	}
 	svc.listenersPtr.Store(&listeners)
-	bus.Subscribe(domain.EventInputFailover, func(_ context.Context, e domain.Event) error {
-		svc.hlsFailoverMu.Lock()
-		svc.hlsFailoverGen[e.StreamCode]++
-		svc.hlsFailoverMu.Unlock()
-		return nil
-	})
 
 	svc.cleanupAllOutputDirs()
 
@@ -192,19 +180,18 @@ func New(i do.Injector) (*Service, error) {
 // NewServiceForTesting creates a Service without DI, for use in integration tests.
 func NewServiceForTesting(cfg config.PublisherConfig, buf *buffer.Service, bus events.Bus) *Service {
 	svc := &Service{
-		cfg:            cfg,
-		buf:            buf,
-		bus:            bus,
-		ffmpegPath:     "ffmpeg",
-		hlsFailoverGen: make(map[domain.StreamCode]uint64),
-		streams:        make(map[domain.StreamCode]*streamState),
-		mediaBuffer:    make(map[domain.StreamCode]domain.StreamCode),
-		rtspMounts:     make(map[string]*gortsplib.ServerStream),
-		rtspSrvReady:   make(chan struct{}),
-		rtmpActive:     make(map[domain.StreamCode]struct{}),
-		srtActive:      make(map[domain.StreamCode]struct{}),
-		pushStates:     make(map[domain.StreamCode]map[string]*pushState),
-		rtspSessions:   make(map[*gortsplib.ServerSession]*rtspClient),
+		cfg:          cfg,
+		buf:          buf,
+		bus:          bus,
+		ffmpegPath:   "ffmpeg",
+		streams:      make(map[domain.StreamCode]*streamState),
+		mediaBuffer:  make(map[domain.StreamCode]domain.StreamCode),
+		rtspMounts:   make(map[string]*gortsplib.ServerStream),
+		rtspSrvReady: make(chan struct{}),
+		rtmpActive:   make(map[domain.StreamCode]struct{}),
+		srtActive:    make(map[domain.StreamCode]struct{}),
+		pushStates:   make(map[domain.StreamCode]map[string]*pushState),
+		rtspSessions: make(map[*gortsplib.ServerSession]*rtspClient),
 	}
 	svc.listenersPtr.Store(&config.ListenersConfig{})
 	return svc
@@ -244,13 +231,6 @@ func (s *Service) cleanupAllOutputDirs() {
 			slog.Warn("publisher: startup cleanup failed", "dir", dir, "err", err)
 		}
 	}
-}
-
-// hlsFailoverGenSnapshot returns the current failover generation for streamID.
-func (s *Service) hlsFailoverGenSnapshot(streamID domain.StreamCode) uint64 {
-	s.hlsFailoverMu.Lock()
-	defer s.hlsFailoverMu.Unlock()
-	return s.hlsFailoverGen[streamID]
 }
 
 // Start launches all serve-endpoints and push-destination workers for a stream.
@@ -404,10 +384,6 @@ func (s *Service) Stop(streamID domain.StreamCode) {
 		delete(s.mediaBuffer, streamID)
 	}
 	s.mu.Unlock()
-
-	s.hlsFailoverMu.Lock()
-	delete(s.hlsFailoverGen, streamID)
-	s.hlsFailoverMu.Unlock()
 
 	if ok {
 		// Wait for all protocol goroutines to finish so no writer races with
@@ -622,18 +598,13 @@ func (s *Service) hlsSegCounter(streamID domain.StreamCode, profile string) prom
 	return s.m.PublisherSegmentsTotal.WithLabelValues(string(streamID), "hls", profile)
 }
 
-// dashSegCounter is the DASH counterpart to hlsSegCounter.
-func (s *Service) dashSegCounter(streamID domain.StreamCode, profile string) prometheus.Counter {
-	if s.m == nil {
-		return nil
-	}
-	return s.m.PublisherSegmentsTotal.WithLabelValues(string(streamID), "dash", profile)
-}
-
 // segWriteDurObserver pre-binds the segment-write-duration histogram for
 // the given stream + format. The histogram tracks wall-clock time spent
 // in os.WriteFile / writeFileAtomic — sustained P99 growth signals disk
 // I/O backpressure before BufferDropsTotal does. Nil-safe.
+//
+// The DASH publisher's segment counter is plumbed inside the dash
+// package; this helper is HLS-only after the DASH rewrite.
 func (s *Service) segWriteDurObserver(streamID domain.StreamCode, format string) prometheus.Observer {
 	if s.m == nil || s.m.PublisherSegmentWriteDuration == nil {
 		return nil

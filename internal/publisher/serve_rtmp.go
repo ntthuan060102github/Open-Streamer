@@ -23,13 +23,12 @@ import (
 	"fmt"
 	"log/slog"
 
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
-
 	"github.com/q191201771/lal/pkg/rtmp"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/push"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
@@ -124,11 +123,16 @@ func runRTMPPlayPipeline(
 				if !ok {
 					return
 				}
-				if pkt.AV != nil && pkt.AV.Discontinuity {
+				if pkt.SessionStart {
+					// Source switched (failover / reconnect / mixer cycle).
+					// Drop stale muxer state so the new session gets fresh
+					// PAT/PMT tables and clean continuity counters; flush
+					// the TS carry so a half-formed packet from the old
+					// session can't merge with new-session bytes.
 					avMux = nil
 					tsCarry = nil
 				}
-				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+				tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 					// Scan b for SPS/PPS until both cached, then preload
 					// the writer once. Defensive against gomedia's
 					// TSDemuxer occasionally delivering access units
@@ -208,11 +212,11 @@ func runRTMPPlayPipeline(
 		firstVideo: true,
 	}
 
-	demux := mpeg2.NewTSDemuxer()
-	demux.OnFrame = ps.onTSFrame
+	dmx := tsdemux.New()
+	dmx.OnFrame = ps.onTSFrame
 
 	demuxDone := make(chan error, 1)
-	go func() { demuxDone <- demux.Input(tb) }()
+	go func() { demuxDone <- dmx.Input(ctx, tb) }()
 
 	select {
 	case <-ctx.Done():
@@ -238,19 +242,15 @@ type rtmpPlaySession struct {
 	firstVideo  bool
 }
 
-func (ps *rtmpPlaySession) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+func (ps *rtmpPlaySession) onTSFrame(cid tsdemux.StreamType, frame []byte, pts, dts uint64) {
 	if len(frame) == 0 {
 		return
 	}
-	switch cid {
-	case mpeg2.TS_STREAM_H264:
+	switch cid { //nolint:exhaustive // H.265 / MPEG audio intentionally drop — standard RTMP play carries only H.264 + AAC
+	case tsdemux.StreamTypeH264:
 		ps.writeVideo(frame, pts, dts)
-	case mpeg2.TS_STREAM_AAC:
+	case tsdemux.StreamTypeAAC:
 		ps.writeAudio(frame, dts)
-	case mpeg2.TS_STREAM_H265,
-		mpeg2.TS_STREAM_AUDIO_MPEG1,
-		mpeg2.TS_STREAM_AUDIO_MPEG2:
-		return // not supported in standard RTMP
 	default:
 		return
 	}

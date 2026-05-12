@@ -5,14 +5,14 @@ package publisher
 // Architecture (two ingest paths into the same RTP encoder):
 //
 //	Buffer Hub → subscriber ──┬─ AV packet  ────────────────────────┐
-//	                          │  (direct: keeps PTS / DTS / IDR /   │
-//	                          │   Discontinuity flags intact)       │
+//	                          │  (direct: keeps PTS / DTS / IDR     │
+//	                          │   intact, no MPEG-TS round-trip)    │
 //	                          │                                     ▼
 //	                          │                            rtspSession
 //	                          │                       (codec detection +
 //	                          │                        RTP encoding)
 //	                          │                                     ▲
-//	                          └─ TS bytes ─→ mpeg2.TSDemuxer ──────┘
+//	                          └─ TS bytes ─→ tsdemux.Demuxer ──────┘
 //	                              (legacy raw-TS sources only:
 //	                               UDP multicast, file:// .ts, copy://)
 //	                                                  │
@@ -22,11 +22,11 @@ package publisher
 //
 // AV packets bypass the MPEG-TS round-trip because the upstream pipeline
 // already produces clean Annex-B (H.264) / ADTS (AAC) byte streams with
-// millisecond PTS / DTS metadata. Re-muxing to TS just to re-demux loses
-// the Discontinuity flag, introduces a 1-AU latency in the demuxer's
-// access-unit detection, and round-trips PTS/DTS through an extra
-// 90 kHz ↔ ms scaling step that's been the source of every "non-monotonic
-// DTS / freezes after 1s / 0 frames muxed" regression we've chased.
+// millisecond PTS / DTS metadata. Re-muxing to TS just to re-demux
+// introduces a 1-AU latency in the demuxer's access-unit detection, and
+// round-trips PTS/DTS through an extra 90 kHz ↔ ms scaling step that's
+// been the source of every "non-monotonic DTS / freezes after 1s / 0
+// frames muxed" regression we've chased.
 //
 // Stream registration lifecycle:
 //  1. serveRTSP waits for the gortsplib server to start, then subscribes to the Buffer Hub.
@@ -53,10 +53,10 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg4audio"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
-	mpeg2 "github.com/yapingcat/gomedia/go-mpeg2"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
 )
 
@@ -328,9 +328,9 @@ func runRTSPPipeline(
 		}
 		demuxBuf = newTSBuffer(streamCode)
 		demuxDone = make(chan error, 1)
-		demux := mpeg2.NewTSDemuxer()
-		demux.OnFrame = sess.onTSFrame
-		go func() { demuxDone <- demux.Input(demuxBuf) }()
+		dmx := tsdemux.New()
+		dmx.OnFrame = sess.onTSFrame
+		go func() { demuxDone <- dmx.Input(ctx, demuxBuf) }()
 	}
 	defer func() {
 		if demuxBuf != nil {
@@ -361,10 +361,13 @@ func runRTSPPipeline(
 			if !ok {
 				return
 			}
+			if pkt.SessionStart {
+				sess.onSessionBoundary()
+			}
 			switch {
 			case pkt.AV != nil:
-				// Direct path. PTS / DTS / Discontinuity / KeyFrame all
-				// preserved; no scaling round-trip, no demuxer latency.
+				// Direct path. PTS / DTS / KeyFrame preserved; no scaling
+				// round-trip, no demuxer latency.
 				sess.handleAVPacket(pkt.AV)
 			case len(pkt.TS) > 0:
 				// Raw-TS fallback. Feed 188-aligned chunks into the
@@ -519,26 +522,25 @@ type rtspPendingAudio struct {
 	dts   uint64
 }
 
+// onSessionBoundary is invoked at the top of the recv loop whenever a
+// buffer.Packet arrives with SessionStart=true. It re-arms the firstVideo
+// gate so the next IDR re-initialises downstream decoders, and clears the
+// wallclock pacer anchor so the next paced packet establishes a fresh
+// (paceBase, paceMedia) mapping. Audio keeps streaming — its timeline is
+// independent and re-anchored by computeAudioRTP if DTS jumps.
+func (sess *rtspSession) onSessionBoundary() {
+	sess.firstVideo = true
+	sess.paceSet = false
+}
+
 // handleAVPacket dispatches a buffer-hub AVPacket directly into the RTP
-// pipeline, bypassing MPEG-TS round-trip. Honours the Discontinuity flag
-// by re-arming firstVideo so we wait for the next IDR before resuming —
-// the RTP timeline itself stays monotonic via computeVideoRTP /
-// computeAudioRTP, which absorb any backwards source DTS jump.
+// pipeline, bypassing MPEG-TS round-trip. The RTP timeline stays
+// monotonic via computeVideoRTP / computeAudioRTP, which absorb any
+// backwards source DTS jump. Session-boundary resets are handled in
+// onSessionBoundary at the recv-loop level, not here.
 func (sess *rtspSession) handleAVPacket(av *domain.AVPacket) {
 	if av == nil || len(av.Data) == 0 {
 		return
-	}
-	if av.Discontinuity {
-		// New IDR required before video flows again so downstream
-		// decoders can re-initialise after the gap. Audio keeps
-		// streaming — its timeline is independent and re-anchored
-		// by computeAudioRTP if dts jumps.
-		sess.firstVideo = true
-		// Wallclock pacer must also re-anchor: source DTS jumped
-		// (loop / restart / failover), so the (paceBase, paceMedia)
-		// mapping no longer reflects realtime. The next paced packet
-		// will set a fresh anchor.
-		sess.paceSet = false
 	}
 	switch av.Codec { //nolint:exhaustive // RTSP only carries H.264 + AAC; other codecs intentionally drop.
 	case domain.AVCodecH264:
@@ -551,18 +553,15 @@ func (sess *rtspSession) handleAVPacket(av *domain.AVPacket) {
 // onTSFrame is the demuxer callback used only on the raw-TS fallback
 // path (sources that publish pre-muxed TS into the buffer hub). AV
 // sources reach handleVideo / handleAudio via handleAVPacket directly.
-func (sess *rtspSession) onTSFrame(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts, dts uint64) {
+func (sess *rtspSession) onTSFrame(cid tsdemux.StreamType, frame []byte, pts, dts uint64) {
 	if len(frame) == 0 {
 		return
 	}
-	switch cid {
-	case mpeg2.TS_STREAM_H264:
+	switch cid { //nolint:exhaustive // H.265 / MPEG audio intentionally drop — RTSP serve carries only H.264 + AAC in this build
+	case tsdemux.StreamTypeH264:
 		sess.handleVideo(frame, pts, dts)
-	case mpeg2.TS_STREAM_AAC:
+	case tsdemux.StreamTypeAAC:
 		sess.handleAudio(frame, dts)
-	case mpeg2.TS_STREAM_H265,
-		mpeg2.TS_STREAM_AUDIO_MPEG1,
-		mpeg2.TS_STREAM_AUDIO_MPEG2:
 	default:
 	}
 }
@@ -919,7 +918,7 @@ func (sess *rtspSession) computeAudioRTP(dts uint64) uint32 {
 //
 // Anchor is shared between video and audio so the two tracks stay phase-
 // locked. Re-anchors when:
-//   - paceSet is false (first call, or after a Discontinuity reset),
+//   - paceSet is false (first call, or after a session-boundary reset),
 //   - the would-be sleep exceeds rtspPaceMaxSleep (source PTS jumped far
 //     ahead — looped feed, fresh keyframe burst, encoder reset),
 //   - we have fallen further than rtspPaceMaxLag behind realtime
@@ -936,9 +935,9 @@ func (sess *rtspSession) pace(dts uint64) {
 		return
 	}
 	// Signed math: source DTS can dip slightly below the anchor (small
-	// reorder / jitter) without triggering a Discontinuity flag. Treat
-	// any negative delta as a re-anchor rather than under-flowing into
-	// a giant positive duration.
+	// reorder / jitter) without crossing a session boundary. Treat any
+	// negative delta as a re-anchor rather than under-flowing into a
+	// giant positive duration.
 	deltaMs := int64(dts) - int64(sess.paceMedia)
 	if deltaMs < 0 {
 		sess.paceBase = time.Now()

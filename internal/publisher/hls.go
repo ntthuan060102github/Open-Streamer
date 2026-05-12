@@ -4,14 +4,18 @@ package publisher
 //
 // Segmenting strategy:
 //   - AV path (pkt.AV): flush the current segment BEFORE writing an IDR frame so
-//     every new segment starts with a keyframe.  Failover discontinuities are
-//     detected via pkt.AV.Discontinuity.
+//     every new segment starts with a keyframe.
 //   - TS path (pkt.TS, transcoder output): the transcoder is configured with a
 //     GOP size matching segSec, so a wall-clock ticker flush at segSec intervals
-//     lands close to IDR boundaries without needing a demuxer.  Failover is
-//     detected via the service-level hlsFailoverGen counter.
+//     lands close to IDR boundaries without needing a demuxer.
 //
 // In both modes, a 3/2 × segSec force-flush prevents runaway segments.
+//
+// Session boundaries (cold start, reconnect, failover, mixer cycle) are
+// signalled by buffer.Packet.SessionStart=true on the first packet of the
+// new session — onSessionBoundary flushes the in-progress segment and
+// schedules EXT-X-DISCONTINUITY for the next one, identically across AV-
+// path and raw-TS-path sources.
 
 import (
 	"context"
@@ -42,8 +46,7 @@ type hlsRunOpts struct {
 	// track; surfaces in the master playlist's CODECS attribute. Derived
 	// from the transcoder config at setup time so the master playlist
 	// declares the correct codec list before the first segment lands.
-	hasAudio    bool
-	failoverGen func() uint64
+	hasAudio bool
 	// segCount is incremented once per successful segment write. Pre-bound
 	// to {stream_code,format=hls,profile} so the hot path skips the
 	// WithLabelValues map lookup. Nil-safe.
@@ -85,7 +88,6 @@ func (s *Service) serveHLS(ctx context.Context, streamID domain.StreamCode) {
 
 	manifest := filepath.Join(streamDir, "index.m3u8")
 	opts := &hlsRunOpts{
-		failoverGen: func() uint64 { return s.hlsFailoverGenSnapshot(streamID) },
 		segCount:    s.hlsSegCounter(streamID, "main"),
 		segWriteDur: s.segWriteDurObserver(streamID, "hls"),
 	}
@@ -137,14 +139,9 @@ func runHLSSegmenter(
 		p.width = opts.width
 		p.height = opts.height
 		p.hasAudio = opts.hasAudio
-		p.failoverGen = opts.failoverGen
 		p.segCount = opts.segCount
 		p.segWriteDur = opts.segWriteDur
 	}
-	if p.failoverGen == nil {
-		p.failoverGen = func() uint64 { return 0 }
-	}
-	p.knownGen = p.failoverGen()
 
 	p.run(ctx, sub)
 }
@@ -178,10 +175,6 @@ type hlsSegmenter struct {
 	// Sliding-window manifest state.
 	segN   uint64
 	onDisk []hlsSegEntry
-
-	// Failover generation tracking (TS path; AV path uses pkt.AV.Discontinuity).
-	failoverGen func() uint64
-	knownGen    uint64
 
 	// ABR wiring.
 	abrMaster *hlsABRMaster
@@ -253,7 +246,7 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 				p.doFlush()
 				return
 			}
-			p.handleIncoming(pkt, segDur, &avMux, &tsCarry)
+			p.handleIncoming(ctx, pkt, segDur, &avMux, &tsCarry)
 
 		case <-tick.C:
 			p.tickFlush(maxDur, segDur)
@@ -264,12 +257,23 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 // handleIncoming dispatches one buffer packet through the AV / raw-TS path.
 // Extracted from run() to keep that function under the cognitive-complexity
 // ceiling. Mutates avMux / tsCarry via pointers — both are loop-local state.
+//
+// The session-boundary cue (pkt.SessionStart=true) is the single trigger
+// for flushing the current segment and emitting EXT-X-DISCONTINUITY on the
+// next one. It fires identically across AV-path and raw-TS-path sources,
+// replacing the two parallel mechanisms used previously (in-band
+// AVPacket-flag for AV, event-bus generation counter for TS — both removed
+// in Phase 3 of the refactor).
 func (p *hlsSegmenter) handleIncoming(
+	ctx context.Context,
 	pkt buffer.Packet,
 	segDur time.Duration,
 	avMux **tsmux.FromAV,
 	tsCarry *[]byte,
 ) {
+	if pkt.SessionStart {
+		p.onSessionBoundary(avMux, tsCarry)
+	}
 	if pkt.AV != nil {
 		// After a non-keyframe-aligned force-flush, drop AV packets until
 		// the next IDR so the next segment starts at a clean keyframe.
@@ -277,17 +281,10 @@ func (p *hlsSegmenter) handleIncoming(
 		if p.shouldDropAVPacket(pkt.AV) {
 			return
 		}
-		p.handleAVPacket(pkt.AV, segDur)
-		// On source switch, discard stale muxer state so the new source
-		// gets fresh PAT/PMT tables and clean continuity counters.
-		// FeedWirePacket lazily allocates a new FromAV on the next call.
-		if pkt.AV.Discontinuity {
-			*avMux = nil
-			*tsCarry = nil
-		}
+		p.maybeFlushAtKeyframe(pkt.AV, segDur)
 	}
 	rawTS := len(pkt.TS) > 0 && pkt.AV == nil
-	tsmux.FeedWirePacket(pkt.TS, pkt.AV, avMux, func(b []byte) {
+	tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, avMux, func(b []byte) {
 		alignedFeed(b, tsCarry, func(pkt188 []byte) bool {
 			p.appendSegment188(pkt188, rawTS)
 			return true
@@ -345,50 +342,53 @@ func (p *hlsSegmenter) appendSegment188(pkt188 []byte, rawTS bool) {
 	}
 }
 
-// handleAVPacket processes AV-path control signals: discontinuity flushing and
-// IDR-aligned segment splitting.  Must not be called with p.mu held.
-func (p *hlsSegmenter) handleAVPacket(av *domain.AVPacket, segDur time.Duration) {
-	if av.Discontinuity {
-		p.mu.Lock()
-		// Flush old-source data before mixing in new-source data.
-		if len(p.segBuf) > 0 {
-			p.flushLocked()
-		}
-		p.discNext = true
-		p.mu.Unlock()
+// onSessionBoundary is invoked at the top of handleIncoming whenever a
+// buffer.Packet carries SessionStart=true. It flushes the in-progress
+// segment so old-source data lands in its own segment, schedules the
+// EXT-X-DISCONTINUITY tag for the NEXT segment, and discards stale muxer
+// state so the new source gets fresh PAT/PMT tables and clean continuity
+// counters (FeedWirePacket lazily re-allocates FromAV on the next call).
+func (p *hlsSegmenter) onSessionBoundary(avMux **tsmux.FromAV, tsCarry *[]byte) {
+	p.mu.Lock()
+	if len(p.segBuf) > 0 {
+		p.flushLocked()
 	}
+	p.discNext = true
+	p.discardUntilIDR = false
+	p.mu.Unlock()
+	*avMux = nil
+	*tsCarry = nil
+}
 
-	// IDR (keyframe): flush the previous segment BEFORE writing the IDR bytes
-	// so the new segment starts at a clean keyframe boundary.
-	if av.KeyFrame {
-		p.mu.Lock()
-		if len(p.segBuf) > 0 && !p.segStart.IsZero() &&
-			time.Since(p.segStart) >= segDur {
-			p.flushLocked()
-		}
-		p.mu.Unlock()
+// maybeFlushAtKeyframe lands a fresh segment boundary on every IDR once
+// the in-progress segment has reached segDur. AV-path streams use this to
+// produce GOP-aligned segments; raw-TS streams rely on the keyframe
+// scanner in tickFlush instead. Must not be called with p.mu held.
+func (p *hlsSegmenter) maybeFlushAtKeyframe(av *domain.AVPacket, segDur time.Duration) {
+	if !av.KeyFrame {
+		return
 	}
+	p.mu.Lock()
+	if len(p.segBuf) > 0 && !p.segStart.IsZero() &&
+		time.Since(p.segStart) >= segDur {
+		p.flushLocked()
+	}
+	p.mu.Unlock()
 }
 
 // tickFlush is called every 50 ms by the ticker; it handles:
 //   - Raw-TS path: keyframe-aligned segmenting via the scanner (preferred)
 //   - TS-path time-based segmenting (transcoder output, GOP-aligned)
 //   - Fallback force-flush for stuck AV paths
-//   - Failover generation detection (TS path)
+//
+// Session boundaries are signalled via buffer.Packet.SessionStart and
+// handled in onSessionBoundary at packet-receive time — tickFlush only
+// runs the segment-cadence safety net.
 func (p *hlsSegmenter) tickFlush(maxDur, segDur time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if len(p.segBuf) == 0 || p.segStart.IsZero() {
-		return
-	}
-
-	// Detect failover via service-level generation counter (TS path).
-	if gen := p.failoverGen(); gen != p.knownGen {
-		p.knownGen = gen
-		// Flush the current (mixed) segment and mark next as discontinuous.
-		p.flushLocked()
-		p.discNext = true
 		return
 	}
 
