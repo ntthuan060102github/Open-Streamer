@@ -204,13 +204,6 @@ type mp4Handler struct {
 	mux   *tsmux.FromAV
 	queue [][]byte
 
-	// debugPktCount counts the gomp4 packets we've read for diagnostic
-	// logging — see logPacket. Reset on every loop reset() so each
-	// loop iteration logs its first 80 packets independently. Temporary
-	// instrumentation tracking the test2 "30+ video PES with identical
-	// DTS" bug; remove once that issue is resolved.
-	debugPktCount int
-
 	// Continuous-PTS state. On loop reset, ptsOffset jumps forward by the
 	// duration of the just-finished iteration so the new iteration's
 	// timestamps continue monotonically from where the previous one ended —
@@ -272,10 +265,6 @@ func (h *mp4Handler) reset() error {
 	// RandomAccessIndicator lands, so a player joining mid-loop still
 	// gets a fresh PAT/PMT quickly.
 	h.paceOnce = false
-	// Reset the debug packet counter so each loop iteration logs its
-	// first 80 packets — lets us see the first-frame DTS pattern at
-	// every reset() boundary, not just at process start.
-	h.debugPktCount = 0
 	slog.Info("file reader: mp4 loop reset",
 		"path", h.path,
 		"took_ms", time.Since(start).Milliseconds(),
@@ -332,42 +321,9 @@ func (h *mp4Handler) feedNextPacket(ctx context.Context) error {
 	adjPts := pkt.Pts + h.ptsOffset
 	adjDts := pkt.Dts + h.ptsOffset
 
-	h.logPacket(pkt, adjPts, adjDts)
-
 	h.pace(ctx, adjDts)
 	h.muxPacket(pkt, adjPts, adjDts)
 	return nil
-}
-
-// logPacket emits an Info-level log line for the first 80 packets of
-// each loop iteration so we can see exactly what gomp4 hands us.
-// Diagnostic for the test2 "30+ video PES headers with identical DTS"
-// bug — if gomp4 returns 30 packets all with pkt.Dts=0 then the
-// bug is upstream; if gomp4 returns increasing DTS but our output
-// still has duplicates then the bug is in our tsmux/astits path.
-//
-// 80 packets is enough to span the first ~3 s at 30 fps (plus audio
-// frames interleaved) — captures the first IDR plus several P-frames
-// across the keyframe boundary, which is where the duplicated-DTS
-// signature shows up most clearly in the segment dumps. Remove this
-// block once the bug is diagnosed.
-func (h *mp4Handler) logPacket(pkt *gomp4.AVPacket, adjPts, adjDts uint64) {
-	if h.debugPktCount >= 80 {
-		h.debugPktCount++
-		return
-	}
-	h.debugPktCount++
-	slog.Info("mp4Handler debug: gomp4 packet",
-		"path", h.path,
-		"seq", h.debugPktCount,
-		"cid", pkt.Cid,
-		"raw_pts_ms", pkt.Pts,
-		"raw_dts_ms", pkt.Dts,
-		"pts_offset_ms", h.ptsOffset,
-		"adj_pts_ms", adjPts,
-		"adj_dts_ms", adjDts,
-		"data_len", len(pkt.Data),
-	)
 }
 
 func (h *mp4Handler) muxPacket(pkt *gomp4.AVPacket, adjPts, adjDts uint64) {
