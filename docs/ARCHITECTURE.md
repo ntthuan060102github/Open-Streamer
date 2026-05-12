@@ -235,8 +235,7 @@ strategies (`gortsplib`, `lal`, etc.). The manager's per-input
 
 ### Timeline Normaliser (`internal/timeline`)
 
-Single unification of the three legacy PTS rebasers (Phase-2 refactor —
-see `docs/REFACTOR_PROPOSAL.md`). Replaced:
+Single unification of the three legacy PTS rebasers. Replaced:
 
 - `internal/ingestor/ptsrebaser` (AV-path)
 - `internal/ingestor/pull/mixer` `videoPTSBase`/`audioPTSBase`
@@ -315,12 +314,10 @@ re-stream) dispatch on `SessionStart=true` instead of multi-source
 `Discontinuity` flags.
 
 **Scope**: AV-path codecs only (RTSP / RTMP pull, RTMP push, `copy://`,
-`mixer://`). Raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) carry
-PTS inside PES headers and bypass the Normaliser — they ride the dedicated
-raw-TS chunk path through the buffer hub. The DASH packager's `behindPrevSegEnd`
-pacing gate (see [Publisher / DASH](#publisher-internalpublisher) below)
-compensates downstream. Extending the Normaliser to cover raw-TS is the
-next planned refactor phase — see `docs/REFACTOR_PROPOSAL.md` and
+`mixer://`). Raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) are
+demuxed → run through the Normaliser per-PES → remuxed via the
+`internal/ingestor/tsnorm` wrapper, then ride the raw-TS chunk path
+through the buffer hub. Residual quality-of-service items tracked in
 `docs/DASH_OUTSTANDING_BUGS.md`.
 
 **Known limitation**: `mixer://` combining two clock-independent sources

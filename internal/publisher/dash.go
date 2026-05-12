@@ -12,9 +12,7 @@ import (
 )
 
 // serveDASH starts a single-rendition MPEG-DASH publisher for streamID.
-//
-// Output is built by the dash package — a clean rewrite of the v1
-// dash_fmp4.go packager. See docs/DASH_REWRITE.md for design.
+// Output is built by the dash package.
 func (s *Service) serveDASH(ctx context.Context, streamID domain.StreamCode) {
 	cfg := s.cfg.DASH
 	streamDir := filepath.Join(cfg.Dir, string(streamID))

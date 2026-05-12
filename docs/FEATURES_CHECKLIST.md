@@ -108,7 +108,7 @@ Single unification of the three legacy PTS rebasers (`ingestor/ptsrebaser`, `ing
 | Per-stream lifecycle | Complete | New `Normaliser` per `readLoop` invocation; reconnect builds a fresh anchor against the new wallclock |
 | Wired in pull worker + RTMP push server | Complete | `worker.writeOnePacket` and `push/rtmp_server.OnReadRtmpAvMsg` both call `Apply` and skip the buffer write on `Apply == false` |
 
-**Scope**: AV-path codecs only (RTSP / RTMP pull, RTMP push, `copy://`, `mixer://`). Raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) carry PTS inside PES headers and bypass the Normaliser; the DASH packager's `behindPrevSegEnd` pacing gate compensates downstream. Extending the Normaliser to raw-TS is the next planned phase — see [docs/REFACTOR_PROPOSAL.md](./REFACTOR_PROPOSAL.md) and [docs/DASH_OUTSTANDING_BUGS.md](./DASH_OUTSTANDING_BUGS.md).
+**Scope**: AV-path codecs (RTSP / RTMP pull, RTMP push, `copy://`, `mixer://`) write through `timeline.Normaliser` directly; raw-TS sources (UDP / HLS-pull / HTTP-TS / SRT / file) are demuxed → run through the Normaliser per-PES → remuxed via the [internal/ingestor/tsnorm](../internal/ingestor/tsnorm/tsnorm.go) wrapper. Residual quality-of-service items tracked in [docs/DASH_OUTSTANDING_BUGS.md](./DASH_OUTSTANDING_BUGS.md).
 
 ---
 

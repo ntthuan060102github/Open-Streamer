@@ -2,8 +2,6 @@
 //
 // It segments wallclock-anchored AVPackets (or raw MPEG-TS chunks) into
 // ISO-BMFF fragments and writes a live MPD with a sliding SegmentTimeline.
-// The new package replaces the previous `internal/publisher/dash_fmp4.go`
-// monolith — see `docs/DASH_REWRITE.md` for the design rationale.
 //
 // Public surface is intentionally minimal: a `Packager` type that owns
 // its own goroutine, started via `Run(ctx)` and stopped via context

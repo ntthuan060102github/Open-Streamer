@@ -81,12 +81,9 @@ type MixerReader struct {
 
 	// PTS normalisation is delegated to the ingestor's per-worker Normaliser
 	// (internal/timeline), which sees this reader's output and wallclock-
-	// anchors each track independently. The previous in-reader normaliser
-	// (per-track videoPTSBase / audioPTSBase, re-anchored on Discontinuity)
-	// was redundant once Phase 2 collapsed all timeline anchoring into a
-	// single owner — see docs/REFACTOR_PROPOSAL.md §4.5. Mixer-specific V/A
-	// pairing (snap onto the burst track when one upstream drains first) is
-	// also handled by the Normaliser's cross-track snap.
+	// anchors each track independently. Mixer-specific V/A pairing (snap
+	// onto the burst track when one upstream drains first) is handled by
+	// the Normaliser's cross-track snap.
 
 	closed atomic.Bool
 }

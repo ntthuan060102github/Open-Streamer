@@ -11,10 +11,10 @@
 //     by per-cycle Normaliser instances seeded from entry.t0.
 //
 // All three used to set a `AVPacket.Discontinuity` flag with different
-// meanings (see docs/REFACTOR_PROPOSAL.md §2.2). That flag is also gone:
-// session-boundary signalling moved to `buffer.Packet.SessionStart` and
-// rebaser-internal re-anchor events surface only via Stats /
-// LastDiagnostic for telemetry. Consumers never re-normalise.
+// meanings. That flag is also gone: session-boundary signalling moved
+// to `buffer.Packet.SessionStart` and rebaser-internal re-anchor events
+// surface only via Stats / LastDiagnostic for telemetry. Consumers
+// never re-normalise.
 //
 // The Normaliser is wallclock-anchored, session-aware, V/A-pair-aware,
 // monotonic-floored, drift-capped. The OWNER is the ingestor: each
