@@ -509,9 +509,17 @@ func (p *Packager) writeSegments(now time.Time, d CutDecision) bool {
 	flushed := false
 
 	if d.VideoCount > 0 && p.videoInit != nil {
+		// Peek the frame immediately after the last drained one so dur
+		// math can cover [first.PTS, next.PTS] instead of [first.PTS,
+		// last.PTS] — the latter under-reports by one inter-frame
+		// interval and bakes a per-segment gap into the MPD timeline
+		// that players render as a 1-frame stutter at every boundary
+		// (observed on staging: video dur 5.96 s with gap +0.04 s,
+		// matching the 40 ms inter-frame interval at 25 fps).
+		nextPTSms, hasNext := p.queue.videoPTSAt(d.VideoCount)
 		frames := p.queue.PopVideo(d.VideoCount)
 		if len(frames) > 0 {
-			if p.writeVideoSegment(now, frames) {
+			if p.writeVideoSegment(now, frames, nextPTSms, hasNext) {
 				flushed = true
 			}
 		}
@@ -548,12 +556,12 @@ func (p *Packager) writeSegments(now time.Time, d CutDecision) bool {
 // fell behind wallclock and the audio MPD timeline drifted >100 s
 // behind video, making playback impossible. Wallclock-based tfdt
 // hides under-emission as small per-segment gaps that players tolerate.
-func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame) bool {
+func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame, nextPTSms uint64, hasNext bool) bool {
 	p.vSegN++
 	name := fmt.Sprintf("seg_v_%05d.m4s", p.vSegN)
 
 	tfdt := wallclockTicks(now, p.availStart, uint64(VideoTimescale))
-	segDurTicks := computeVideoSegDurTicks(frames)
+	segDurTicks := computeVideoSegDurTicks(frames, nextPTSms, hasNext)
 
 	data, err := BuildVideoFragment(uint32(p.vSegN), p.videoInit.TrackID, tfdt, frames, p.isHEVC, segDurTicks) //nolint:gosec // segN fits uint32 for the stream's lifetime
 	if err != nil {
@@ -647,21 +655,42 @@ func wallclockTicks(now, ast time.Time, timescale uint64) uint64 {
 }
 
 // computeVideoSegDurTicks returns the total segment duration in 90 kHz
-// ticks. For a non-empty queue it's PTSms of last frame minus first,
-// scaled to 90 kHz. Zero falls back to a tiny non-zero value to keep
-// downstream uint32 dur from being 0 (mp4ff rejects 0 dur on samples).
-func computeVideoSegDurTicks(frames []VideoFrame) uint64 {
-	if len(frames) < 2 {
-		// Single-frame segment is degenerate but valid; pick 1 frame
-		// at typical 40 ms (25 fps) so the player has SOMETHING.
+// ticks. When nextPTSms is available (peeked from the queue before
+// PopVideo), dur covers [first.PTS, next.PTS] — the exact wallclock
+// extent the segment occupies on the media timeline. When the segment
+// drained the entire queue (safety-net cut or queue empty after the
+// last frame), falls back to (last - first) plus one estimated
+// per-frame interval so the segment doesn't visibly under-report by
+// one frame.
+//
+// The next-frame anchor is what eliminates the per-segment 1-frame
+// stutter that the previous `last - first` formula produced: at 25 fps
+// a 150-frame segment has last.PTS = first.PTS + 5960 ms (149 inter-
+// frame intervals), but the segment "covers" 6000 ms of media —
+// the missing 40 ms is the last frame's own duration, which next.PTS
+// captures exactly.
+func computeVideoSegDurTicks(frames []VideoFrame, nextPTSms uint64, hasNext bool) uint64 {
+	if len(frames) == 0 {
+		// Defensive — caller shouldn't pass an empty slice, but keep
+		// downstream mp4ff dur > 0 just in case.
 		return uint64(VideoTimescale) * 40 / 1000
 	}
 	first := frames[0].PTSms
+	if hasNext && nextPTSms > first {
+		return (nextPTSms - first) * uint64(VideoTimescale) / 1000
+	}
+	// No next frame: estimate one inter-frame interval from the average
+	// across drained frames so the last frame's duration isn't dropped.
+	if len(frames) < 2 {
+		return uint64(VideoTimescale) * 40 / 1000
+	}
 	last := frames[len(frames)-1].PTSms
 	if last <= first {
 		return uint64(VideoTimescale) * 40 / 1000
 	}
-	return (last - first) * uint64(VideoTimescale) / 1000
+	span := last - first
+	perFrame := span / uint64(len(frames)-1) //nolint:gosec // len > 1 by branch above
+	return (span + perFrame) * uint64(VideoTimescale) / 1000
 }
 
 // trimWindow removes old segments from disk past Window + History.

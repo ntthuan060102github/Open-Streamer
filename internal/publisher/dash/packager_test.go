@@ -479,6 +479,78 @@ func TestSplitADTSBundle(t *testing.T) {
 	})
 }
 
+// TestComputeVideoSegDurTicks — dur math must cover [first.PTS,
+// next.PTS] so the segment doesn't visibly under-report by one
+// inter-frame interval (the player-visible 1-frame stutter at every
+// segment boundary).
+func TestComputeVideoSegDurTicks(t *testing.T) {
+	mkFrames := func(ptsValues ...uint64) []VideoFrame {
+		out := make([]VideoFrame, len(ptsValues))
+		for i, p := range ptsValues {
+			out[i] = VideoFrame{PTSms: p}
+		}
+		return out
+	}
+
+	t.Run("uses_next_PTS_when_available", func(t *testing.T) {
+		// 25 fps × 150 frames: span = 5960 ms (149 intervals × 40 ms);
+		// the 151st frame sits at 6000 ms. Dur must read 6000 ms.
+		frames := mkFrames(0, 40, 80) // span doesn't matter when next is given
+		got := computeVideoSegDurTicks(frames, 6000, true)
+		want := uint64(6000) * uint64(VideoTimescale) / 1000
+		if got != want {
+			t.Errorf("dur with next=6000ms first=0 → %d ticks, want %d", got, want)
+		}
+	})
+
+	t.Run("fallback_estimates_when_no_next", func(t *testing.T) {
+		// Three frames at 40 ms cadence: span = 80 ms, perFrame ≈ 40 ms,
+		// dur = 120 ms (covers the third frame's own duration).
+		frames := mkFrames(0, 40, 80)
+		got := computeVideoSegDurTicks(frames, 0, false)
+		want := uint64(120) * uint64(VideoTimescale) / 1000
+		if got != want {
+			t.Errorf("fallback dur for 3-frame 40ms = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("hasNext_but_next_not_past_first_falls_back", func(t *testing.T) {
+		// Pathological backward PTS — guards against uint64 underflow.
+		frames := mkFrames(1000, 1040, 1080)
+		got := computeVideoSegDurTicks(frames, 500, true)
+		// Falls back to span+perFrame estimate.
+		want := uint64(120) * uint64(VideoTimescale) / 1000
+		if got != want {
+			t.Errorf("fallback (next<first) = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("empty_frames_returns_safety_fallback", func(t *testing.T) {
+		got := computeVideoSegDurTicks(nil, 0, false)
+		if got == 0 {
+			t.Error("expected non-zero fallback for empty frames")
+		}
+	})
+
+	t.Run("single_frame_with_next_uses_next", func(t *testing.T) {
+		frames := mkFrames(1000)
+		got := computeVideoSegDurTicks(frames, 1040, true)
+		want := uint64(40) * uint64(VideoTimescale) / 1000
+		if got != want {
+			t.Errorf("single-frame with next = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("single_frame_no_next_uses_40ms_safety", func(t *testing.T) {
+		frames := mkFrames(1000)
+		got := computeVideoSegDurTicks(frames, 0, false)
+		want := uint64(40) * uint64(VideoTimescale) / 1000
+		if got != want {
+			t.Errorf("single-frame fallback = %d, want %d", got, want)
+		}
+	})
+}
+
 // TestPackager_BehindPrevSegEnd — the timeline-pace gate. Verifies the
 // helper that holds emit until wallclock catches up to the previous
 // segment's end. Manipulates Packager state directly so each case is
