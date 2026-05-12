@@ -459,7 +459,7 @@ func (s *Service) record(
 				hasPTS = true
 			}
 
-			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+			tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 				segBuf = append(segBuf, b...)
 			})
 

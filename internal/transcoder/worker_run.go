@@ -258,7 +258,7 @@ func (s *Service) runOnce(
 						werr = write(b)
 					})
 				} else {
-					tsmux.FeedWirePacket(nil, pkt.AV, &avMux, func(b []byte) {
+					tsmux.FeedWirePacket(ctx, nil, pkt.AV, &avMux, func(b []byte) {
 						if werr != nil {
 							return
 						}

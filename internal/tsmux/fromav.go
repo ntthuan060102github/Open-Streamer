@@ -61,10 +61,13 @@ type FromAV struct {
 }
 
 // NewFromAV creates an empty muxer; streams are added on first packet per codec.
-func NewFromAV() *FromAV {
+// ctx is forwarded to astits.NewMuxer — pass the caller's lifecycle context
+// (typically the publisher / transcoder / ingestor goroutine ctx) so the
+// muxer's internal state is tied to that lifecycle.
+func NewFromAV(ctx context.Context) *FromAV {
 	f := &FromAV{pendingDisc: make(map[uint16]bool)}
 	f.mux = astits.NewMuxer(
-		context.Background(),
+		ctx,
 		bufWriter{buf: &f.buf},
 		astits.MuxerOptTablesRetransmitPeriod(tablesRetransmitPeriod),
 	)
@@ -270,8 +273,11 @@ func KeyFrameH265(annexB []byte) bool {
 	return gocodec.IsH265IDRFrame(annexB)
 }
 
-// FeedWirePacket forwards raw TS chunks or muxes one AVPacket to TS via mux (lazily allocated).
-func FeedWirePacket(ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]byte)) {
+// FeedWirePacket forwards raw TS chunks or muxes one AVPacket to TS via
+// mux (lazily allocated). ctx is forwarded to NewFromAV on lazy
+// allocation — pass the caller's lifecycle context so the underlying
+// astits.Muxer ties cleanly to that lifecycle.
+func FeedWirePacket(ctx context.Context, ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]byte)) {
 	if len(ts) > 0 {
 		onTS(ts)
 		return
@@ -280,7 +286,7 @@ func FeedWirePacket(ts []byte, av *domain.AVPacket, mux **FromAV, onTS func([]by
 		return
 	}
 	if *mux == nil {
-		*mux = NewFromAV()
+		*mux = NewFromAV(ctx)
 	}
 	(*mux).Write(av, onTS)
 }

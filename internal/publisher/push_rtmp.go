@@ -154,7 +154,7 @@ func (p *rtmpPushPackager) run(ctx context.Context, sub *buffer.Subscriber) erro
 	dmx := tsdemux.New()
 	dmx.OnFrame = p.onTSFrame
 	demuxDone := make(chan error, 1)
-	go func() { demuxDone <- dmx.Input(tb) }()
+	go func() { demuxDone <- dmx.Input(ctx, tb) }()
 
 	select {
 	case <-ctx.Done():
@@ -307,7 +307,7 @@ func (p *rtmpPushPackager) feedLoop(ctx context.Context, sub *buffer.Subscriber,
 				p.gotDiscontinuity.Store(true)
 				return
 			}
-			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+			tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 				alignedFeed(b, &tsCarry, func(pkt188 []byte) bool {
 					_, err := tb.Write(pkt188)
 					return err == nil

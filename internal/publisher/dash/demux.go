@@ -2,6 +2,7 @@ package dash
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"sync"
@@ -160,11 +161,11 @@ type onTSFrameFunc = tsdemux.OnFrameFunc
 // startDemuxer launches the TSDemuxer goroutine consuming from tb.
 // The OnFrame callback fires synchronously from that goroutine.
 // Caller must Close(tb) to unblock the demuxer on shutdown.
-func startDemuxer(tb *tsBuffer, onFrame onTSFrameFunc) {
+func startDemuxer(ctx context.Context, tb *tsBuffer, onFrame onTSFrameFunc) {
 	dmx := tsdemux.New()
 	dmx.OnFrame = onFrame
 	go func() {
-		if err := dmx.Input(tb); err != nil && err != io.EOF {
+		if err := dmx.Input(ctx, tb); err != nil && err != io.EOF {
 			slog.Debug("dash: demuxer exit", "err", err)
 		}
 	}()

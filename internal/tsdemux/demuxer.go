@@ -73,17 +73,22 @@ func New() *Demuxer { return &Demuxer{} }
 // astits.ErrNoMorePackets are treated as clean termination and
 // return nil; everything else is propagated.
 //
+// ctx is forwarded to astits.NewDemuxer so cancellation propagates
+// to the demuxer's internal state. Pass the caller's goroutine ctx —
+// for the pump-based callers (tsdemux_packet_reader, dash/demux,
+// publisher serve / push) this is the worker's read-loop ctx.
+//
 // Stream-type lookup: astits's pull API returns PSI + PES as
 // independent DemuxerData records. We accumulate PID → StreamType
 // from PMT records and consult it on each PES. PES that arrive
 // before the first PMT are dropped (no stream type known) —
 // matches gomedia's behaviour and the spec's expectation that
 // PMT precedes its referenced PES.
-func (d *Demuxer) Input(r io.Reader) error {
+func (d *Demuxer) Input(ctx context.Context, r io.Reader) error {
 	if d.OnFrame == nil {
 		return errors.New("tsdemux: OnFrame not set")
 	}
-	dmx := astits.NewDemuxer(context.Background(), r)
+	dmx := astits.NewDemuxer(ctx, r)
 	pidStream := make(map[uint16]astits.StreamType)
 	for {
 		data, err := dmx.NextData()

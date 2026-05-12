@@ -132,7 +132,7 @@ func runRTMPPlayPipeline(
 					avMux = nil
 					tsCarry = nil
 				}
-				tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+				tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 					// Scan b for SPS/PPS until both cached, then preload
 					// the writer once. Defensive against gomedia's
 					// TSDemuxer occasionally delivering access units
@@ -216,7 +216,7 @@ func runRTMPPlayPipeline(
 	dmx.OnFrame = ps.onTSFrame
 
 	demuxDone := make(chan error, 1)
-	go func() { demuxDone <- dmx.Input(tb) }()
+	go func() { demuxDone <- dmx.Input(ctx, tb) }()
 
 	select {
 	case <-ctx.Done():

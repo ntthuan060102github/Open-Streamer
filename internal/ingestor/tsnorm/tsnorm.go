@@ -121,6 +121,13 @@ const tsPacketSize = 188
 type Normaliser struct {
 	mu sync.Mutex
 
+	// ctx is the long-lived context threaded into astits.NewMuxer /
+	// astits.NewDemuxer so cancellation propagates from the worker's
+	// readLoop down into the demux / mux pipeline. Stored on the
+	// struct because buildMuxer is called from New AND from OnSession
+	// (which rebuilds the muxer mid-stream).
+	ctx context.Context
+
 	norm *timeline.Normaliser
 
 	// Mux pipeline state. The astits.Muxer writes to outBuf via the
@@ -162,14 +169,19 @@ type Normaliser struct {
 // New constructs a Normaliser with the given timeline config. The
 // caller usually passes timeline.DefaultConfig().
 //
+// ctx is threaded into astits.NewMuxer + astits.NewDemuxer so
+// cancellation propagates into the demux pump goroutine; pass the
+// worker's readLoop ctx.
+//
 // astits's RandomAccessIndicator on PCR-PID PES auto-emits PAT + PMT
 // immediately before that PES. We set RAI on every H.264 / H.265
 // keyframe so each IDR is preceded by fresh PSI — the fix for the
 // HLS "non-existing PPS 0 referenced" decode failures the original
 // gomedia-based path produced when its fixed 400 ms PAT cadence
 // happened to land mid-GOP.
-func New(cfg timeline.Config) *Normaliser {
+func New(ctx context.Context, cfg timeline.Config) *Normaliser {
 	n := &Normaliser{
+		ctx:         ctx,
 		norm:        timeline.New(cfg),
 		pidStream:   make(map[uint16]astits.StreamType),
 		pendingDisc: make(map[uint16]bool),
@@ -197,7 +209,7 @@ func New(cfg timeline.Config) *Normaliser {
 func (n *Normaliser) buildMuxer() {
 	n.outBuf.Reset()
 	n.muxer = astits.NewMuxer(
-		context.Background(),
+		n.ctx,
 		bufWriter{buf: &n.outBuf},
 		astits.MuxerOptTablesRetransmitPeriod(muxerTablesRetransmitPeriod),
 	)
@@ -371,7 +383,7 @@ func (n *Normaliser) runDemux() {
 		quit:   n.quit,
 	}
 	dmx := astits.NewDemuxer(
-		context.Background(),
+		n.ctx,
 		rdr,
 		astits.DemuxerOptPacketSize(tsPacketSize),
 	)

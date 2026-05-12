@@ -2,6 +2,7 @@ package tsnorm_test
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	gompeg2 "github.com/yapingcat/gomedia/go-mpeg2"
@@ -14,7 +15,7 @@ import (
 
 // TestProcess_EmptyChunkReturnsEmpty — defensive zero-input case.
 func TestProcess_EmptyChunkReturnsEmpty(t *testing.T) {
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	out, err := n.Process(nil)
 	if err != nil {
 		t.Fatalf("Process(nil) err = %v", err)
@@ -32,7 +33,7 @@ func TestProcess_EmptyChunkReturnsEmpty(t *testing.T) {
 func TestProcess_PreservesH264KeyframePayload(t *testing.T) {
 	// Build a single-IDR H.264 AVPacket and mux it into TS bytes.
 	idrPayload := buildH264IDR()
-	srcMuxer := tsmux.NewFromAV()
+	srcMuxer := tsmux.NewFromAV(context.Background())
 	var srcBuf bytes.Buffer
 	srcMuxer.Write(&domain.AVPacket{
 		Codec:    domain.AVCodecH264,
@@ -45,7 +46,7 @@ func TestProcess_PreservesH264KeyframePayload(t *testing.T) {
 		t.Fatal("source muxer produced no TS bytes")
 	}
 
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	out, err := n.Process(srcBuf.Bytes())
 	if err != nil {
 		t.Fatalf("Process: %v", err)
@@ -83,12 +84,12 @@ func TestProcess_PreservesH264KeyframePayload(t *testing.T) {
 // frames preserve inter-frame deltas.
 func TestProcess_AnchorsPTSToWallclock(t *testing.T) {
 	cfg := timeline.DefaultConfig()
-	n := tsnorm.New(cfg)
+	n := tsnorm.New(context.Background(), cfg)
 
 	// Two H.264 frames spaced 40 ms apart in source PTS, but starting
 	// far in the future (100 s in upstream time). The Normaliser should
 	// anchor frame 1 at ~0 ms and frame 2 at ~40 ms in output PTS.
-	srcMuxer := tsmux.NewFromAV()
+	srcMuxer := tsmux.NewFromAV(context.Background())
 	var srcBuf bytes.Buffer
 	for i, srcPTS := range []uint64{100_000, 100_040} {
 		isKey := i == 0
@@ -142,8 +143,8 @@ func TestProcess_AnchorsPTSToWallclock(t *testing.T) {
 // PTS values exactly. Useful sanity check before exercising the active
 // path.
 func TestProcess_DisabledConfigPassesThrough(t *testing.T) {
-	n := tsnorm.New(timeline.Config{}) // Enabled=false zero value
-	srcMuxer := tsmux.NewFromAV()
+	n := tsnorm.New(context.Background(), timeline.Config{}) // Enabled=false zero value
+	srcMuxer := tsmux.NewFromAV(context.Background())
 	var srcBuf bytes.Buffer
 	srcMuxer.Write(&domain.AVPacket{
 		Codec:    domain.AVCodecH264,
@@ -182,7 +183,7 @@ func TestProcess_DisabledConfigPassesThrough(t *testing.T) {
 // session boundary and check the second pulse's first frame lands near
 // 0 ms again rather than continuing the timeline from before.
 func TestOnSessionResetsAnchor(t *testing.T) {
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 
 	// First pulse: upstream PTS 100_000. Output PTS should be near 0.
 	src1 := muxSingleH264(t, 100_000)
@@ -235,7 +236,7 @@ func TestProcess_PreservesAACADTSPrefix(t *testing.T) {
 	// it through tsnorm, then re-demux the output and verify the
 	// emitted frame still starts with the ADTS sync word (0xFFF).
 	adtsFrame := []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}
-	srcMuxer := tsmux.NewFromAV()
+	srcMuxer := tsmux.NewFromAV(context.Background())
 	var srcBuf bytes.Buffer
 	srcMuxer.Write(&domain.AVPacket{
 		Codec: domain.AVCodecAAC,
@@ -247,7 +248,7 @@ func TestProcess_PreservesAACADTSPrefix(t *testing.T) {
 		t.Fatal("source muxer produced no TS bytes for AAC")
 	}
 
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	out, err := n.Process(srcBuf.Bytes())
 	if err != nil {
 		t.Fatalf("Process: %v", err)
@@ -303,7 +304,7 @@ func TestProcess_InterleavedVAEmitsBothInFirstPMT(t *testing.T) {
 	_ = src.Write(vpid, buildH264IDR(), 0, 0)
 	_ = src.Write(apid, []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}, 50, 50)
 
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	out, err := n.Process(srcBuf.Bytes())
 	if err != nil {
 		t.Fatalf("Process: %v", err)
@@ -364,7 +365,7 @@ func TestProcess_LazyAddStream188ByteChunks(t *testing.T) {
 		_ = src.Write(vpid, buildH264NonIDR(), videoPTS, videoPTS)
 	}
 
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	var collected bytes.Buffer
 	for _, ch := range chunks {
 		out, err := n.Process(ch)
@@ -417,7 +418,7 @@ func TestProcess_LazyAddStream188ByteChunks(t *testing.T) {
 // the frame would be dropped on an unannounced PID.
 func TestProcess_PreservesH265KeyframePayload(t *testing.T) {
 	idrPayload := buildH265IDR()
-	srcMuxer := tsmux.NewFromAV()
+	srcMuxer := tsmux.NewFromAV(context.Background())
 	var srcBuf bytes.Buffer
 	srcMuxer.Write(&domain.AVPacket{
 		Codec:    domain.AVCodecH265,
@@ -430,7 +431,7 @@ func TestProcess_PreservesH265KeyframePayload(t *testing.T) {
 		t.Fatal("source muxer produced no TS bytes for H.265")
 	}
 
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	out, err := n.Process(srcBuf.Bytes())
 	if err != nil {
 		t.Fatalf("Process: %v", err)
@@ -482,7 +483,7 @@ func TestProcess_NoH265InOutputForH264OnlySource(t *testing.T) {
 		_ = src.Write(apid, []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0xAA}, basePTS, basePTS)
 	}
 
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	out, err := n.Process(srcBuf.Bytes())
 	if err != nil {
 		t.Fatalf("Process: %v", err)
@@ -512,7 +513,7 @@ func TestProcess_NoH265InOutputForH264OnlySource(t *testing.T) {
 // upstream PTS. Used by tests that need a small known-shape input.
 func muxSingleH264(t *testing.T, ptsMS uint64) []byte {
 	t.Helper()
-	m := tsmux.NewFromAV()
+	m := tsmux.NewFromAV(context.Background())
 	var buf bytes.Buffer
 	m.Write(&domain.AVPacket{
 		Codec:    domain.AVCodecH264,
@@ -643,7 +644,7 @@ func hasDiscontinuityIndicatorOn(data []byte, pid uint16) bool {
 // New() must carry discontinuity_indicator=1 on the video PID so strict
 // analyzers don't flag the fresh CC=0 start as packet loss.
 func TestProcess_DiscontinuityIndicatorOnFirstEmit(t *testing.T) {
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	src := muxSingleH264(t, 100_000)
 	out, err := n.Process(src)
 	if err != nil {
@@ -660,7 +661,7 @@ func TestProcess_DiscontinuityIndicatorOnFirstEmit(t *testing.T) {
 // re-flag. Without re-seed, downstream TSDuck would log a CC error on
 // every session boundary.
 func TestProcess_DiscontinuityIndicatorReseedsOnSession(t *testing.T) {
-	n := tsnorm.New(timeline.DefaultConfig())
+	n := tsnorm.New(context.Background(), timeline.DefaultConfig())
 	// First pulse consumes the initial pendingDisc[videoPID]=true seed.
 	src1 := muxSingleH264(t, 100_000)
 	out1, err := n.Process(src1)

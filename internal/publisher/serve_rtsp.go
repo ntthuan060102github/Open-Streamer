@@ -330,7 +330,7 @@ func runRTSPPipeline(
 		demuxDone = make(chan error, 1)
 		dmx := tsdemux.New()
 		dmx.OnFrame = sess.onTSFrame
-		go func() { demuxDone <- dmx.Input(demuxBuf) }()
+		go func() { demuxDone <- dmx.Input(ctx, demuxBuf) }()
 	}
 	defer func() {
 		if demuxBuf != nil {

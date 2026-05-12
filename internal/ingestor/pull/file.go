@@ -73,7 +73,7 @@ func NewFileReader(path string, loop bool) *FileReader {
 
 // Open opens the file and selects the appropriate handler based on extension.
 // Returns an error if the path does not exist or is a directory.
-func (r *FileReader) Open(_ context.Context) error {
+func (r *FileReader) Open(ctx context.Context) error {
 	if r.handler != nil {
 		return nil // idempotent
 	}
@@ -88,14 +88,14 @@ func (r *FileReader) Open(_ context.Context) error {
 
 	switch strings.ToLower(filepath.Ext(r.path)) {
 	case ".mp4", ".m4v", ".mov":
-		h, err := newMP4Handler(r.path, r.loop)
+		h, err := newMP4Handler(ctx, r.path, r.loop)
 		if err != nil {
 			return fmt.Errorf("file reader: mp4 init %q: %w", r.path, err)
 		}
 		r.handler = h
 
 	case ".flv":
-		h, err := newFLVHandler(r.path, r.loop) //nolint:contextcheck // ctx stored in h.paceCtx per-read
+		h, err := newFLVHandler(ctx, r.path, r.loop)
 		if err != nil {
 			return fmt.Errorf("file reader: flv init %q: %w", r.path, err)
 		}
@@ -221,14 +221,14 @@ type mp4Handler struct {
 	paceAt   time.Time // wall-clock of first packet
 }
 
-func newMP4Handler(path string, loop bool) (*mp4Handler, error) {
+func newMP4Handler(ctx context.Context, path string, loop bool) (*mp4Handler, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 
 	h := &mp4Handler{path: path, loop: loop, f: f}
-	h.mux = tsmux.NewFromAV()
+	h.mux = tsmux.NewFromAV(ctx)
 
 	if err := h.reset(); err != nil {
 		_ = f.Close()
@@ -430,7 +430,7 @@ type flvHandler struct {
 	paceAt   time.Time
 }
 
-func newFLVHandler(path string, loop bool) (*flvHandler, error) {
+func newFLVHandler(ctx context.Context, path string, loop bool) (*flvHandler, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -442,8 +442,8 @@ func newFLVHandler(path string, loop bool) (*flvHandler, error) {
 		f:    f,
 		buf:  make([]byte, flvReadBuf),
 	}
-	h.mux = tsmux.NewFromAV()
-	h.buildReader()
+	h.mux = tsmux.NewFromAV(ctx)
+	h.buildReader() //nolint:contextcheck // per-read ctx is stored in h.paceCtx and consulted inside the OnFrame closure
 	return h, nil
 }
 

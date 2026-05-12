@@ -246,7 +246,7 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 				p.doFlush()
 				return
 			}
-			p.handleIncoming(pkt, segDur, &avMux, &tsCarry)
+			p.handleIncoming(ctx, pkt, segDur, &avMux, &tsCarry)
 
 		case <-tick.C:
 			p.tickFlush(maxDur, segDur)
@@ -265,6 +265,7 @@ func (p *hlsSegmenter) run(ctx context.Context, sub *buffer.Subscriber) {
 // AVPacket-flag for AV, event-bus generation counter for TS — both removed
 // in Phase 3 of the refactor).
 func (p *hlsSegmenter) handleIncoming(
+	ctx context.Context,
 	pkt buffer.Packet,
 	segDur time.Duration,
 	avMux **tsmux.FromAV,
@@ -283,7 +284,7 @@ func (p *hlsSegmenter) handleIncoming(
 		p.maybeFlushAtKeyframe(pkt.AV, segDur)
 	}
 	rawTS := len(pkt.TS) > 0 && pkt.AV == nil
-	tsmux.FeedWirePacket(pkt.TS, pkt.AV, avMux, func(b []byte) {
+	tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, avMux, func(b []byte) {
 		alignedFeed(b, tsCarry, func(pkt188 []byte) bool {
 			p.appendSegment188(pkt188, rawTS)
 			return true

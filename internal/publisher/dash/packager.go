@@ -200,7 +200,7 @@ func (p *Packager) Run(ctx context.Context, sub *buffer.Subscriber) {
 				p.finalFlush()
 				return
 			}
-			p.onPacket(pkt, &tsCarry, &tb)
+			p.onPacket(ctx, pkt, &tsCarry, &tb)
 		case <-ticker.C:
 			p.tryCut(time.Now())
 		}
@@ -211,7 +211,7 @@ func (p *Packager) Run(ctx context.Context, sub *buffer.Subscriber) {
 // tsCarry + tb belong to Run's local state — passed by reference so
 // the demuxer is lazily started on the FIRST TS packet rather than
 // always-on (AV-only streams pay nothing).
-func (p *Packager) onPacket(pkt buffer.Packet, tsCarry *[]byte, tb **tsBuffer) {
+func (p *Packager) onPacket(ctx context.Context, pkt buffer.Packet, tsCarry *[]byte, tb **tsBuffer) {
 	if pkt.SessionStart {
 		p.onSessionBoundary()
 	}
@@ -221,7 +221,7 @@ func (p *Packager) onPacket(pkt buffer.Packet, tsCarry *[]byte, tb **tsBuffer) {
 	case len(pkt.TS) > 0:
 		if *tb == nil {
 			*tb = newTSBuffer(p.cfg.StreamID)
-			startDemuxer(*tb, p.onTSFrame)
+			startDemuxer(ctx, *tb, p.onTSFrame)
 		}
 		aligned := alignTS(tsCarry, pkt.TS)
 		if len(aligned) > 0 {

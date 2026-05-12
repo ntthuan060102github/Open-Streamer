@@ -89,7 +89,7 @@ func runPullWorker(
 	// `tsNorm` is the parallel path for UDP / HLS-pull / HTTP-TS /
 	// SRT / file. Same wallclock anchoring semantics; lives on the
 	// same lifecycle so OnSession can fire on both from one call site.
-	tsNorm := tsnorm.New(cb.normaliserCfg)
+	tsNorm := tsnorm.New(ctx, cb.normaliserCfg)
 
 	for {
 		if !openSource(ctx, streamID, input, r, cb, &delay, &handedOff) {

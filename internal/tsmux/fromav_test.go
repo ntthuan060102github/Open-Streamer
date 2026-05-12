@@ -1,13 +1,14 @@
 package tsmux
 
 import (
+	"context"
 	"testing"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
 
 func TestWriteNilOrEmptyIsNoOp(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	called := false
 	f.Write(nil, func(_ []byte) { called = true })
 	f.Write(&domain.AVPacket{}, func(_ []byte) { called = true })
@@ -18,7 +19,7 @@ func TestWriteNilOrEmptyIsNoOp(t *testing.T) {
 }
 
 func TestWriteUnknownCodecIsNoOp(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	called := false
 	f.Write(
 		&domain.AVPacket{Codec: domain.AVCodecUnknown, Data: []byte{0x01, 0x02}},
@@ -30,7 +31,7 @@ func TestWriteUnknownCodecIsNoOp(t *testing.T) {
 }
 
 func TestWriteH264EmitsTSPackets(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	// Minimal AVCC -> Annex-B doesn't matter for the muxer; gomedia accepts whatever bytes.
 	annexB := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, // SPS
@@ -56,7 +57,7 @@ func TestWriteH264EmitsTSPackets(t *testing.T) {
 }
 
 func TestWriteAACEmitsTSPackets(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	// 7-byte ADTS header + dummy AAC payload.
 	aac := []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0x21, 0x00, 0x00}
 	var n int
@@ -70,7 +71,7 @@ func TestWriteAACEmitsTSPackets(t *testing.T) {
 }
 
 func TestWriteH265EmitsTSPackets(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	hevc := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, // VPS
 		0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x01, // SPS
@@ -115,6 +116,7 @@ func TestFeedWirePacketTSPassthrough(t *testing.T) {
 	var got []byte
 	var mux *FromAV
 	FeedWirePacket(
+		context.Background(),
 		[]byte{0x47, 0x01, 0x02, 0x03},
 		nil,
 		&mux,
@@ -138,6 +140,7 @@ func TestFeedWirePacketAVAllocatesMuxLazily(t *testing.T) {
 		0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00,
 	}
 	FeedWirePacket(
+		context.Background(),
 		nil,
 		&domain.AVPacket{Codec: domain.AVCodecH264, Data: annexB, PTSms: 1, DTSms: 1, KeyFrame: true},
 		&mux,
@@ -152,6 +155,7 @@ func TestFeedWirePacketAVAllocatesMuxLazily(t *testing.T) {
 
 	saved := mux
 	FeedWirePacket(
+		context.Background(),
 		nil,
 		&domain.AVPacket{Codec: domain.AVCodecH264, Data: annexB, PTSms: 2, DTSms: 2, KeyFrame: true},
 		&mux,
@@ -177,6 +181,7 @@ func TestFromAV_MuxesMP2Audio(t *testing.T) {
 	mp2Frame := []byte{0xFF, 0xFD, 0x40, 0x04, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD}
 
 	FeedWirePacket(
+		context.Background(),
 		nil,
 		&domain.AVPacket{Codec: domain.AVCodecMP2, Data: mp2Frame, PTSms: 100, DTSms: 100},
 		&mux,
@@ -200,6 +205,7 @@ func TestFromAV_MuxesMP2Audio(t *testing.T) {
 	// the muxer or re-adding the stream — same property the AAC path has.
 	saved := mux
 	FeedWirePacket(
+		context.Background(),
 		nil,
 		&domain.AVPacket{Codec: domain.AVCodecMP2, Data: mp2Frame, PTSms: 124, DTSms: 124},
 		&mux,
@@ -213,9 +219,9 @@ func TestFromAV_MuxesMP2Audio(t *testing.T) {
 func TestFeedWirePacketNilInputs(t *testing.T) {
 	var mux *FromAV
 	called := false
-	FeedWirePacket(nil, nil, &mux, func(_ []byte) { called = true })
-	FeedWirePacket(nil, &domain.AVPacket{}, &mux, func(_ []byte) { called = true })
-	FeedWirePacket(nil, &domain.AVPacket{Codec: domain.AVCodecH264, Data: []byte{1}}, &mux, nil)
+	FeedWirePacket(context.Background(), nil, nil, &mux, func(_ []byte) { called = true })
+	FeedWirePacket(context.Background(), nil, &domain.AVPacket{}, &mux, func(_ []byte) { called = true })
+	FeedWirePacket(context.Background(), nil, &domain.AVPacket{Codec: domain.AVCodecH264, Data: []byte{1}}, &mux, nil)
 	if called {
 		t.Fatal("emit must not be called for empty inputs")
 	}
@@ -433,7 +439,7 @@ func firstPacketByPID(packets [][]byte, pid uint16) []byte {
 // adaptation_field.discontinuity_indicator=1 so strict analyzers
 // (TSDuck tsanalyze) don't flag the CC=0 start as a packet-loss event.
 func TestFromAV_DiscontinuityIndicatorOnFirstVideoEmit(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	annexB := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f,
 		0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80,
@@ -458,7 +464,7 @@ func TestFromAV_DiscontinuityIndicatorOnFirstVideoEmit(t *testing.T) {
 // not a persistent attribute). pendingDisc clears the bit after the
 // first emit per PID.
 func TestFromAV_DiscontinuityIndicatorClearedAfterFirstEmit(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	annexB := []byte{
 		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f,
 		0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80,
@@ -490,7 +496,7 @@ func TestFromAV_DiscontinuityIndicatorClearedAfterFirstEmit(t *testing.T) {
 // exists ONLY to carry this flag — verifies the audio branch's
 // "discontinuity-only AF" path.
 func TestFromAV_DiscontinuityIndicatorOnFirstAudioEmit(t *testing.T) {
-	f := NewFromAV()
+	f := NewFromAV(context.Background())
 	aac := []byte{0xFF, 0xF1, 0x4C, 0x80, 0x01, 0x1F, 0xFC, 0x21, 0x00, 0x00}
 	var emitted [][]byte
 	f.Write(

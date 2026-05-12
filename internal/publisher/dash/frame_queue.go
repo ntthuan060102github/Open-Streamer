@@ -84,6 +84,14 @@ const (
 	maxAudioFrames = 900
 )
 
+// FrameQueue is the per-Packager FIFO of decoded video + audio access
+// units waiting to be cut into segments. Each track has an independent
+// capped slice; pushes drop the front when the cap is exceeded so a
+// stalled segmenter cannot accumulate unbounded frames (root cause of
+// the ~692 MB / 83 % heap leak observed in production on 2026-05-09).
+//
+// Not safe for concurrent use; the Packager mutex (`p.mu`) serialises
+// pushes from the AV/TS ingress and pops from the segmenter run loop.
 type FrameQueue struct {
 	video []VideoFrame
 	audio []AudioFrame

@@ -161,7 +161,7 @@ func (d *TSDemuxPacketReader) Open(ctx context.Context) error {
 	demuxDone := d.demuxDone
 
 	go d.pumpChunks(ctx)
-	go d.runDemux(q, done, chunks, demuxDone)
+	go d.runDemux(ctx, q, done, chunks, demuxDone)
 	return nil
 }
 
@@ -219,6 +219,7 @@ func (d *TSDemuxPacketReader) captureReadErr(err error, ctx context.Context) {
 // byte. consecutiveErrors caps the restart count so a truly
 // unrecoverable stream eventually returns and the caller reconnects.
 func (d *TSDemuxPacketReader) runDemux(
+	ctx context.Context,
 	q chan domain.AVPacket,
 	done chan struct{},
 	chunks chan []byte,
@@ -252,7 +253,7 @@ func (d *TSDemuxPacketReader) runDemux(
 			}
 		}
 
-		err := demuxInputSafe(dmx, cr)
+		err := demuxInputSafe(ctx, dmx, cr)
 		if err == nil {
 			// Normal exit: chanReader returned io.EOF because d.chunks was closed.
 			return
@@ -309,13 +310,13 @@ func (d *TSDemuxPacketReader) pace(dtsMS int64, done <-chan struct{}) {
 // rather than panics, so this is now a defensive wrapper rather than
 // a workaround for a known library bug — it costs ~nothing and
 // guards against future regressions or malformed-input edge cases.
-func demuxInputSafe(dmx *tsdemux.Demuxer, cr *chanReader) (err error) {
+func demuxInputSafe(ctx context.Context, dmx *tsdemux.Demuxer, cr *chanReader) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("ts demux panic: %v", r)
 		}
 	}()
-	return dmx.Input(cr)
+	return dmx.Input(ctx, cr)
 }
 
 // streamTypeMPEG1Audio is astits's stream_type for MPEG-1 audio

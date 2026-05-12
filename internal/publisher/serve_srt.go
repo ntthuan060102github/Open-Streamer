@@ -188,7 +188,7 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 				batch = batch[:0]
 			}
 			var writeErr error
-			tsmux.FeedWirePacket(pkt.TS, pkt.AV, &avMux, func(b []byte) {
+			tsmux.FeedWirePacket(ctx, pkt.TS, pkt.AV, &avMux, func(b []byte) {
 				if writeErr != nil {
 					return
 				}

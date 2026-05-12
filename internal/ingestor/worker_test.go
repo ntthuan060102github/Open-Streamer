@@ -29,8 +29,8 @@ func disabledNormaliser() *timeline.Normaliser {
 // PTS/DTS pass through untouched. The demux/mux roundtrip still runs
 // (so writeRawTSChunk exercises its normal code path) but the timeline
 // re-anchor does nothing.
-func disabledTSNormaliser() *tsnorm.Normaliser {
-	return tsnorm.New(timeline.Config{})
+func disabledTSNormaliser(ctx context.Context) *tsnorm.Normaliser {
+	return tsnorm.New(ctx, timeline.Config{})
 }
 
 // ---- mock PacketReader ----
@@ -123,7 +123,7 @@ func TestReadLoop_WritesPacketsToBuffer(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser())
+		errCh <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser(context.Background()))
 	}()
 
 	var received [][]byte
@@ -159,7 +159,7 @@ func TestReadLoop_ContextCancelled(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		cancel()
-		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser())
+		errCh <- readLoop(ctx, streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser(ctx))
 	}()
 
 	select {
@@ -188,7 +188,7 @@ func TestReadLoop_SkipsEmptyPackets(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser())
+		done <- readLoop(context.Background(), streamID, streamID, domain.Input{}, r, buf, nil, disabledNormaliser(), disabledTSNormaliser(context.Background()))
 	}()
 
 	select {
