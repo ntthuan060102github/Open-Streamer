@@ -66,12 +66,34 @@ func recordProfileErrorEntry(pw *profileWorker, msg string, at time.Time) {
 	pw.errors = append([]domain.ErrorEntry{e}, pw.errors...)
 }
 
+// ProfileStatus reports the CURRENT health of one profile encoder. It is
+// distinct from RestartCount (which is cumulative history): a profile that
+// crashed once but has been running stably since is RestartCount=1 yet
+// ProfileStatusHealthy. UI clients should drive their degraded badge off
+// Status, not off RestartCount.
+type ProfileStatus string
+
+const (
+	// ProfileStatusHealthy means the profile is NOT in the Service's
+	// unhealthyProfiles set — either has never tripped the consecutive-
+	// fast-crash threshold, or tripped it earlier but the next sustained
+	// run cleared the flag.
+	ProfileStatusHealthy ProfileStatus = "healthy"
+
+	// ProfileStatusUnhealthy means the profile is currently in
+	// unhealthyProfiles — has fast-crashed ≥ healthDegradeThreshold
+	// times in a row without sustaining healthSustainDur. Auto-clears
+	// the moment the next FFmpeg run lives long enough.
+	ProfileStatusUnhealthy ProfileStatus = "unhealthy"
+)
+
 // ProfileSnapshot is a serialisable copy of one profile encoder's runtime state.
 // Errors is a bounded rolling history (newest first) of FFmpeg crash messages
 // captured for this profile since the stream started.
 type ProfileSnapshot struct {
 	Index        int                 `json:"index"` // 0-based ladder index; track label = track_<index+1>
 	Track        string              `json:"track"`
+	Status       ProfileStatus       `json:"status"` // CURRENT health, not history
 	RestartCount int                 `json:"restart_count"`
 	Errors       []domain.ErrorEntry `json:"errors,omitempty"`
 }
@@ -91,14 +113,29 @@ func (s *Service) RuntimeStatus(streamID domain.StreamCode) (RuntimeStatus, bool
 		return RuntimeStatus{}, false
 	}
 
+	// Snapshot the unhealthy set first under its own mutex so we can
+	// report current per-profile health without holding two locks at
+	// once (sw.mu / healthMu). Nil map reads are safe and return ok=false.
+	s.healthMu.Lock()
+	unhealthy := make(map[int]struct{}, len(s.unhealthyProfiles[streamID]))
+	for idx := range s.unhealthyProfiles[streamID] {
+		unhealthy[idx] = struct{}{}
+	}
+	s.healthMu.Unlock()
+
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
 	out := RuntimeStatus{Profiles: make([]ProfileSnapshot, 0, len(sw.profiles))}
 	for idx, pw := range sw.profiles {
+		status := ProfileStatusHealthy
+		if _, bad := unhealthy[idx]; bad {
+			status = ProfileStatusUnhealthy
+		}
 		snap := ProfileSnapshot{
 			Index:        idx,
 			Track:        buffer.VideoTrackSlug(idx),
+			Status:       status,
 			RestartCount: pw.restartCount,
 		}
 		if len(pw.errors) > 0 {
