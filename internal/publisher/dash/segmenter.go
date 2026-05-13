@@ -77,8 +77,14 @@ type CutDecision struct {
 	Ok bool
 
 	// VideoCount is the number of OLDEST video frames to drain from
-	// the queue. The last drained frame is the trailing IDR (when
-	// available) so the NEXT segment can start at a fresh IDR.
+	// the queue. The last drained frame is the frame just BEFORE the
+	// trailing IDR — the IDR itself STAYS queued so the NEXT segment
+	// starts at a clean SAP boundary (DASH startWithSAP="1"). Without
+	// this off-by-one, strict players (Safari/VT, Chrome-on-Mac
+	// hardware decode) reject every segment after the first with
+	// MEDIA_ERR_DECODE -12909, because each segment after #1 starts
+	// with a P/B slice whose reference frames live in the previous
+	// segment.
 	//
 	// On a safety-net cut with no IDR available, VideoCount = the
 	// entire video queue at the moment of the cut.
@@ -168,8 +174,21 @@ func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedM
 }
 
 // findIDRCutPoint searches for the FIRST IDR whose PTSms is at least
-// segDurMS past the first frame, returning its index. Returns -1 when
-// no such IDR is queued.
+// segDurMS past the first frame, and returns the index of the frame
+// JUST BEFORE that IDR — i.e. the last frame to include in the
+// outgoing segment. The IDR itself stays queued so the NEXT segment
+// starts at a clean SAP boundary. Returns -1 when no qualifying IDR
+// is queued.
+//
+// Cut-just-before-IDR (vs cut-including-IDR) is mandatory for DASH
+// startWithSAP="1": every emitted segment must start with an IDR.
+// The previous return-i form had the IDR closing the current segment,
+// leaving the next segment to start with a P/B slice whose reference
+// frames lived in the previous segment. Tolerant players (Firefox,
+// software-decode Chrome) accepted that and used the prior segment's
+// IDR for refs; strict pipelines (Safari/VideoToolbox, Chrome-on-Mac
+// HW decode) hard-fail with MEDIA_ERR_DECODE -12909
+// (VTDecompressionOutputCallback bad-data) on every segment after #0.
 //
 // Picking the FIRST IDR past segDur (rather than the LATEST in queue)
 // keeps each segment ≤ ~segDur in frame-PTS span, which matters
@@ -194,7 +213,8 @@ func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 		return -1
 	}
 	// Scan from oldest to newest; the FIRST IDR whose PTS is >=
-	// first+segDur is the cut point.
+	// first+segDur defines the cut boundary, and we return the index
+	// of the frame BEFORE it so the IDR stays for the next segment.
 	for i := 1; i < q.VideoLen(); i++ {
 		ptsMS, ok := q.videoPTSAt(i)
 		if !ok {
@@ -203,9 +223,8 @@ func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 		if ptsMS-first.PTSms < segDurMS {
 			continue
 		}
-		// Need an IDR at or past this point. Check if frame i is IDR.
 		if vf, ok := q.videoAt(i); ok && vf.IsIDR {
-			return i
+			return i - 1
 		}
 	}
 	return -1
@@ -246,7 +265,19 @@ func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio 
 		if hasNext && nextPTSms > first.PTSms {
 			vDurMs = nextPTSms - first.PTSms
 		} else if cutPTSms, ok := q.videoPTSAt(lastVideoIdx); ok && cutPTSms > first.PTSms {
+			// Fallback: no frame queued past lastVideoIdx. Use
+			// (cutPTSms − first.PTSms) PLUS one estimated per-frame
+			// interval so the duration matches what computeVideoSegDurTicks
+			// will write to the MPD (which also adds perFrame for the
+			// last frame's own duration). Without this, my V/A coupling
+			// targetA under-counts by one frame per cut and audio drifts
+			// behind video — observed on test2 file://MP4 where the V
+			// queue typically drains completely each cut, making this
+			// fallback the common case (~40 ms/cut compound deficit).
 			vDurMs = cutPTSms - first.PTSms
+			if vCount > 1 {
+				vDurMs += vDurMs / uint64(vCount-1) //nolint:gosec // vCount > 1 by branch
+			}
 		}
 		if vDurMs > 0 {
 			// Exact total samples that match V's duration:

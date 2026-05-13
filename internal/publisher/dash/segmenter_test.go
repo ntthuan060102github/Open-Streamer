@@ -48,14 +48,18 @@ func TestCut_BelowSegDurHolds(t *testing.T) {
 	}
 }
 
-// TestCut_AtIDRBoundary — segmenter cuts at the trailing IDR once segDur
-// of content is queued.
+// TestCut_AtIDRBoundary — segmenter cuts just BEFORE the trailing IDR
+// once segDur of content is queued; the IDR itself stays for the next
+// segment so every emitted segment starts at a SAP boundary (DASH
+// startWithSAP="1"). Strict players (Safari/VT) reject any segment that
+// doesn't begin with an IDR.
 func TestCut_AtIDRBoundary(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 	// 3 s of video @ 40 ms spacing = 75 frames. GOP=25 (1s) → IDRs at
-	// indexes 0, 25, 50. We expect the cut at index 50 (the trailing
-	// IDR within segDur window).
+	// indexes 0, 25, 50. First IDR past segDur (2 s) is index 50 — cut
+	// drains frames 0..49 (50 frames), leaving the IDR at index 50 as
+	// the new head of the queue for the next segment.
 	fillVideo(q, 75, 40, 25)
 	fillAudio(q, 100, 23) // plenty of audio
 
@@ -66,16 +70,13 @@ func TestCut_AtIDRBoundary(t *testing.T) {
 	if !d.IsIDRAligned {
 		t.Errorf("expected IDR-aligned cut, got IsIDRAligned=false")
 	}
-	// The trailing IDR is at index 50 → VideoCount = 51 (drain up to
-	// and including that frame).
-	if d.VideoCount != 51 {
-		t.Errorf("VideoCount = %d, want 51 (drain through IDR at index 50)", d.VideoCount)
+	if d.VideoCount != 50 {
+		t.Errorf("VideoCount = %d, want 50 (drain up to but NOT including IDR at index 50)", d.VideoCount)
 	}
-	// Audio count: frames with PTSms ≤ video[50].PTSms = 50*40 = 2000.
-	// audio PTS = 0, 23, 46, ..., 23*86=1978, 23*87=2001. So 87 frames
-	// (indexes 0..86) are ≤ 2000.
-	if d.AudioCount != 87 {
-		t.Errorf("AudioCount = %d, want 87 (frames ≤ 2000ms)", d.AudioCount)
+	// V/A coupling math: nextPTSms = videoPTSAt(50) = 2000 ms.
+	// totalSamples = 2000 × 44100 / 1000 = 88200; targetA = 88200/1024 = 86.
+	if d.AudioCount != 86 {
+		t.Errorf("AudioCount = %d, want 86 (round(2000ms × 44100/1024/1000))", d.AudioCount)
 	}
 }
 
@@ -83,21 +84,24 @@ func TestCut_AtIDRBoundary(t *testing.T) {
 // whose PTS is at least segDur past the queue's first frame. This
 // keeps segment durs ≤ segDur, preventing the overlapping-timeline
 // problem where frame-PTS-span exceeded inter-cut wallclock and the
-// MPD's (t, d) describes overlapping ranges.
+// MPD's (t, d) describes overlapping ranges. The IDR itself is NOT
+// drained — it stays as the next segment's first frame so the SAP
+// invariant holds across segment boundaries.
 func TestCut_PrefersFirstIDRPastSegDur(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 	// 4 s of video @ 40 ms, GOP=25 → IDRs at 0, 25, 50, 75 (PTS 0, 1000,
 	// 2000, 3000). With segDur=2 s, the first IDR whose PTS ≥ 2000ms
-	// is index 50 (PTS 2000). Cut drains frames 0..50 = 51 frames.
+	// is index 50 (PTS 2000). Cut drains frames 0..49 = 50 frames,
+	// leaving the IDR at index 50 for the next segment.
 	fillVideo(q, 100, 40, 25)
 
 	d := s.Cut(time.Now(), q, true, false, 0)
 	if !d.Ok || !d.IsIDRAligned {
 		t.Fatalf("expected IDR cut, got %+v", d)
 	}
-	if d.VideoCount != 51 {
-		t.Errorf("VideoCount = %d, want 51 (drain through index 50, first IDR past segDur)", d.VideoCount)
+	if d.VideoCount != 50 {
+		t.Errorf("VideoCount = %d, want 50 (drain up to but NOT including IDR at index 50)", d.VideoCount)
 	}
 }
 
@@ -253,11 +257,12 @@ func TestCut_HybridResidualConverges(t *testing.T) {
 		totalAudioFrames += uint64(d.AudioCount) //nolint:gosec
 	}
 
-	// Each V cut spans frames 0..150 (IDR at index 150, PTS 6000 ms).
-	// vCount=151; nextPTSms = videoPTSAt(151) = 151×40 = 6040 ms.
-	// Hybrid math: vDurMs = nextPTSms − first.PTSms = 6040.
-	// cumulativeV = nCuts × 6040.
-	cumulativeVMs := uint64(nCuts) * 6040
+	// Each V cut spans frames 0..149 (cut just BEFORE the IDR at
+	// index 150, which has PTS 6000 ms and stays for the next
+	// segment). vCount=150; nextPTSms = videoPTSAt(150) = 6000 ms.
+	// Hybrid math: vDurMs = nextPTSms − first.PTSms = 6000.
+	// cumulativeV = nCuts × 6000.
+	cumulativeVMs := uint64(nCuts) * 6000
 	cumulativeAMs := totalAudioFrames * 1024 * 1000 / sr
 	deltaMs := int64(cumulativeVMs) - int64(cumulativeAMs)
 	if deltaMs > 21 || deltaMs < -21 {

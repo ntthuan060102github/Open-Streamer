@@ -177,6 +177,17 @@ type Packager struct {
 	videoFrameSeen bool
 	audioFrameSeen bool
 
+	// firstIDRSeen latches true on the first H.264 IDR (or HEVC IRAP)
+	// pushed into the video queue. Until set, handleH264 DROPS non-key
+	// frames so segment 0's first sample is a SAP — DASH manifests
+	// declare startWithSAP="1" and strict players reject any segment
+	// whose first sample isn't an IDR (Safari/VideoToolbox returns
+	// MEDIA_ERR_DECODE -12909). SPS/PPS accumulation still runs on
+	// every dropped frame so the init segment can build from
+	// pre-IDR parameter sets if the source delivers them that way
+	// (RTMP AVCDecoderConfigurationRecord, MP4 stsd).
+	firstIDRSeen bool
+
 	// Cut-time diagnostic counters and timestamps. starvedAudioCutCount
 	// fires when a Cut decision returned Ok=true but AudioCount=0 while
 	// the queue has audio frames (smoking gun for hypothesis 1 / 2).
@@ -327,14 +338,26 @@ func (p *Packager) onAVPacket(av *domain.AVPacket) {
 
 // handleH264 enqueues an H.264 access unit and tries to build the video
 // init segment if it isn't already built.
+//
+// IDR-startup gate: drops every non-key frame until the first IDR
+// arrives. Without this, cold-start frames captured mid-GOP enter
+// the queue and segment 0 ends up starting with a P/B slice — strict
+// hardware decoders (Safari/VT, Chrome-on-Mac VideoToolbox) reject
+// such segments with MEDIA_ERR_DECODE -12909. SPS/PPS extraction
+// still runs on every dropped frame so the init segment can build
+// from any in-band parameter sets that arrive before the first IDR.
 func (p *Packager) handleH264(av *domain.AVPacket) {
 	p.videoFrameSeen = true
 	if p.videoInit == nil && !p.videoPSGivenUp {
 		p.accumulateVideoPS(av.Data)
 		p.tryBuildVideoInit()
 	}
-	// Queue the frame regardless — once init is built, the queue's
-	// existing contents are still valid (Normaliser-anchored PTS).
+	if !p.firstIDRSeen {
+		if !av.KeyFrame {
+			return
+		}
+		p.firstIDRSeen = true
+	}
 	p.pushVideoWithDiag(VideoFrame{
 		AnnexB: cloneBytes(av.Data),
 		PTSms:  av.PTSms,
@@ -648,6 +671,15 @@ func (p *Packager) tryCut(now time.Time) {
 		p.state.OnFirstSegmentFlushed()
 		if p.availStart.IsZero() {
 			p.availStart = now
+		}
+		// Safety-net cuts drain the entire video queue without landing
+		// on an IDR boundary, so the next pushed frame could be a P/B
+		// slice that would re-contaminate segment N+1. Re-arm the
+		// startup gate so handleH264 drops non-key frames until the
+		// next IDR arrives, restoring SAP alignment at the cost of a
+		// few hundred ms of skipped frames.
+		if !d.IsIDRAligned {
+			p.firstIDRSeen = false
 		}
 		p.trimWindow()
 		p.publishManifest(now)
