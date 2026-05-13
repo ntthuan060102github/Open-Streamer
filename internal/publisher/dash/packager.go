@@ -704,7 +704,11 @@ func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame, nextPTS
 	p.vSegN++
 	name := fmt.Sprintf("seg_v_%05d.m4s", p.vSegN)
 
-	tfdt := videoTfdtForSegment(p.vSegEntries, now, p.availStart)
+	var audioSR uint64
+	if p.audioInit != nil {
+		audioSR = uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0
+	}
+	tfdt := videoTfdtForSegment(p.vSegEntries, p.aSegEntries, now, p.availStart, audioSR)
 	segDurTicks := computeVideoSegDurTicks(frames, nextPTSms, hasNext)
 
 	data, err := BuildVideoFragment(uint32(p.vSegN), p.videoInit.TrackID, tfdt, frames, p.isHEVC, segDurTicks) //nolint:gosec // segN fits uint32 for the stream's lifetime
@@ -731,7 +735,7 @@ func (p *Packager) writeAudioSegment(now time.Time, frames []AudioFrame) bool {
 	name := fmt.Sprintf("seg_a_%05d.m4s", p.aSegN)
 
 	sr := uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0
-	tfdt := audioTfdtForSegment(p.aSegEntries, now, p.availStart, sr)
+	tfdt := audioTfdtForSegment(p.aSegEntries, p.vSegEntries, now, p.availStart, sr)
 	durTicks := uint64(len(frames)) * 1024 // AAC: 1024 samples per frame
 
 	data, err := BuildAudioFragment(uint32(p.aSegN), p.audioInit.TrackID, tfdt, frames) //nolint:gosec // segN fits uint32
@@ -791,25 +795,54 @@ func (p *Packager) behindPrevSegEnd(now time.Time) bool {
 // segment uses the previous segment's end (sequential on media time)
 // so adjacent segments are contiguous in the MPD's <S t=...> entries.
 //
+// Cross-track first-emit alignment: when video's FIRST segment is about
+// to write but audio has already emitted (e.g. audio init was ready
+// while the video init was still accumulating SPS/PPS), the video's
+// tfdt anchors to AUDIO'S CURRENT END instead of wallclock. Without
+// this, V's tfdt = 0 and A's already-emitted segments hold a non-zero
+// tfdt, baking a permanent V/A timeline offset for the rest of the
+// session — visible to the player as 1-N seconds of A/V drift.
+//
 // Sequential anchoring eliminates the per-segment ≤50 ms gap that
 // wallclock-anchored tfdt inherited from the run-loop tick granularity
 // — see writeVideoSegment's docstring for the full rationale.
-func videoTfdtForSegment(entries []SegmentEntry, now, ast time.Time) uint64 {
-	if n := len(entries); n > 0 {
-		last := entries[n-1]
+func videoTfdtForSegment(videoEntries, audioEntries []SegmentEntry, now, ast time.Time, audioSR uint64) uint64 {
+	if n := len(videoEntries); n > 0 {
+		last := videoEntries[n-1]
 		return last.StartTicks + last.DurTicks
+	}
+	// First-ever video segment.
+	if an := len(audioEntries); an > 0 && audioSR > 0 {
+		aLast := audioEntries[an-1]
+		aEndMs := (aLast.StartTicks + aLast.DurTicks) * 1000 / audioSR
+		return aEndMs * uint64(VideoTimescale) / 1000
 	}
 	return wallclockTicks(now, ast, uint64(VideoTimescale))
 }
 
 // audioTfdtForSegment is the audio counterpart of videoTfdtForSegment.
 // timescale is the audio sample rate (Hz) — each tick is one sample.
-func audioTfdtForSegment(entries []SegmentEntry, now, ast time.Time, timescale uint64) uint64 {
-	if n := len(entries); n > 0 {
-		last := entries[n-1]
+//
+// Cross-track first-emit alignment: when audio's FIRST segment writes
+// but video has already emitted segments (the COMMON case — video init
+// usually builds before audio because SPS/PPS arrive in the first few
+// PES, while audio init waits for the first ADTS header), the audio's
+// tfdt anchors to VIDEO'S CURRENT END instead of wallclock. Without
+// this, the residual V/A timeline drift bug observed on bac_ninh_raw
+// (4 s offset baked in at startup) and test_puhser (84 s offset)
+// persists despite the time-span queue cap fix.
+func audioTfdtForSegment(audioEntries, videoEntries []SegmentEntry, now, ast time.Time, audioSR uint64) uint64 {
+	if n := len(audioEntries); n > 0 {
+		last := audioEntries[n-1]
 		return last.StartTicks + last.DurTicks
 	}
-	return wallclockTicks(now, ast, timescale)
+	// First-ever audio segment.
+	if vn := len(videoEntries); vn > 0 {
+		vLast := videoEntries[vn-1]
+		vEndMs := (vLast.StartTicks + vLast.DurTicks) * 1000 / uint64(VideoTimescale)
+		return vEndMs * audioSR / 1000
+	}
+	return wallclockTicks(now, ast, audioSR)
 }
 
 // wallclockTicks returns (now − ast) × timescale, clamping to 0 when

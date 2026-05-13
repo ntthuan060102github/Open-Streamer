@@ -490,7 +490,7 @@ func TestTfdtForSegment(t *testing.T) {
 	t.Run("video_first_seg_uses_wallclock_anchor", func(t *testing.T) {
 		// No entries → seeds onto wallclockTicks(now, AST). At now=AST,
 		// wallclockTicks = 0.
-		got := videoTfdtForSegment(nil, t0, t0)
+		got := videoTfdtForSegment(nil, nil, t0, t0, 48000)
 		if got != 0 {
 			t.Errorf("first segment tfdt at now==AST → %d, want 0", got)
 		}
@@ -500,7 +500,7 @@ func TestTfdtForSegment(t *testing.T) {
 		// AST set, but first emit happens 3 s after. tfdt should reflect
 		// that wallclock offset so the MPD timeline starts at the right
 		// place.
-		got := videoTfdtForSegment(nil, t0.Add(3*time.Second), t0)
+		got := videoTfdtForSegment(nil, nil, t0.Add(3*time.Second), t0, 48000)
 		want := uint64(3) * uint64(VideoTimescale)
 		if got != want {
 			t.Errorf("first segment tfdt at now=AST+3s → %d, want %d", got, want)
@@ -513,16 +513,30 @@ func TestTfdtForSegment(t *testing.T) {
 			{StartTicks: 6 * uint64(VideoTimescale), DurTicks: 540000}, // ends at 12s
 		}
 		// now is irrelevant for subsequent segments — should NOT influence tfdt.
-		got := videoTfdtForSegment(entries, t0.Add(time.Hour), t0)
+		got := videoTfdtForSegment(entries, nil, t0.Add(time.Hour), t0, 48000)
 		want := uint64(12) * uint64(VideoTimescale)
 		if got != want {
 			t.Errorf("subsequent seg tfdt = %d, want %d (= prev.Start + prev.Dur)", got, want)
 		}
 	})
 
+	t.Run("video_first_seg_aligns_to_audio_when_audio_emitted_first", func(t *testing.T) {
+		// Audio has emitted 2 segments at 48 kHz, ending at 4 s. Video's
+		// first emit must anchor at 4 s in video timescale, NOT at 0.
+		audioEntries := []SegmentEntry{
+			{StartTicks: 0, DurTicks: 2 * 48000},
+			{StartTicks: 2 * 48000, DurTicks: 2 * 48000},
+		}
+		got := videoTfdtForSegment(nil, audioEntries, t0.Add(5*time.Second), t0, 48000)
+		want := uint64(4) * uint64(VideoTimescale)
+		if got != want {
+			t.Errorf("V first tfdt aligned to A end → %d, want %d (4s in 90 kHz)", got, want)
+		}
+	})
+
 	t.Run("audio_first_seg_uses_wallclock_anchor_with_sr_timescale", func(t *testing.T) {
 		// Audio timescale = sample rate. At 48 kHz, wallclockTicks(now=AST, AST) = 0.
-		got := audioTfdtForSegment(nil, t0, t0, 48000)
+		got := audioTfdtForSegment(nil, nil, t0, t0, 48000)
 		if got != 0 {
 			t.Errorf("first audio seg tfdt at now==AST → %d, want 0", got)
 		}
@@ -533,10 +547,26 @@ func TestTfdtForSegment(t *testing.T) {
 			{StartTicks: 0, DurTicks: 2 * 48000},     // 2 s @ 48 kHz
 			{StartTicks: 2 * 48000, DurTicks: 96000}, // ends at 4 s
 		}
-		got := audioTfdtForSegment(entries, t0.Add(time.Hour), t0, 48000)
+		got := audioTfdtForSegment(entries, nil, t0.Add(time.Hour), t0, 48000)
 		want := uint64(4) * 48000
 		if got != want {
 			t.Errorf("subsequent audio seg tfdt = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("audio_first_seg_aligns_to_video_when_video_emitted_first", func(t *testing.T) {
+		// Video has emitted 2 segments ending at 8 s in 90 kHz. Audio's
+		// first emit must anchor at 8 s in audio timescale (= 8 * 48000),
+		// NOT at wallclock-since-AST. This is the bac_ninh_raw / test_puhser
+		// V/A baked-offset bug that the time-span cap fix didn't address.
+		videoEntries := []SegmentEntry{
+			{StartTicks: 0, DurTicks: 4 * uint64(VideoTimescale)},
+			{StartTicks: 4 * uint64(VideoTimescale), DurTicks: 4 * uint64(VideoTimescale)},
+		}
+		got := audioTfdtForSegment(nil, videoEntries, t0.Add(10*time.Second), t0, 48000)
+		want := uint64(8) * 48000
+		if got != want {
+			t.Errorf("A first tfdt aligned to V end → %d, want %d (8s @ 48 kHz)", got, want)
 		}
 	})
 }
