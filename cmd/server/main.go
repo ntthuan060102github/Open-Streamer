@@ -102,6 +102,12 @@ func run() error {
 	for _, w := range probeRes.Warnings {
 		slog.Warn("ffmpeg capability missing", "msg", w)
 	}
+	// Make the probe result available to services via DI so they can
+	// adapt their arg-building strategy to the binary's optional-feature
+	// set (e.g. transcoder.Service reads ProbeResult.BSFs to pick the
+	// bsf:v fast path vs the legacy setsar filter for SAR). Services
+	// that don't need it simply skip do.Invoke[*transcoder.ProbeResult].
+	do.ProvideValue(injector, probeRes)
 
 	// Init logger from store config.
 	// Apply installs both slog and nazalog (LAL) levels from the same cfg

@@ -24,7 +24,7 @@ func TestBuildMultiOutputArgs_PipeNumbering(t *testing.T) {
 		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264"},
 		{Width: 640, Height: 360, Bitrate: "800k", Codec: "h264"},
 	}
-	args, err := buildMultiOutputArgs(profiles, tc)
+	args, err := buildMultiOutputArgs(profiles, tc, nil)
 	require.NoError(t, err)
 
 	joined := strings.Join(args, " ")
@@ -57,7 +57,7 @@ func TestBuildMultiOutputArgs_PerProfileBitrate(t *testing.T) {
 		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264"},
 		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264"},
 	}
-	args, err := buildMultiOutputArgs(profiles, tc)
+	args, err := buildMultiOutputArgs(profiles, tc, nil)
 	require.NoError(t, err)
 
 	joined := strings.Join(args, " ")
@@ -86,7 +86,7 @@ func TestBuildMultiOutputArgs_NVENCUsesScaleCuda(t *testing.T) {
 	profiles := []Profile{
 		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264"},
 	}
-	args, err := buildMultiOutputArgs(profiles, tc)
+	args, err := buildMultiOutputArgs(profiles, tc, nil)
 	require.NoError(t, err)
 
 	joined := strings.Join(args, " ")
@@ -102,14 +102,14 @@ func TestBuildMultiOutputArgs_RejectVideoCopy(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 	}
 	profiles := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}
-	_, err := buildMultiOutputArgs(profiles, tc)
+	_, err := buildMultiOutputArgs(profiles, tc, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "video.copy=true")
 }
 
 func TestBuildMultiOutputArgs_RejectEmpty(t *testing.T) {
 	t.Parallel()
-	_, err := buildMultiOutputArgs(nil, &domain.TranscoderConfig{})
+	_, err := buildMultiOutputArgs(nil, &domain.TranscoderConfig{}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no video profiles")
 }
@@ -126,7 +126,7 @@ func TestBuildMultiOutputArgs_SingleProfileWorks(t *testing.T) {
 	profiles := []Profile{
 		{Width: 1920, Height: 1080, Bitrate: "5000k", Codec: "h264"},
 	}
-	args, err := buildMultiOutputArgs(profiles, tc)
+	args, err := buildMultiOutputArgs(profiles, tc, nil)
 	require.NoError(t, err)
 
 	joined := strings.Join(args, " ")

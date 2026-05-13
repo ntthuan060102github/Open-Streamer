@@ -126,6 +126,45 @@ func TestFilterPresent(t *testing.T) {
 	assert.False(t, filterPresent(sample, "Filters:"))
 }
 
+// bsfPresent matches whole-line tokens — partial substrings, header
+// rows, and missing names all return false.
+func TestBsfPresent(t *testing.T) {
+	t.Parallel()
+	const sample = `Bitstream filters:
+aac_adtstoasc
+av1_frame_merge
+av1_frame_split
+av1_metadata
+chomp
+dca_core
+dts2pts
+dump_extra
+dv_error_marker
+eac3_core
+extract_extradata
+filter_units
+h264_metadata
+h264_mp4toannexb
+h264_redundant_pps
+hapqa_extract
+hevc_metadata
+hevc_mp4toannexb
+imx_dump_header
+media100_to_mjpegb
+`
+	for _, name := range []string{"h264_metadata", "hevc_metadata", "av1_metadata", "filter_units"} {
+		assert.True(t, bsfPresent(sample, name), "expected bsf %q present", name)
+	}
+	// Whole-token match: "metadata" alone must not partial-hit
+	// h264_metadata / hevc_metadata.
+	assert.False(t, bsfPresent(sample, "metadata"))
+	assert.False(t, bsfPresent(sample, "h264"))
+	// Header lines (with trailing colon) don't match a bare name.
+	assert.False(t, bsfPresent(sample, "Bitstream filters"))
+	// Unlisted names return false.
+	assert.False(t, bsfPresent(sample, "vp9_metadata"))
+}
+
 // optionalEncodersForBackends: filter by host's available HW backends.
 // Server passes hwdetect.Available() — UI does not pick. Result must
 // be union across all listed backends + audio (HW-independent).

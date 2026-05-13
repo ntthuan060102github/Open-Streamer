@@ -14,7 +14,7 @@ func TestBuildFFmpegArgs_CopyVideoAndAudio(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Copy: true},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k"}}, tc, nil)
 	require.NoError(t, err)
 	require.Contains(t, args, "-analyzeduration")
 	require.Contains(t, args, "-probesize")
@@ -38,7 +38,7 @@ func TestBuildFFmpegArgs_ScaleAndEncode(t *testing.T) {
 		Width: 1280, Height: 720, Bitrate: "2000k",
 		Codec: "h264", Preset: "veryfast",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := vfFilterValue(t, args)
 	require.Contains(t, vf, "scale=1280:720:")
@@ -57,7 +57,7 @@ func TestBuildFFmpegArgs_NVENCFromHW(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{{Width: 0, Height: 0, Bitrate: "3000k", Codec: "h264", Preset: "p4"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Contains(t, args, "h264_nvenc")
 }
@@ -69,7 +69,7 @@ func TestBuildFFmpegArgs_ExtraArgs(t *testing.T) {
 		Audio:     domain.AudioTranscodeConfig{Copy: true},
 		ExtraArgs: []string{"-muxdelay", "0"},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k"}}, tc, nil)
 	require.NoError(t, err)
 	idx := indexOf(args, "-muxdelay")
 	require.Greater(t, idx, 0)
@@ -87,7 +87,7 @@ func TestBuildFFmpegArgs_MaxBitrateAndFramerate(t *testing.T) {
 		Codec: "h264", Preset: "fast",
 		MaxBitrate: 4000, Framerate: 30,
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Contains(t, args, "-maxrate")
 	require.Contains(t, args, "4000k")
@@ -107,7 +107,7 @@ func TestBuildFFmpegArgs_CodecProfileAndLevel(t *testing.T) {
 		Bitrate: "2000k", Codec: "h264", Preset: "fast",
 		CodecProfile: "high", CodecLevel: "4.1",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Contains(t, args, "-profile:v")
 	require.Contains(t, args, "high")
@@ -118,13 +118,13 @@ func TestBuildFFmpegArgs_CodecProfileAndLevel(t *testing.T) {
 func TestBuildFFmpegArgs_NoProfiles(t *testing.T) {
 	t.Parallel()
 	tc := &domain.TranscoderConfig{}
-	_, err := buildFFmpegArgs(nil, tc)
+	_, err := buildFFmpegArgs(nil, tc, nil)
 	require.Error(t, err)
 }
 
 func TestBuildFFmpegArgs_NilTranscoderConfig(t *testing.T) {
 	t.Parallel()
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k", Codec: "h264"}}, nil)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "1k", Codec: "h264"}}, nil, nil)
 	require.NoError(t, err)
 	require.Contains(t, args, "pipe:1")
 }
@@ -344,7 +344,7 @@ func TestBuildVideoFilter_ChainOrder(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
 	p := Profile{Width: 1280, Height: 720, SAR: "1:1", ResizeMode: "pad"}
-	got := buildVideoFilter(p, tc, "libx264")
+	got := buildVideoFilter(p, tc, "libx264", nil)
 	yadifAt := strings.Index(got, "yadif")
 	scaleAt := strings.Index(got, "scale=")
 	sarAt := strings.Index(got, "setsar=1:1")
@@ -359,7 +359,7 @@ func TestBuildVideoFilter_Empty(t *testing.T) {
 	t.Parallel()
 	// No interlace, no dims, no SAR → no -vf at all.
 	tc := &domain.TranscoderConfig{}
-	got := buildVideoFilter(Profile{}, tc, "libx264")
+	got := buildVideoFilter(Profile{}, tc, "libx264", nil)
 	require.Empty(t, got)
 }
 
@@ -373,7 +373,7 @@ func TestBuildVideoFilter_GPUKeepsCudaSuffixes(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := Profile{Width: 1920, Height: 1080, ResizeMode: "fit"}
-	got := buildVideoFilter(p, tc, "h264_nvenc")
+	got := buildVideoFilter(p, tc, "h264_nvenc", nil)
 	require.Contains(t, got, "yadif_cuda")
 	require.Contains(t, got, "scale_cuda")
 	require.NotContains(t, got, "yadif=")
@@ -392,7 +392,7 @@ func TestBuildFFmpegArgs_BframesAndRefs(t *testing.T) {
 		Bitrate: "2000k", Codec: "h264", Preset: "fast",
 		Bframes: &bf, Refs: &refs,
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	bfIdx := indexOf(args, "-bf")
 	require.Greater(t, bfIdx, -1)
@@ -416,7 +416,7 @@ func TestBuildFFmpegArgs_BframesOnNVENCEnablesBRefMode(t *testing.T) {
 		Bitrate: "3000k", Codec: "h264", Preset: "p4",
 		Bframes: &bf,
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Contains(t, args, "h264_nvenc")
 	bfIdx := indexOf(args, "-bf")
@@ -437,7 +437,7 @@ func TestBuildFFmpegArgs_SARAppendedAfterScale(t *testing.T) {
 		Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast",
 		SAR: "1:1",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := vfFilterValue(t, args)
 	require.Contains(t, vf, "setsar=1:1")
@@ -455,7 +455,7 @@ func TestBuildFFmpegArgs_InterlaceCPUPipeline(t *testing.T) {
 	p := []Profile{{
 		Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := vfFilterValue(t, args)
 	require.Contains(t, vf, "yadif=mode=0:parity=0:deint=0")
@@ -474,7 +474,7 @@ func TestBuildFFmpegArgs_ResizeModeStretch(t *testing.T) {
 		Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast",
 		ResizeMode: string(domain.ResizeModeStretch),
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := vfFilterValue(t, args)
 	require.Equal(t, "scale=1280:720", vf)
