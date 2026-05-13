@@ -141,6 +141,22 @@ type Packager struct {
 	// the packager's segmenter has fallen permanently behind.
 	videoOverflowDropCount int
 	audioOverflowDropCount int
+
+	// Out-of-order push counters: incremented when PushVideo / PushAudio
+	// receives a frame whose PTSms is strictly less than the queue's
+	// previous tail. Diagnostic for hypothesis-1 (audioCountAtOrBefore
+	// sequential-stop scan misses qualifying frames after an OOO frame
+	// at the front).
+	videoOOOPushCount int
+	audioOOOPushCount int
+
+	// Cut-time diagnostic counters and timestamps. starvedAudioCutCount
+	// fires when a Cut decision returned Ok=true but AudioCount=0 while
+	// the queue has audio frames (smoking gun for hypothesis 1 / 2).
+	// lastDiagLogAt rate-limits the diagnostic log to ≤ once per second
+	// per packager — tryCut runs every 50 ms, raw logs would flood.
+	starvedAudioCutCount int
+	lastDiagLogAt        time.Time
 }
 
 // NewPackager constructs a Packager from cfg. Validates required
@@ -291,19 +307,27 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 	}
 	// Queue the frame regardless — once init is built, the queue's
 	// existing contents are still valid (Normaliser-anchored PTS).
-	if dropped := p.queue.PushVideo(VideoFrame{
+	p.pushVideoWithDiag(VideoFrame{
 		AnnexB: cloneBytes(av.Data),
 		PTSms:  av.PTSms,
 		DTSms:  av.DTSms,
 		IsIDR:  av.KeyFrame,
-	}); dropped > 0 {
+	})
+	if p.videoInit != nil {
+		p.state.OpenPairingWindow(time.Now())
+	}
+}
+
+// pushVideoWithDiag is the video counterpart of pushAudioWithDiag.
+// Persistent overflow drops indicate the segmenter is unable to cut
+// (typically the pacing gate is permanently behind because cumulative
+// per-segment dur has drifted ahead of wallclock); MPD timeline
+// integrity is already lost at that point and the drop is the lesser
+// evil. OOO pushes signal an upstream Normaliser anomaly.
+func (p *Packager) pushVideoWithDiag(f VideoFrame) {
+	dropped, ooo := p.queue.PushVideo(f)
+	if dropped > 0 {
 		p.videoOverflowDropCount += dropped
-		// Log on transition (every 1000th drop to bound spam). Persistent
-		// drops here indicate the segmenter is unable to cut — typically
-		// the pacing gate is permanently behind because cumulative per-
-		// segment dur has drifted ahead of wallclock (V at >1× wallclock,
-		// hard re-anchors not catching it). MPD timeline integrity is
-		// already lost at this point; the drop is the lesser evil.
 		if p.videoOverflowDropCount == 1 || p.videoOverflowDropCount%1000 == 0 {
 			slog.Warn("dash: video frame queue overflow — dropping oldest",
 				"stream_id", p.cfg.StreamID,
@@ -312,8 +336,16 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 			)
 		}
 	}
-	if p.videoInit != nil {
-		p.state.OpenPairingWindow(time.Now())
+	if ooo {
+		p.videoOOOPushCount++
+		if p.videoOOOPushCount == 1 || p.videoOOOPushCount%100 == 0 {
+			slog.Warn("dash: video OOO push (PTSms regressed vs queue tail)",
+				"stream_id", p.cfg.StreamID,
+				"total_ooo", p.videoOOOPushCount,
+				"frame_pts_ms", f.PTSms,
+				"is_idr", f.IsIDR,
+			)
+		}
 	}
 }
 
@@ -344,19 +376,37 @@ func (p *Packager) handleAAC(av *domain.AVPacket) {
 		}
 	}
 	for _, f := range frames {
-		if dropped := p.queue.PushAudio(f); dropped > 0 {
-			p.audioOverflowDropCount += dropped
-			if p.audioOverflowDropCount == 1 || p.audioOverflowDropCount%1000 == 0 {
-				slog.Warn("dash: audio frame queue overflow — dropping oldest",
-					"stream_id", p.cfg.StreamID,
-					"total_dropped", p.audioOverflowDropCount,
-					"queue_after_drop", p.queue.AudioLen(),
-				)
-			}
-		}
+		p.pushAudioWithDiag(f)
 	}
 	if p.audioInit != nil {
 		p.state.OpenPairingWindow(time.Now())
+	}
+}
+
+// pushAudioWithDiag pushes one audio frame to the queue and updates
+// the overflow + OOO diagnostic counters. Extracted from handleAAC so
+// the parent stays under the cognitive-complexity ceiling.
+func (p *Packager) pushAudioWithDiag(f AudioFrame) {
+	dropped, ooo := p.queue.PushAudio(f)
+	if dropped > 0 {
+		p.audioOverflowDropCount += dropped
+		if p.audioOverflowDropCount == 1 || p.audioOverflowDropCount%1000 == 0 {
+			slog.Warn("dash: audio frame queue overflow — dropping oldest",
+				"stream_id", p.cfg.StreamID,
+				"total_dropped", p.audioOverflowDropCount,
+				"queue_after_drop", p.queue.AudioLen(),
+			)
+		}
+	}
+	if ooo {
+		p.audioOOOPushCount++
+		if p.audioOOOPushCount == 1 || p.audioOOOPushCount%100 == 0 {
+			slog.Warn("dash: audio OOO push (PTSms regressed vs queue tail)",
+				"stream_id", p.cfg.StreamID,
+				"total_ooo", p.audioOOOPushCount,
+				"frame_pts_ms", f.PTSms,
+			)
+		}
 	}
 }
 
@@ -497,6 +547,8 @@ func (p *Packager) tryCut(now time.Time) {
 		return
 	}
 
+	p.diagAudioStarvation(now, d, haveAudio)
+
 	flushed := p.writeSegments(now, d)
 	if flushed {
 		p.seg.MarkCut(now)
@@ -507,6 +559,52 @@ func (p *Packager) tryCut(now time.Time) {
 		p.trimWindow()
 		p.publishManifest(now)
 	}
+}
+
+// diagAudioStarvation logs a queue snapshot whenever a Cut decision
+// included video but excluded all audio despite frames being queued —
+// the smoking gun for the bac_ninh_raw / test1 / test5 audio-dead bug.
+// Rate-limited to ≤ 1 log/sec/packager so the 50 ms tryCut cadence
+// can't flood the journal. Caller holds p.mu.
+//
+// Outputs include FirstAudio.PTSms, AudioTail.PTSms, FirstVideo.PTSms,
+// VideoTail.PTSms, plus skippedQualifying — the count of audio frames
+// AFTER the cut boundary whose PTSms also satisfied the threshold but
+// were missed by audioCountAtOrBefore's sequential-stop scan. When
+// skippedQualifying > 0, hypothesis 1 (queue non-monotonic) is
+// confirmed; when 0 with FirstAudio.PTSms > FirstVideo.PTSms+segDur,
+// hypothesis 2 (video PTS regression) is more likely.
+func (p *Packager) diagAudioStarvation(now time.Time, d CutDecision, haveAudio bool) {
+	if !haveAudio || d.AudioCount > 0 || p.queue.AudioLen() == 0 {
+		return
+	}
+	p.starvedAudioCutCount++
+	if !p.lastDiagLogAt.IsZero() && now.Sub(p.lastDiagLogAt) < time.Second {
+		return
+	}
+	p.lastDiagLogAt = now
+	aFirst, _ := p.queue.FirstAudio()
+	aTail, _ := p.queue.AudioTailPTSms()
+	vFirst, _ := p.queue.FirstVideo()
+	vTail, _ := p.queue.VideoTailPTSms()
+	// Re-derive a lower-bound cutPTSms_video without re-running the
+	// segmenter: the SegDur target sits at vFirst+SegDur, and Cut's
+	// audio-count uses the PTS of the chosen IDR which is ≥ vFirst+SegDur.
+	threshold := vFirst.PTSms + uint64(p.cfg.SegDur.Milliseconds()) //nolint:gosec
+	_, skipped := p.queue.audioCountAtOrBeforeWithSkip(threshold)
+	slog.Warn("dash: cut excluded all audio despite queue",
+		"stream_id", p.cfg.StreamID,
+		"starved_count", p.starvedAudioCutCount,
+		"audio_len", p.queue.AudioLen(),
+		"audio_first_ms", aFirst.PTSms,
+		"audio_tail_ms", aTail,
+		"video_len", p.queue.VideoLen(),
+		"video_first_ms", vFirst.PTSms,
+		"video_tail_ms", vTail,
+		"video_count_in_decision", d.VideoCount,
+		"audio_skipped_qualifying", skipped,
+		"pairing_truncated", p.pairingTruncated,
+	)
 }
 
 // truncateAtPairingLocked drops frames whose PTSms is earlier than the
