@@ -2513,8 +2513,6 @@
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.updated",
                 "stream.started",
@@ -2543,7 +2541,9 @@
                 "watermark.asset_deleted",
                 "hook.created",
                 "hook.updated",
-                "hook.deleted"
+                "hook.deleted",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2560,8 +2560,6 @@
                 "EventStreamUpdated": "PUT /streams/{code} on existing record"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "PUT /streams/{code} on existing record",
                 "",
@@ -2590,11 +2588,11 @@
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamUpdated",
                 "EventStreamStarted",
@@ -2623,7 +2621,9 @@
                 "EventWatermarkAssetDeleted",
                 "EventHookCreated",
                 "EventHookUpdated",
-                "EventHookDeleted"
+                "EventHookDeleted",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {
@@ -4111,10 +4111,29 @@
                 "restart_count": {
                     "type": "integer"
                 },
+                "status": {
+                    "description": "CURRENT health, not history",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/transcoder.ProfileStatus"
+                        }
+                    ]
+                },
                 "track": {
                     "type": "string"
                 }
             }
+        },
+        "transcoder.ProfileStatus": {
+            "type": "string",
+            "enum": [
+                "healthy",
+                "unhealthy"
+            ],
+            "x-enum-varnames": [
+                "ProfileStatusHealthy",
+                "ProfileStatusUnhealthy"
+            ]
         },
         "transcoder.RuntimeStatus": {
             "type": "object",

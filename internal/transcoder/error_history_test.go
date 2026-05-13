@@ -95,6 +95,53 @@ func TestRuntimeStatus_NotRunning(t *testing.T) {
 	require.False(t, ok)
 }
 
+// Status reflects CURRENT health, not history. A profile with restart_count > 0
+// but not in unhealthyProfiles is "healthy" (recovered after past crashes).
+// One in unhealthyProfiles is "unhealthy" even if restart_count is small.
+func TestRuntimeStatus_StatusReflectsCurrentHealth(t *testing.T) {
+	t.Parallel()
+	sw := &streamWorker{
+		profiles: map[int]*profileWorker{
+			0: {restartCount: 5}, // crashed in the past, currently fine
+			1: {restartCount: 1}, // currently in crash loop
+			2: {restartCount: 0}, // never crashed
+		},
+	}
+	s := &Service{
+		workers: map[domain.StreamCode]*streamWorker{"live": sw},
+		unhealthyProfiles: map[domain.StreamCode]map[int]struct{}{
+			"live": {1: {}},
+		},
+	}
+
+	rt, ok := s.RuntimeStatus("live")
+	require.True(t, ok)
+	require.Len(t, rt.Profiles, 3)
+	require.Equal(t, ProfileStatusHealthy, rt.Profiles[0].Status, "past crashes don't latch status")
+	require.Equal(t, ProfileStatusUnhealthy, rt.Profiles[1].Status, "currently in unhealthy set")
+	require.Equal(t, ProfileStatusHealthy, rt.Profiles[2].Status, "never crashed")
+}
+
+// Snapshot copies the unhealthy set, so flipping a profile to unhealthy AFTER
+// the snapshot was taken must not retroactively change the returned Status.
+func TestRuntimeStatus_StatusIsSnapshotted(t *testing.T) {
+	t.Parallel()
+	sw := &streamWorker{profiles: map[int]*profileWorker{0: {}}}
+	s := &Service{
+		workers:           map[domain.StreamCode]*streamWorker{"live": sw},
+		unhealthyProfiles: map[domain.StreamCode]map[int]struct{}{},
+	}
+
+	rt, ok := s.RuntimeStatus("live")
+	require.True(t, ok)
+	require.Equal(t, ProfileStatusHealthy, rt.Profiles[0].Status)
+
+	// Mark unhealthy after snapshot — already-returned snapshot must
+	// still show healthy because Service copied the set defensively.
+	s.markProfileUnhealthy("live", 0)
+	require.Equal(t, ProfileStatusHealthy, rt.Profiles[0].Status, "stale snapshot stays consistent")
+}
+
 func profileErrMsg(i int) string {
 	return "crash-" + string(rune('0'+i))
 }
