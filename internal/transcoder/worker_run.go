@@ -45,7 +45,7 @@ func (s *Service) runProfileEncoder(
 ) {
 	track := buffer.VideoTrackSlug(profileIndex)
 
-	args, err := buildFFmpegArgs([]Profile{prof}, tc)
+	args, err := buildFFmpegArgs([]Profile{prof}, tc, s.BSFs())
 	if err != nil {
 		slog.Error("transcoder: build ffmpeg args", "stream_code", logStream, "profile", track, "err", err)
 		return

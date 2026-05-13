@@ -213,7 +213,7 @@ func TestRuntime_BuildVideoFilter_FullChain(t *testing.T) {
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			vf := buildVideoFilter(tt.p, tt.tc, tt.enc)
+			vf := buildVideoFilter(tt.p, tt.tc, tt.enc, nil)
 			require.NotEmpty(t, vf, "expected a -vf chain")
 			runFilterChainOnFFmpeg(t, vf)
 		})
@@ -236,7 +236,7 @@ func TestRuntime_UserConfigScenario(t *testing.T) {
 	}
 	for _, p := range rungs {
 		t.Run(buildScenarioName(p), func(t *testing.T) {
-			vf := buildVideoFilter(p, tc, "h264_nvenc")
+			vf := buildVideoFilter(p, tc, "h264_nvenc", nil)
 			require.NotEmpty(t, vf)
 			runFilterChainOnFFmpeg(t, vf)
 		})

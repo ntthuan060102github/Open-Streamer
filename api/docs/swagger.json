@@ -4051,6 +4051,13 @@
         "transcoder.ProbeResult": {
             "type": "object",
             "properties": {
+                "bsfs": {
+                    "description": "BSFs lists bitstream-filter support detected via `ffmpeg -bsfs`.\nBitstream filters operate on already-encoded packets (no frame\npipeline impact), so the arg builders use them as zero-cost\nalternatives to certain `-vf` filters when available. Missing\nany of these falls back gracefully to the legacy filter path.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "boolean"
+                    }
+                },
                 "encoders": {
                     "type": "object",
                     "additionalProperties": {

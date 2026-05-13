@@ -211,14 +211,43 @@ type Service struct {
 	// until EVERY failing profile has recovered.
 	healthMu          sync.Mutex
 	unhealthyProfiles map[domain.StreamCode]map[int]struct{}
+
+	// bsfs holds the bitstream-filter subset of ProbeResult.BSFs that
+	// the arg builders consult to decide between fast-path emission
+	// (e.g. `-bsf:v h264_metadata=sample_aspect_ratio=…`) and legacy
+	// `-vf setsar=…` filtering. Empty map (no probe / probe failed)
+	// makes every "is BSF available" check return false → fall back to
+	// legacy emission. Held under s.mu like cfg.
+	bsfs map[string]bool
+}
+
+// BSFs returns a snapshot of the bitstream filters detected on the
+// active FFmpeg binary. Safe to call concurrently.
+func (s *Service) BSFs() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]bool, len(s.bsfs))
+	for k, v := range s.bsfs {
+		out[k] = v
+	}
+	return out
 }
 
 // New creates a Service and registers it with the DI injector.
+//
+// Boot-time FFmpeg capability inventory is reused: cmd/server already
+// ran transcoder.Probe at startup. Re-probing here would burn the same
+// 5+ seconds of sub-invocations for no new information, so we look up
+// the result via DI when present (do.Invoke gracefully returns the
+// zero value when nobody provided one — tests, library embeds). The
+// arg builders treat an absent / empty BSF map as "feature unavailable
+// → use legacy filter path", which keeps every codepath safe.
 func New(i do.Injector) (*Service, error) {
 	cfg := do.MustInvoke[config.TranscoderConfig](i)
 	buf := do.MustInvoke[*buffer.Service](i)
 	bus := do.MustInvoke[events.Bus](i)
 	m := do.MustInvoke[*metrics.Metrics](i)
+	probeRes, _ := do.Invoke[*ProbeResult](i)
 
 	return &Service{
 		cfg:               cfg,
@@ -227,7 +256,23 @@ func New(i do.Injector) (*Service, error) {
 		m:                 m,
 		workers:           make(map[domain.StreamCode]*streamWorker),
 		unhealthyProfiles: make(map[domain.StreamCode]map[int]struct{}),
+		bsfs:              bsfMapFromProbe(probeRes),
 	}, nil
+}
+
+// bsfMapFromProbe returns a defensive copy of probeRes.BSFs, or an
+// empty map when probeRes is nil. Callers store the result on Service
+// and pass to arg builders — copying isolates Service from later
+// mutation of the shared ProbeResult.
+func bsfMapFromProbe(probeRes *ProbeResult) map[string]bool {
+	if probeRes == nil || len(probeRes.BSFs) == 0 {
+		return map[string]bool{}
+	}
+	out := make(map[string]bool, len(probeRes.BSFs))
+	for k, v := range probeRes.BSFs {
+		out[k] = v
+	}
+	return out
 }
 
 // SetUnhealthyCallback registers a function the Service calls the
@@ -367,8 +412,33 @@ func (s *Service) dropHealthState(streamID domain.StreamCode) {
 // (half-old, half-new) config.
 func (s *Service) SetConfig(cfg config.TranscoderConfig) {
 	s.mu.Lock()
+	pathChanged := s.cfg.FFmpegPath != cfg.FFmpegPath
 	s.cfg = cfg
 	s.mu.Unlock()
+
+	// Re-probe only when the FFmpeg path itself changes. Capability
+	// detection costs ~5 seconds of sub-invocations in the worst case,
+	// and the typical SetConfig caller (runtime.Manager applying a
+	// /config POST) hot-swaps fields like watermarks or codec args
+	// without touching the binary. Probing every SetConfig would
+	// serialise those otherwise-fast hot-swaps behind FFmpeg startup.
+	//
+	// Failure is non-fatal: an empty BSF map flips arg builders back to
+	// the setsar / legacy paths, which keep producing identical output
+	// (only at higher GPU cost on hardware pipelines).
+	if pathChanged {
+		// Empty hws slice asks Probe to inspect every backend's
+		// optional encoder set — Service only needs the BSFs subset
+		// of the result, so the encoder coverage doesn't affect us.
+		res, err := Probe(context.Background(), cfg.FFmpegPath, nil)
+		s.mu.Lock()
+		if err != nil {
+			s.bsfs = map[string]bool{}
+		} else {
+			s.bsfs = bsfMapFromProbe(res)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // Config returns a snapshot of the currently active transcoder config.

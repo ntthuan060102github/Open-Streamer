@@ -1997,6 +1997,16 @@ definitions:
     type: object
   transcoder.ProbeResult:
     properties:
+      bsfs:
+        additionalProperties:
+          type: boolean
+        description: |-
+          BSFs lists bitstream-filter support detected via `ffmpeg -bsfs`.
+          Bitstream filters operate on already-encoded packets (no frame
+          pipeline impact), so the arg builders use them as zero-cost
+          alternatives to certain `-vf` filters when available. Missing
+          any of these falls back gracefully to the legacy filter path.
+        type: object
       encoders:
         additionalProperties:
           additionalProperties:

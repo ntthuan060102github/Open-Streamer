@@ -65,7 +65,7 @@ func (s *Service) runStreamEncoder(
 		profiles[i] = t.Profile
 	}
 
-	args, err := buildMultiOutputArgs(profiles, tc)
+	args, err := buildMultiOutputArgs(profiles, tc, s.BSFs())
 	if err != nil {
 		slog.Error("transcoder: multi-output: build args failed",
 			"stream_code", logStream, "err", err)

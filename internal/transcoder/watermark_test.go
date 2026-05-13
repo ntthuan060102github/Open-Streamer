@@ -397,7 +397,7 @@ func TestBuildFFmpegArgsAppliesWatermark(t *testing.T) {
 			Enabled: true, Type: domain.WatermarkTypeText, Text: "WM",
 		},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Width: 1280, Height: 720, Bitrate: "1500k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Width: 1280, Height: 720, Bitrate: "1500k"}}, tc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestBuildMultiOutputArgsAppliesWatermarkPerOutput(t *testing.T) {
 	args, err := buildMultiOutputArgs([]Profile{
 		{Width: 1920, Height: 1080, Bitrate: "4500k"},
 		{Width: 1280, Height: 720, Bitrate: "2500k"},
-	}, tc)
+	}, tc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +456,7 @@ func TestBuildMultiOutputArgsResizesPerOutput(t *testing.T) {
 	args, err := buildMultiOutputArgs([]Profile{
 		{Width: 1920, Height: 1080, Bitrate: "4500k"},
 		{Width: 1280, Height: 720, Bitrate: "2500k"},
-	}, tc)
+	}, tc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ func TestBuildFFmpegArgsResizesAgainstLadder(t *testing.T) {
 		},
 	}
 	// Building args for the SMALLER profile (single-output ffmpeg per profile).
-	args, err := buildFFmpegArgs([]Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Width: 1280, Height: 720, Bitrate: "2500k"}}, tc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

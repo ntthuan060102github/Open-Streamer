@@ -48,7 +48,7 @@ func TestScenario_BothCopy_EmitsCopyForBothStreams(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Copy: true},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc, nil)
 	require.NoError(t, err)
 
 	cv := allArgsAfter(args, "-c:v")
@@ -74,7 +74,7 @@ func TestScenario_VideoCopy_AudioReencodeAAC(t *testing.T) {
 			SampleRate: 48000, Channels: 2,
 		},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "copy", argAfter(args, "-c:v"))
@@ -90,7 +90,7 @@ func TestScenario_VideoCopy_AudioReencodeEAC3(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Codec: domain.AudioCodecEAC3, Bitrate: 256},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "copy", argAfter(args, "-c:v"))
 	require.Equal(t, "eac3", argAfter(args, "-c:a"))
@@ -103,7 +103,7 @@ func TestScenario_VideoCopy_AudioReencodeMP3(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Codec: domain.AudioCodecMP3, Bitrate: 128},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "libmp3lame", argAfter(args, "-c:a"))
 	require.Equal(t, "128k", argAfter(args, "-b:a"))
@@ -115,7 +115,7 @@ func TestScenario_VideoCopy_AudioReencodeAC3(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Codec: domain.AudioCodecAC3, Bitrate: 384},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "ac3", argAfter(args, "-c:a"))
 	require.Equal(t, "384k", argAfter(args, "-b:a"))
@@ -128,7 +128,7 @@ func TestScenario_VideoCopy_AudioReencodeDefaults(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{}, // copy=false, codec=""
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "copy", argAfter(args, "-c:v"))
 	require.Equal(t, "aac", argAfter(args, "-c:a"))
@@ -147,7 +147,7 @@ func TestScenario_VideoReencodeNoHW_AudioCopy_EmptyCodecRoutesLibx264(t *testing
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "libx264", argAfter(args, "-c:v"),
@@ -173,7 +173,7 @@ func TestScenario_VideoReencodeNVENC_AudioCopy_EmptyCodecRoutesH264NVENC(t *test
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{{Width: 1920, Height: 1080, Bitrate: "4500k"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"),
@@ -196,7 +196,7 @@ func TestScenario_VideoReencodeNVENC_HEVC_RoutesHEVCNVENC(t *testing.T) {
 		Width: 1920, Height: 1080, Bitrate: "3500k",
 		Codec: "h265", Preset: "p5",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "hevc_nvenc", argAfter(args, "-c:v"))
 	require.Equal(t, "p5", argAfter(args, "-preset"))
@@ -215,7 +215,7 @@ func TestScenario_VideoReencodeNoHW_AudioCopy_ExplicitH264Preserved(t *testing.T
 		Width: 1280, Height: 720, Bitrate: "2500k",
 		Codec: "h264", Preset: "veryfast",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "libx264", argAfter(args, "-c:v"))
 	require.Equal(t, "veryfast", argAfter(args, "-preset"))
@@ -234,7 +234,7 @@ func TestScenario_ExplicitNVENCEncoder_PreservedRegardlessOfHW(t *testing.T) {
 		Width: 1280, Height: 720, Bitrate: "2500k",
 		Codec: "h264_nvenc", Preset: "p4",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"),
 		"explicit nvenc encoder must pass through even when global HW=none")
@@ -258,7 +258,7 @@ func TestScenario_FullReencodeNVENC(t *testing.T) {
 		MaxBitrate: 7500, Framerate: 30,
 		Preset: "p5", CodecProfile: "high", CodecLevel: "4.1",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"))
@@ -289,7 +289,7 @@ func TestScenario_FullReencodeNoHW_DefaultsBothSides(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "libx264", argAfter(args, "-c:v"))
 	require.Equal(t, "2500k", argAfter(args, "-b:v"))
@@ -313,7 +313,7 @@ func TestScenario_ProfileCodecCopyWithVideoCopyFalse(t *testing.T) {
 	// fallthrough and returns "libx264" rather than emitting "copy" alongside
 	// preset/bitrate args (which FFmpeg would reject).
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "copy"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	cv := argAfter(args, "-c:v")
 	require.NotEqual(t, "copy", cv,
@@ -338,7 +338,7 @@ func TestScenario_MultipleProfiles_OnlyFirstUsed(t *testing.T) {
 		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "p4", ResizeMode: string(domain.ResizeModeFit)},
 		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264", Preset: "p3", ResizeMode: string(domain.ResizeModeFit)},
 	}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "4500k", argAfter(args, "-b:v"),
@@ -368,7 +368,7 @@ func TestScenario_KeyframeIntervalDerivesGOP(t *testing.T) {
 		Codec: "h264", Preset: "p5",
 		KeyframeInterval: 2, Framerate: 30,
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "60", argAfter(args, "-g"), "2s × 30fps = 60-frame GOP")
 	require.Equal(t, "30", argAfter(args, "-keyint_min"))
@@ -383,7 +383,7 @@ func TestScenario_GlobalFPSFallback(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone, FPS: 25},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "25", argAfter(args, "-r"),
 		"profile framerate empty → Global.FPS as integer -r")
@@ -400,7 +400,7 @@ func TestScenario_FullReencode_AudioNormalize(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "fast"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	af := argAfter(args, "-af")
 	require.Contains(t, af, "loudnorm=I=-23:LRA=7:TP=-2",
@@ -417,7 +417,7 @@ func TestScenario_NoScaleWhenDimensionsZero(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{{Bitrate: "3000k", Codec: "h264", Preset: "p4"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.NotContains(t, args, "-vf",
 		"no -vf when both width and height are 0")
@@ -433,7 +433,7 @@ func TestScenario_NoMaxrateWhenUnset(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "fast"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.NotContains(t, args, "-maxrate")
 	require.NotContains(t, args, "-bufsize")
@@ -447,7 +447,7 @@ func TestScenario_PipeIOContract(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Copy: true},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "pipe:0", argAfter(args, "-i"))
 	require.Equal(t, "mpegts", argAfter(args, "-f"),
@@ -468,7 +468,7 @@ func TestScenario_ExtraArgsAppendedBeforeOutput(t *testing.T) {
 		Audio:     domain.AudioTranscodeConfig{Copy: true},
 		ExtraArgs: []string{"-muxdelay", "0", "-mpegts_flags", "+resend_headers"},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "0", argAfter(args, "-muxdelay"))
 	require.Equal(t, "+resend_headers", argAfter(args, "-mpegts_flags"))
@@ -483,7 +483,7 @@ func TestScenario_MapFlagsAllowMissingStreams(t *testing.T) {
 		Video: domain.VideoTranscodeConfig{Copy: true},
 		Audio: domain.AudioTranscodeConfig{Copy: true},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "2500k"}}, tc, nil)
 	require.NoError(t, err)
 	maps := allArgsAfter(args, "-map")
 	require.Contains(t, maps, "0:v:0?")
@@ -516,7 +516,7 @@ func TestScenario_NVENC_FullGPUPipeline(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	// 1. hwaccel flags must appear before -i (input option, not output option).
@@ -555,7 +555,7 @@ func TestScenario_NVENC_HEVC_FullGPUPipeline(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{{Width: 1920, Height: 1080, Bitrate: "3500k", Codec: "h265", ResizeMode: string(domain.ResizeModeFit)}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "cuda", argAfter(args, "-hwaccel"))
 	require.Equal(t, "cuda", argAfter(args, "-hwaccel_output_format"))
@@ -580,7 +580,7 @@ func TestScenario_NVENC_ExplicitLibx264_KeepsCPUPipeline(t *testing.T) {
 		Width: 1280, Height: 720, Bitrate: "2500k",
 		Codec: "libx264", Preset: "veryfast",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "libx264", argAfter(args, "-c:v"))
@@ -601,7 +601,7 @@ func TestScenario_NVENC_VideoCopy_NoHWAccel(t *testing.T) {
 		Audio:  domain.AudioTranscodeConfig{Codec: domain.AudioCodecAAC, Bitrate: 128},
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
-	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc)
+	args, err := buildFFmpegArgs([]Profile{{Bitrate: "ignored"}}, tc, nil)
 	require.NoError(t, err)
 	require.NotContains(t, args, "-hwaccel",
 		"video.copy=true skips decode — hwaccel context init is wasted")
@@ -618,7 +618,7 @@ func TestScenario_NoHW_NoHWAccelFlags(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNone},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", ResizeMode: string(domain.ResizeModeFit)}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.NotContains(t, args, "-hwaccel")
 	require.NotContains(t, args, "-hwaccel_output_format")
@@ -634,7 +634,7 @@ func TestScenario_VAAPI_FullGPUPipeline(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelVAAPI},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264_vaapi"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "vaapi", argAfter(args, "-hwaccel"))
 	require.Equal(t, "vaapi", argAfter(args, "-hwaccel_output_format"))
@@ -651,7 +651,7 @@ func TestScenario_QSV_FullGPUPipeline(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelQSV},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264_qsv"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "qsv", argAfter(args, "-hwaccel"))
 	require.Equal(t, "qsv", argAfter(args, "-hwaccel_output_format"))
@@ -670,7 +670,7 @@ func TestScenario_VideoToolbox_HWAccelButCPUScale(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelVideoToolbox},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264_videotoolbox"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	require.Equal(t, "videotoolbox", argAfter(args, "-hwaccel"))
 	require.NotContains(t, args, "-hwaccel_output_format",
@@ -689,7 +689,7 @@ func TestScenario_NVENC_HWAccelOrderingBeforeInput(t *testing.T) {
 		Global: domain.TranscoderGlobalConfig{HW: domain.HWAccelNVENC},
 	}
 	p := []Profile{{Width: 1920, Height: 1080, Bitrate: "4500k"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	iIdx := inputIdx(t, args)
@@ -728,7 +728,7 @@ func TestScenario_NVENC_FullProfile_AllNewFields(t *testing.T) {
 		SAR:        "1:1",
 		ResizeMode: string(domain.ResizeModeFit),
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"))
@@ -763,7 +763,7 @@ func TestScenario_NVENC_BframesPositive_EnablesBRefMode(t *testing.T) {
 		Codec: "h264", Preset: "p5",
 		Bframes: &bf,
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "3", argAfter(args, "-bf"))
@@ -783,7 +783,7 @@ func TestScenario_CPU_PadModeProducesPadFilter(t *testing.T) {
 		Codec: "h264", Preset: "fast",
 		ResizeMode: string(domain.ResizeModePad),
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := argAfter(args, "-vf")
 	require.Contains(t, vf, "scale=1280:720:")
@@ -801,7 +801,7 @@ func TestScenario_CPU_CropMode_HasNoPad(t *testing.T) {
 		Codec: "h264", Preset: "fast",
 		ResizeMode: string(domain.ResizeModeCrop),
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := argAfter(args, "-vf")
 	require.Contains(t, vf, "scale=1280:720:force_original_aspect_ratio=increase")
@@ -826,7 +826,7 @@ func TestScenario_NVENC_CropMode_DegradesToFitOnGPU(t *testing.T) {
 		Codec: "h264", Preset: "p4",
 		ResizeMode: string(domain.ResizeModeCrop),
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "h264_nvenc", argAfter(args, "-c:v"))
@@ -850,7 +850,7 @@ func TestScenario_NVENC_StretchMode_NoPadOrAspect(t *testing.T) {
 		Codec: "h264", Preset: "p4",
 		ResizeMode: string(domain.ResizeModeStretch),
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := argAfter(args, "-vf")
 	require.Equal(t, "scale_cuda=1280:720", vf,
@@ -870,7 +870,7 @@ func TestScenario_Interlace_AppliesToEveryProfileIndependently(t *testing.T) {
 		{Width: 1280, Height: 720, Bitrate: "2500k", Codec: "h264", Preset: "fast"},
 		{Width: 854, Height: 480, Bitrate: "1200k", Codec: "h264", Preset: "fast"},
 	} {
-		args, err := buildFFmpegArgs([]Profile{p}, tc)
+		args, err := buildFFmpegArgs([]Profile{p}, tc, nil)
 		require.NoError(t, err)
 		vf := argAfter(args, "-vf")
 		require.Contains(t, vf, "yadif=mode=0:parity=-1:deint=0")
@@ -888,7 +888,7 @@ func TestScenario_InterlaceProgressive_SkipsFilter(t *testing.T) {
 	p := []Profile{{
 		Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast",
 	}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 	vf := argAfter(args, "-vf")
 	require.NotContains(t, vf, "yadif")
@@ -905,7 +905,7 @@ func TestScenario_NewFields_NoneSet_NoExtraArgs(t *testing.T) {
 		Audio: domain.AudioTranscodeConfig{Copy: true},
 	}
 	p := []Profile{{Width: 1280, Height: 720, Bitrate: "2000k", Codec: "h264", Preset: "fast"}}
-	args, err := buildFFmpegArgs(p, tc)
+	args, err := buildFFmpegArgs(p, tc, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, "", argAfter(args, "-bf"))

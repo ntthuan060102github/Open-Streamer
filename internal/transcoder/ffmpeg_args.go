@@ -10,7 +10,12 @@ import (
 
 // buildFFmpegArgs builds FFmpeg CLI arguments: read MPEG-TS from stdin, write MPEG-TS to stdout.
 // When multiple profiles are provided, only the first is used for the single stdout ladder slot.
-func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string, error) {
+//
+// bsfs is the bitstream-filter feature map from transcoder.Probe. Pass
+// nil (or an empty map) when probe state is unknown — the builder falls
+// back to legacy `-vf setsar` emission for SAR. See sarBSFArg for the
+// rationale.
+func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig, bsfs map[string]bool) ([]string, error) {
 	if tc == nil {
 		tc = &domain.TranscoderConfig{}
 	}
@@ -51,11 +56,14 @@ func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string,
 	if tc.Video.Copy {
 		args = append(args, "-c:v", "copy")
 	} else {
-		vf := buildVideoFilter(p, tc, videoEnc)
+		vf := buildVideoFilter(p, tc, videoEnc, bsfs)
 		if vf != "" {
 			args = append(args, "-vf", vf)
 		}
 		args = append(args, "-c:v", videoEnc)
+		if bsfArg, ok := sarBSFArg(p.SAR, videoEnc, bsfs); ok {
+			args = append(args, "-bsf:v", bsfArg)
+		}
 		if preset := normalizePreset(p.Preset, videoEnc); preset != "" {
 			args = append(args, "-preset", preset)
 		}
@@ -112,7 +120,10 @@ func buildFFmpegArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string,
 // Returns args ready for exec.Command. Returns error if profiles is empty
 // or if any profile is video.copy=true (copy mode bypasses the shared
 // decode and would force a separate pass — not supported in multi-output).
-func buildMultiOutputArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]string, error) {
+//
+// bsfs is the bitstream-filter feature map from transcoder.Probe — see
+// buildFFmpegArgs for the fallback behaviour when nil/empty.
+func buildMultiOutputArgs(profiles []Profile, tc *domain.TranscoderConfig, bsfs map[string]bool) ([]string, error) {
 	if tc == nil {
 		tc = &domain.TranscoderConfig{}
 	}
@@ -155,11 +166,14 @@ func buildMultiOutputArgs(profiles []Profile, tc *domain.TranscoderConfig) ([]st
 		// Video mapping for this output.
 		args = append(args, "-map", "0:v:0?")
 		videoEnc := normalizeVideoEncoder(p.Codec, tc.Global.HW)
-		vf := buildVideoFilter(p, tc, videoEnc)
+		vf := buildVideoFilter(p, tc, videoEnc, bsfs)
 		if vf != "" {
 			args = append(args, "-vf:v:0", vf)
 		}
 		args = append(args, "-c:v:0", videoEnc)
+		if bsfArg, ok := sarBSFArg(p.SAR, videoEnc, bsfs); ok {
+			args = append(args, "-bsf:v:0", bsfArg)
+		}
 		if preset := normalizePreset(p.Preset, videoEnc); preset != "" {
 			args = append(args, "-preset:v:0", preset)
 		}
@@ -267,7 +281,7 @@ func hwInputArgs(hw domain.HWAccel, encoder string) []string {
 // overlay always run on CPU frames (drawtext is CPU-only and overlay_cuda
 // isn't shipped with stock distro builds), so on GPU pipelines we wrap the
 // watermark with hwdownload / hwupload_cuda.
-func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) string {
+func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string, bsfs map[string]bool) string {
 	hw := tc.Global.HW
 	_, onGPU := gpuScaleFilterName(hw, encoder)
 
@@ -278,8 +292,14 @@ func buildVideoFilter(p Profile, tc *domain.TranscoderConfig, encoder string) st
 	if rs := resizeFilter(p.Width, p.Height, p.ResizeMode, hw, encoder); rs != "" {
 		chain = append(chain, rs)
 	}
+	// Prefer the bitstream-filter path for SAR when the runtime FFmpeg
+	// supports it: that avoids inserting a CPU-only setsar node into a
+	// hardware pipeline (would force a GPU↔CPU round-trip per frame).
+	// Caller emits `-bsf:v` separately; we just suppress the filter here.
 	if p.SAR != "" {
-		chain = append(chain, "setsar="+p.SAR)
+		if _, ok := sarBSFArg(p.SAR, encoder, bsfs); !ok {
+			chain = append(chain, "setsar="+p.SAR)
+		}
 	}
 	base := strings.Join(chain, ",")
 

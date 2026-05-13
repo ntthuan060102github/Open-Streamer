@@ -27,8 +27,14 @@ type ProbeResult struct {
 	Encoders map[string]map[string]bool `json:"encoders"`
 	Muxers   map[string]bool            `json:"muxers"`
 	Filters  map[string]bool            `json:"filters,omitempty"`
-	Warnings []string                   `json:"warnings,omitempty"`
-	Errors   []string                   `json:"errors,omitempty"`
+	// BSFs lists bitstream-filter support detected via `ffmpeg -bsfs`.
+	// Bitstream filters operate on already-encoded packets (no frame
+	// pipeline impact), so the arg builders use them as zero-cost
+	// alternatives to certain `-vf` filters when available. Missing
+	// any of these falls back gracefully to the legacy filter path.
+	BSFs     map[string]bool `json:"bsfs,omitempty"`
+	Warnings []string        `json:"warnings,omitempty"`
+	Errors   []string        `json:"errors,omitempty"`
 }
 
 // Required capability sets — missing any of these means OK=false.
@@ -67,6 +73,22 @@ var optionalFilters = []string{
 	"hwdownload",
 	"hwupload_cuda",
 	"colorchannelmixer",
+}
+
+// optionalBSFs are bitstream filters the arg builders use as fast-path
+// alternatives to certain video filters. Missing any falls back to the
+// legacy `-vf` path with no functional change — only a performance hit
+// on hardware pipelines that have to round-trip frames through CPU.
+//
+//   - h264_metadata / hevc_metadata: rewrite VUI fields (incl.
+//     sample_aspect_ratio) on the encoded bitstream so the arg
+//     builder doesn't need a `-vf setsar=…` pass. Without these,
+//     setsar forces a GPU→CPU→GPU round-trip per frame on NVENC /
+//     VAAPI pipelines (no _cuda / _vaapi variant of setsar exists).
+//     Merged in FFmpeg 4.0 (April 2018).
+var optionalBSFs = []string{
+	"h264_metadata",
+	"hevc_metadata",
 }
 
 // hwOptionalEncoders maps a hardware backend to the video encoders that
@@ -195,6 +217,7 @@ func Probe(ctx context.Context, path string, hws []domain.HWAccel) (*ProbeResult
 		Encoders: make(map[string]map[string]bool, 2),
 		Muxers:   make(map[string]bool, len(requiredMuxers)+len(optionalMuxers)),
 		Filters:  make(map[string]bool, len(optionalFilters)),
+		BSFs:     make(map[string]bool, len(optionalBSFs)),
 	}
 	res.Encoders["required"] = make(map[string]bool, len(requiredEncoders))
 	res.Encoders["optional"] = make(map[string]bool, len(optionalEncoders))
@@ -222,6 +245,14 @@ func Probe(ctx context.Context, path string, hws []domain.HWAccel) (*ProbeResult
 	if err != nil {
 		return nil, fmt.Errorf("list filters: %w", err)
 	}
+	bsfOut, err := runProbe(ctx, path, "-hide_banner", "-bsfs")
+	if err != nil {
+		// -bsfs is supported in every FFmpeg release we care about
+		// (≥ 2.0). A failure here is unusual but non-fatal: leaving
+		// BSFs empty makes every later "is BSF available" check
+		// return false and falls back to the legacy filter path.
+		bsfOut = ""
+	}
 
 	for _, name := range requiredEncoders {
 		res.Encoders["required"][name] = encoderPresent(encOut, name)
@@ -237,6 +268,9 @@ func Probe(ctx context.Context, path string, hws []domain.HWAccel) (*ProbeResult
 	}
 	for _, name := range optionalFilters {
 		res.Filters[name] = filterPresent(filtOut, name)
+	}
+	for _, name := range optionalBSFs {
+		res.BSFs[name] = bsfPresent(bsfOut, name)
 	}
 
 	for _, name := range requiredEncoders {
@@ -267,6 +301,12 @@ func Probe(ctx context.Context, path string, hws []domain.HWAccel) (*ProbeResult
 		if !res.Filters[name] {
 			res.Warnings = append(res.Warnings,
 				fmt.Sprintf("optional filter %q missing — watermark / GPU round-trip configurations using it will fail", name))
+		}
+	}
+	for _, name := range optionalBSFs {
+		if !res.BSFs[name] {
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("optional bsf %q missing — arg builder will fall back to -vf filtering for the corresponding feature (works correctly but loses GPU pipeline efficiency)", name))
 		}
 	}
 
@@ -379,6 +419,28 @@ func filterPresent(out, name string) bool {
 			continue
 		}
 		if fields[1] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// bsfPresent reports whether `ffmpeg -bsfs` lists the given bitstream
+// filter name. The output is a plain one-name-per-line list (optionally
+// indented), with a "Bitstream filters:" header:
+//
+//	Bitstream filters:
+//	aac_adtstoasc
+//	av1_frame_merge
+//	…
+//	h264_metadata
+//	hevc_metadata
+//
+// We match whole tokens (trimmed line == name) so a hypothetical future
+// "h264_metadata_extras" doesn't false-positive h264_metadata.
+func bsfPresent(out, name string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == name {
 			return true
 		}
 	}
