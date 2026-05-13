@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Eyevinn/mp4ff/aac"
+	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/hevc"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -43,7 +45,18 @@ const (
 	dashAudioMediaPattern = "seg_a_$Number%05d$.m4s"
 	dashVideoInitFile     = "init_v.mp4"
 	dashAudioInitFile     = "init_a.mp4"
-	videoPSAccumCap       = 1 << 20 // 1 MiB cap on SPS/PPS accumulator before giving up
+
+	// videoPSAccumCap bounds the accumulator that holds VPS/SPS/PPS
+	// NAL units (Annex-B framed) until BuildH264Init or BuildH265Init
+	// succeeds. Sized to comfortably hold the relevant NAL units for
+	// HEVC (VPS ~30 B + SPS ~80 B + PPS ~10 B) plus a 16× safety
+	// margin — accumulator only ever stores SPS/PPS bytes after the
+	// per-frame extractor was introduced; the cap is now a sanity
+	// guard, never a normal limit. Before the extractor, every frame's
+	// FULL Annex-B bytes were appended, so a single 1080p IDR
+	// (100-200 KB) plus a few P-frames would burst past 1 MiB and the
+	// packager would latch videoPSGivenUp, breaking 1080p ABR shards.
+	videoPSAccumCap = 4 * 1024
 )
 
 // Config carries the per-stream packager configuration.
@@ -410,17 +423,48 @@ func (p *Packager) pushAudioWithDiag(f AudioFrame) {
 	}
 }
 
-// accumulateVideoPS appends Annex-B byte stream to the SPS/PPS buffer,
-// capped at videoPSAccumCap. Latches videoPSGivenUp when the cap is hit
-// without success.
+// accumulateVideoPS scans this frame's Annex-B bytes for parameter-set
+// NAL units (SPS+PPS for H.264; VPS+SPS+PPS for H.265) and appends
+// only THOSE NAL units to p.videoPS — not the full frame bytes.
+//
+// Rationale: a 1080p H.264 IDR is 100-200 KB; a few P-frames between
+// IDR delivery can push the accumulator past the cap before SPS/PPS
+// arrive (root cause of the bac_ninh/track_1 + test_copy/track_1
+// videoPSGivenUp failure observed on production — same source, same
+// transcoder, only the 1080p shard failed because its frame bytes
+// were larger). The extractor keeps videoPS tiny (~hundreds of bytes
+// of NAL data) so cap pressure never fires under normal operation.
+//
+// Cap is still enforced as an OOM safety net for a degenerate stream
+// that emits SPS/PPS-shaped garbage every frame.
 func (p *Packager) accumulateVideoPS(annexB []byte) {
-	if len(p.videoPS)+len(annexB) > videoPSAccumCap {
+	psBuf := annexB4To3(annexB)
+	var nals [][]byte
+	if p.isHEVC {
+		vpss, spss, ppss := hevc.GetParameterSetsFromByteStream(psBuf)
+		nals = append(nals, vpss...)
+		nals = append(nals, spss...)
+		nals = append(nals, ppss...)
+	} else {
+		spss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_SPS, psBuf, false)
+		ppss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_PPS, psBuf, false)
+		nals = append(nals, spss...)
+		nals = append(nals, ppss...)
+	}
+	for _, n := range nals {
+		// Append in 4-byte Annex-B framed form so ExtractParameterSets
+		// (which expects an Annex-B byte stream) finds them later.
+		p.videoPS = append(p.videoPS, 0x00, 0x00, 0x00, 0x01)
+		p.videoPS = append(p.videoPS, n...)
+	}
+	if len(p.videoPS) > videoPSAccumCap {
 		p.videoPSGivenUp = true
 		slog.Warn("dash: videoPS cap exceeded without init — giving up video",
-			"stream_id", p.cfg.StreamID, "cap_bytes", videoPSAccumCap)
-		return
+			"stream_id", p.cfg.StreamID,
+			"cap_bytes", videoPSAccumCap,
+			"accumulator_len", len(p.videoPS),
+		)
 	}
-	p.videoPS = append(p.videoPS, annexB...)
 }
 
 // tryBuildVideoInit attempts to build the H.264 or H.265 init segment
@@ -542,7 +586,19 @@ func (p *Packager) tryCut(now time.Time) {
 		return
 	}
 
-	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio)
+	// Pass audioSR to the segmenter so V/A duration coupling works:
+	// the segmenter computes targetA = round(V_dur_ms × sr / 1024 / 1000)
+	// and either pops exactly that many audio frames (= V dur matches
+	// A dur per cut) or holds the cut until audio catches up. Skip the
+	// coupling (audioSR=0) when this shard doesn't pack audio — those
+	// shards' audio frames are popped & discarded, so the count-by-PTS
+	// legacy path is fine and we don't want to hold V cuts on missing
+	// audio.
+	var audioSR uint64
+	if p.audioInit != nil && p.cfg.PackAudio {
+		audioSR = uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0
+	}
+	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio, audioSR)
 	if !d.Ok {
 		return
 	}

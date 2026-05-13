@@ -100,13 +100,16 @@ type CutDecision struct {
 //  3. Audio-only stream (no video init / no video frames): cut on
 //     audio span ≥ segDur.
 //  4. Otherwise: hold.
-func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool) CutDecision {
+//
+// audioSR is the audio sample rate (Hz). 0 if audio isn't packed —
+// then the V/A coordination math is skipped and AudioCount stays 0.
+func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool, audioSR uint64) CutDecision {
 	segDurMS := uint64(s.segDur.Milliseconds()) //nolint:gosec // segDur > 0 by construction
 	maxElapsedMS := segDurMS * uint64(s.maxFactor)
 
 	switch {
 	case haveVideo && q.VideoLen() > 0:
-		return s.cutVideo(now, q, segDurMS, maxElapsedMS, haveAudio)
+		return s.cutVideo(now, q, segDurMS, maxElapsedMS, haveAudio, audioSR)
 	case haveAudio && q.AudioLen() > 0:
 		return s.cutAudioOnly(q, segDurMS)
 	}
@@ -116,10 +119,10 @@ func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool)
 // cutVideo handles the dual-track or video-only stream. Returns the
 // IDR-aligned cut when possible, the safety-net cut when wallclock has
 // run out, or {Ok:false} when more content is needed.
-func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedMS uint64, haveAudio bool) CutDecision {
+func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedMS uint64, haveAudio bool, audioSR uint64) CutDecision {
 	idx := s.findIDRCutPoint(q, segDurMS)
 	if idx >= 0 {
-		return s.buildCutDecision(q, idx, haveAudio, true)
+		return s.buildCutDecision(q, idx, haveAudio, true, audioSR)
 	}
 
 	// Safety-net: enough wallclock elapsed since last cut without an
@@ -128,14 +131,14 @@ func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedM
 	if !s.lastCut.IsZero() {
 		elapsed := now.Sub(s.lastCut).Milliseconds()
 		if elapsed > 0 && uint64(elapsed) >= maxElapsedMS { //nolint:gosec // bounded by branch above
-			return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false)
+			return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false, audioSR)
 		}
 	}
 	// Cold-start safety-net: lastCut is zero (first cut ever). Allow
 	// the queue to grow up to maxElapsedMS of PTS span before forcing
 	// a cut; before that, wait for an IDR.
 	if s.lastCut.IsZero() && q.VideoSpanMS() >= maxElapsedMS {
-		return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false)
+		return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false, audioSR)
 	}
 	return CutDecision{}
 }
@@ -184,19 +187,54 @@ func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 	return -1
 }
 
-// buildCutDecision packages the cut-up-to-frame-N answer.
-func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio bool, idrAligned bool) CutDecision {
+// buildCutDecision packages the cut-up-to-frame-N answer. For a V+A
+// stream, AudioCount is COUPLED to V's emitted duration so the
+// per-segment V/A durations match in time-domain — the cure for the
+// bac_ninh_raw 8 s / test2 4 s baked-in drift bug:
+//
+//   - V's emitted ms = (nextPTSms − first.PTSms) if a next frame is
+//     queued; else (cutPTSms − first.PTSms).
+//   - Target audio frames = round(V_ms × audioSR / 1024 / 1000); each
+//     AAC frame is exactly 1024 samples.
+//   - If the audio queue holds at least that many frames, AudioCount =
+//     the target, and writeAudioSegment's dur math (N × 1024 ticks)
+//     produces exactly the same time-domain duration as V's segment.
+//   - If the audio queue is short, return Ok=false to HOLD the cut —
+//     the next tick (50 ms) will retry. Stable-state sources never
+//     trigger the hold; only catch-up bursts on HLS-pull / file
+//     sources need it, and there only at startup.
+//
+// audioSR == 0 means caller wants the legacy count-by-PTS path (audio
+// isn't packed in this shard); aCount stays at 0.
+func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio bool, idrAligned bool, audioSR uint64) CutDecision {
 	if lastVideoIdx < 0 {
 		return CutDecision{}
 	}
 	vCount := lastVideoIdx + 1
-	cutPTSms, _ := q.videoPTSAt(lastVideoIdx)
 	aCount := 0
-	if haveAudio {
-		// Include audio frames whose PTSms is ≤ the cut PTS plus one
-		// frame of slack, so the audio segment spans the same wallclock
-		// window as the video segment.
-		aCount = q.audioCountAtOrBefore(cutPTSms)
+	if haveAudio && audioSR > 0 {
+		first, ok1 := q.FirstVideo()
+		if !ok1 {
+			return CutDecision{}
+		}
+		nextPTSms, hasNext := q.videoPTSAt(vCount)
+		var vDurMs uint64
+		if hasNext && nextPTSms > first.PTSms {
+			vDurMs = nextPTSms - first.PTSms
+		} else if cutPTSms, ok := q.videoPTSAt(lastVideoIdx); ok && cutPTSms > first.PTSms {
+			vDurMs = cutPTSms - first.PTSms
+		}
+		if vDurMs > 0 {
+			targetA := int(vDurMs * audioSR / 1024 / 1000) //nolint:gosec
+			if q.AudioLen() < targetA {
+				// Hold cut — audio queue hasn't caught up to V's range.
+				// Next tick retries. Without this hold, V and A would
+				// emit different durations and sequential tfdt would
+				// bake permanent drift.
+				return CutDecision{}
+			}
+			aCount = targetA
+		}
 	}
 	return CutDecision{
 		Ok:           true,
@@ -207,14 +245,30 @@ func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio 
 }
 
 // cutAudioOnly handles audio-only streams. Cuts when audio span >= segDur.
+//
+// Audio-segment size is bounded to ONE segDur worth of frames so the
+// emitted MPD <S d=…> stays close to the operator-configured target
+// (vs the entire queue, which can be up to maxQueueSpanMs = 30 s of
+// audio after a startup burst — that produced 28-second audio
+// segments on bac_ninh / test_copy ABR audio shards when the video
+// queue happened to drain between V cuts and cutAudioOnly fired).
+//
+// Returns Ok=true with AudioCount = the number of frames whose
+// PTSms ≤ first.PTSms + segDurMS, guaranteeing forward progress
+// even when the queue has only the first frame.
 func (s *Segmenter) cutAudioOnly(q *FrameQueue, segDurMS uint64) CutDecision {
-	if q.AudioSpanMS() < segDurMS {
+	first, ok := q.FirstAudio()
+	if !ok || q.AudioSpanMS() < segDurMS {
 		return CutDecision{}
+	}
+	count := q.audioCountAtOrBefore(first.PTSms + segDurMS)
+	if count == 0 {
+		count = 1 // guarantee forward progress; should not normally hit
 	}
 	return CutDecision{
 		Ok:           true,
 		VideoCount:   0,
-		AudioCount:   q.AudioLen(),
+		AudioCount:   count,
 		IsIDRAligned: true, // audio-only is always cleanly cuttable
 	}
 }

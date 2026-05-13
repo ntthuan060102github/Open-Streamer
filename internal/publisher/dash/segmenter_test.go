@@ -42,7 +42,7 @@ func TestCut_BelowSegDurHolds(t *testing.T) {
 	// 1 s of video (25 frames @ 40 ms) — below 2 s target.
 	fillVideo(q, 25, 40, 25)
 
-	d := s.Cut(time.Now(), q, true, true)
+	d := s.Cut(time.Now(), q, true, true, 44100)
 	if d.Ok {
 		t.Fatalf("expected no cut on 1s content (segDur=2s), got %+v", d)
 	}
@@ -59,7 +59,7 @@ func TestCut_AtIDRBoundary(t *testing.T) {
 	fillVideo(q, 75, 40, 25)
 	fillAudio(q, 100, 23) // plenty of audio
 
-	d := s.Cut(time.Now(), q, true, true)
+	d := s.Cut(time.Now(), q, true, true, 44100)
 	if !d.Ok {
 		t.Fatalf("expected cut, got Ok=false")
 	}
@@ -92,7 +92,7 @@ func TestCut_PrefersFirstIDRPastSegDur(t *testing.T) {
 	// is index 50 (PTS 2000). Cut drains frames 0..50 = 51 frames.
 	fillVideo(q, 100, 40, 25)
 
-	d := s.Cut(time.Now(), q, true, false)
+	d := s.Cut(time.Now(), q, true, false, 0)
 	if !d.Ok || !d.IsIDRAligned {
 		t.Fatalf("expected IDR cut, got %+v", d)
 	}
@@ -122,7 +122,7 @@ func TestCut_NoIDRWaitingForSafetyNet(t *testing.T) {
 	// lastCut is zero (first cut). Span is 4960 ms (124*40). maxFactor=3,
 	// segDur=2s → maxElapsedMS=6000. Span 4960 < 6000 → no cold-start
 	// safety-net yet.
-	d := s.Cut(time.Now(), q, true, false)
+	d := s.Cut(time.Now(), q, true, false, 0)
 	if d.Ok {
 		t.Fatalf("expected hold (span < maxElapsed), got %+v", d)
 	}
@@ -133,7 +133,7 @@ func TestCut_NoIDRWaitingForSafetyNet(t *testing.T) {
 		q.PushVideo(VideoFrame{PTSms: pts, DTSms: pts, IsIDR: false})
 	}
 	// Now span = 199*40 = 7960 ms > 6000 → cold-start safety-net fires.
-	d = s.Cut(time.Now(), q, true, false)
+	d = s.Cut(time.Now(), q, true, false, 0)
 	if !d.Ok {
 		t.Fatal("expected safety-net cut after span exceeds maxElapsed")
 	}
@@ -161,13 +161,13 @@ func TestCut_SafetyNetByElapsedWallclock(t *testing.T) {
 	}
 
 	// Less than 6s elapsed → hold.
-	d := s.Cut(t0.Add(3*time.Second), q, true, false)
+	d := s.Cut(t0.Add(3*time.Second), q, true, false, 0)
 	if d.Ok {
 		t.Fatalf("expected hold (3s < 6s deadline), got %+v", d)
 	}
 
 	// Past the 6s deadline → cut everything.
-	d = s.Cut(t0.Add(7*time.Second), q, true, false)
+	d = s.Cut(t0.Add(7*time.Second), q, true, false, 0)
 	if !d.Ok {
 		t.Fatal("expected wallclock safety-net cut at 7s elapsed")
 	}
@@ -177,27 +177,46 @@ func TestCut_SafetyNetByElapsedWallclock(t *testing.T) {
 }
 
 // TestCut_AudioOnlyStream — no video init at all; segmenter cuts on
-// audio span ≥ segDur.
+// audio span ≥ segDur and emits ~segDur worth of frames per cut (NOT
+// the entire queue — that produced 28-second segments on bursty
+// sources where the queue saturated to maxQueueSpanMs of audio).
 func TestCut_AudioOnlyStream(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 
 	// 50 audio frames @ 23 ms = ~1.15s — below segDur.
 	fillAudio(q, 50, 23)
-	d := s.Cut(time.Now(), q, false, true)
+	d := s.Cut(time.Now(), q, false, true, 0)
 	if d.Ok {
 		t.Fatalf("audio-only below segDur should hold, got %+v", d)
 	}
 
-	// 100 frames @ 23ms = ~2.3s — above segDur.
+	// 100 frames @ 23ms = ~2.3s — above segDur. Cut takes ~segDur
+	// worth (= floor(2000/23)+1 = 87 frames whose PTSms ≤ 0+2000).
+	// Remaining frames stay queued for the next cut.
 	q2 := NewFrameQueue()
 	fillAudio(q2, 100, 23)
-	d = s.Cut(time.Now(), q2, false, true)
+	d = s.Cut(time.Now(), q2, false, true, 0)
 	if !d.Ok || d.VideoCount != 0 {
 		t.Fatalf("audio-only cut: want Ok=true VideoCount=0, got %+v", d)
 	}
-	if d.AudioCount != 100 {
-		t.Errorf("AudioCount = %d, want 100 (drain all)", d.AudioCount)
+	if d.AudioCount != 87 {
+		t.Errorf("AudioCount = %d, want 87 (~segDur worth, not drain all)", d.AudioCount)
+	}
+
+	// Pathological burst: 1000 frames @ 21 ms = ~21 s queued at once
+	// (simulates 48 kHz AAC where frame spacing = 1024/48000 ≈ 21.3 ms).
+	// Without the segDur cap we'd emit a 21 s segment; with it we emit
+	// ~segDur worth and let subsequent cuts drain the rest.
+	q3 := NewFrameQueue()
+	fillAudio(q3, 1000, 21)
+	d = s.Cut(time.Now(), q3, false, true, 0)
+	if !d.Ok {
+		t.Fatalf("burst audio cut: want Ok=true, got %+v", d)
+	}
+	// At 21 ms spacing, segDur 2 s ≈ 96 frames. Allow slack for off-by-one.
+	if d.AudioCount > 110 {
+		t.Errorf("burst AudioCount = %d, want close to segDur worth (~96), not entire queue", d.AudioCount)
 	}
 }
 
@@ -206,7 +225,7 @@ func TestCut_AudioOnlyStream(t *testing.T) {
 func TestCut_NoTracksAtAll(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
-	d := s.Cut(time.Now(), q, false, false)
+	d := s.Cut(time.Now(), q, false, false, 0)
 	if d.Ok {
 		t.Errorf("no-tracks Cut should return Ok=false, got %+v", d)
 	}
@@ -227,14 +246,14 @@ func TestMarkCut_ResetsSafetyNet(t *testing.T) {
 	}
 
 	// 5s after MarkCut(t0) — below 6s deadline.
-	if d := s.Cut(t0.Add(5*time.Second), q, true, false); d.Ok {
+	if d := s.Cut(t0.Add(5*time.Second), q, true, false, 0); d.Ok {
 		t.Fatal("5s elapsed should not trip safety-net")
 	}
 
 	// Mark a NEW cut at 4s; subsequent check measures from there.
 	s.MarkCut(t0.Add(4 * time.Second))
 	// At t0+5s, only 1s since the new MarkCut → still below deadline.
-	if d := s.Cut(t0.Add(5*time.Second), q, true, false); d.Ok {
+	if d := s.Cut(t0.Add(5*time.Second), q, true, false, 0); d.Ok {
 		t.Fatal("1s since MarkCut should not trip safety-net")
 	}
 }
