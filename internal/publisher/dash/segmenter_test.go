@@ -220,6 +220,51 @@ func TestCut_AudioOnlyStream(t *testing.T) {
 	}
 }
 
+// TestCut_HybridResidualConverges — the V/A duration coupling math
+// (targetA = V_dur × sr / 1024 / 1000) rarely lands on a whole AAC
+// frame boundary. Without the residual accumulator, integer truncation
+// produces a fixed per-cut deficit that compounds into V/A drift over
+// the session (test2 saw 8 ms/cut × 88 cuts = 0.7 s drift before this
+// fix). This test simulates 100 sequential cuts at 5 s V dur, 48 kHz
+// audio, and asserts cumulative A dur catches up to cumulative V dur
+// within one frame.
+func TestCut_HybridResidualConverges(t *testing.T) {
+	const segDurMs uint64 = 5000
+	const sr uint64 = 48000
+	const nCuts = 100
+	s := NewSegmenter(time.Duration(segDurMs)*time.Millisecond, 3)
+
+	var totalAudioFrames uint64
+	for i := 0; i < nCuts; i++ {
+		q := NewFrameQueue()
+		// 175 frames @ 40 ms = 7 s span; IDR every 50 frames (2 s GOP)
+		// → IDRs at indexes 0, 50, 100, 150. The first IDR past
+		// segDur (5 s) is at index 125 (PTS 5000) — wait, index 150
+		// is at PTS 6000. We expect findIDRCutPoint to pick index
+		// 125's IDR. Actually IDRs are only at multiples of 50, so
+		// first IDR past 5000 ms is at index 150 (PTS 6000 ms).
+		fillVideo(q, 175, 40, 50)
+		// Plenty of audio so the cut isn't held.
+		fillAudio(q, 500, 21) // 48 kHz frames are ~21.33 ms; use 21
+		d := s.Cut(time.Now(), q, true, true, sr)
+		if !d.Ok {
+			t.Fatalf("cut %d held unexpectedly; AudioLen=%d", i, q.AudioLen())
+		}
+		totalAudioFrames += uint64(d.AudioCount) //nolint:gosec
+	}
+
+	// Each V cut spans frames 0..150 (IDR at index 150, PTS 6000 ms).
+	// vCount=151; nextPTSms = videoPTSAt(151) = 151×40 = 6040 ms.
+	// Hybrid math: vDurMs = nextPTSms − first.PTSms = 6040.
+	// cumulativeV = nCuts × 6040.
+	cumulativeVMs := uint64(nCuts) * 6040
+	cumulativeAMs := totalAudioFrames * 1024 * 1000 / sr
+	deltaMs := int64(cumulativeVMs) - int64(cumulativeAMs)
+	if deltaMs > 21 || deltaMs < -21 {
+		t.Errorf("cumulative drift after %d cuts = %d ms, want |drift| ≤ 21 ms (one AAC frame at 48 kHz)", nCuts, deltaMs)
+	}
+}
+
 // TestCut_NoTracksAtAll — both haveVideo and haveAudio false; segmenter
 // returns no-op.
 func TestCut_NoTracksAtAll(t *testing.T) {

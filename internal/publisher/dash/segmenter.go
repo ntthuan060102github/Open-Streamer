@@ -31,6 +31,18 @@ type Segmenter struct {
 	maxFactor int
 
 	lastCut time.Time
+
+	// audioFrameResidualSamples accumulates the fractional-frame
+	// remainder of V/A duration coupling across cuts. AAC frames are
+	// exactly 1024 samples, but V dur × sr / 1000 rarely lands on a
+	// 1024-sample boundary (e.g. 5 s @ 48 kHz = 240 000 samples =
+	// 234.375 frames). Truncating the target frame count produces a
+	// fixed per-cut deficit that compounds into V/A drift over the
+	// session (test2 saw 1.23 s drift after 88 cuts at 8 ms/cut).
+	// Accumulating the sub-frame remainder and bumping targetA up by
+	// one frame whenever the residual exceeds 1024 samples drives the
+	// cumulative error to zero.
+	audioFrameResidualSamples uint64
 }
 
 // NewSegmenter returns a Segmenter targeting segDur per segment with
@@ -54,6 +66,7 @@ func (s *Segmenter) MarkCut(now time.Time) {
 // the new live timeline.
 func (s *Segmenter) Reset() {
 	s.lastCut = time.Time{}
+	s.audioFrameResidualSamples = 0
 }
 
 // CutDecision reports whether the segmenter wants a cut now and what
@@ -103,6 +116,17 @@ type CutDecision struct {
 //
 // audioSR is the audio sample rate (Hz). 0 if audio isn't packed —
 // then the V/A coordination math is skipped and AudioCount stays 0.
+//
+// cutAudioOnly fires only when the stream is genuinely audio-only
+// (haveVideo == false). For a V+A packager whose video queue is
+// temporarily empty (cut just popped V frames, next V hasn't arrived
+// yet, but audio frames keep arriving), the segmenter HOLDS the cut
+// until V arrives. Without this guard, an A-only cut would emit
+// `aSegN++` without `vSegN++`, baking a permanent segment-number
+// divergence (V startN=N, A startN=N+1) that browser DASH players
+// align by segment number — observed on test2 as a 5.4-second
+// content offset visible as severe lip-sync drift even though the
+// manifest tfdt gap was sub-second.
 func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool, audioSR uint64) CutDecision {
 	segDurMS := uint64(s.segDur.Milliseconds()) //nolint:gosec // segDur > 0 by construction
 	maxElapsedMS := segDurMS * uint64(s.maxFactor)
@@ -110,7 +134,7 @@ func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool,
 	switch {
 	case haveVideo && q.VideoLen() > 0:
 		return s.cutVideo(now, q, segDurMS, maxElapsedMS, haveAudio, audioSR)
-	case haveAudio && q.AudioLen() > 0:
+	case !haveVideo && haveAudio && q.AudioLen() > 0:
 		return s.cutAudioOnly(q, segDurMS)
 	}
 	return CutDecision{}
@@ -225,15 +249,28 @@ func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio 
 			vDurMs = cutPTSms - first.PTSms
 		}
 		if vDurMs > 0 {
-			targetA := int(vDurMs * audioSR / 1024 / 1000) //nolint:gosec
+			// Exact total samples that match V's duration:
+			//   samples = V_dur_ms × sr / 1000
+			// Round to whole 1024-sample AAC frames carrying the
+			// fractional remainder forward in s.audioFrameResidualSamples
+			// so cumulative A duration converges on cumulative V
+			// duration regardless of how V dur aligns vs the 1024-sample
+			// boundary (root cause of test2's 8 ms-per-cut V/A drift
+			// before this residual accumulator).
+			totalSamples := vDurMs*audioSR/1000 + s.audioFrameResidualSamples
+			targetA := int(totalSamples / 1024) //nolint:gosec
+			residual := totalSamples - uint64(targetA)*1024
 			if q.AudioLen() < targetA {
 				// Hold cut — audio queue hasn't caught up to V's range.
 				// Next tick retries. Without this hold, V and A would
 				// emit different durations and sequential tfdt would
-				// bake permanent drift.
+				// bake permanent drift. The residual is NOT advanced
+				// on hold; we re-compute it next tick from the same V
+				// dur so retries see the same target.
 				return CutDecision{}
 			}
 			aCount = targetA
+			s.audioFrameResidualSamples = residual
 		}
 	}
 	return CutDecision{

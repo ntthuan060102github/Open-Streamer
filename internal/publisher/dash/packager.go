@@ -163,6 +163,20 @@ type Packager struct {
 	videoOOOPushCount int
 	audioOOOPushCount int
 
+	// videoFrameSeen / audioFrameSeen latch true on the FIRST handleH264
+	// / handleAAC call respectively. Used by tryCut to distinguish
+	// "track frames flowing but init not yet built" (wait for init) vs
+	// "track genuinely absent" (allow pairing-timeout single-track
+	// emit). Without this, a stream whose video frames arrive seconds
+	// before SPS/PPS extraction completes (file://MP4 with split init
+	// header, or any source where the first IDR is delayed past the
+	// 3 s pairing window) emits an audio segment alone at timeout,
+	// permanently offsetting A's segN from V's segN — observed on
+	// test2 as a 5.4 s lip-sync drift even after V/A duration
+	// coupling fixed the per-cut math.
+	videoFrameSeen bool
+	audioFrameSeen bool
+
 	// Cut-time diagnostic counters and timestamps. starvedAudioCutCount
 	// fires when a Cut decision returned Ok=true but AudioCount=0 while
 	// the queue has audio frames (smoking gun for hypothesis 1 / 2).
@@ -314,6 +328,7 @@ func (p *Packager) onAVPacket(av *domain.AVPacket) {
 // handleH264 enqueues an H.264 access unit and tries to build the video
 // init segment if it isn't already built.
 func (p *Packager) handleH264(av *domain.AVPacket) {
+	p.videoFrameSeen = true
 	if p.videoInit == nil && !p.videoPSGivenUp {
 		p.accumulateVideoPS(av.Data)
 		p.tryBuildVideoInit()
@@ -371,6 +386,7 @@ func (p *Packager) pushVideoWithDiag(f VideoFrame) {
 // 4–8 access units. splitADTSBundle splits them and assigns
 // per-frame PTS — see splitADTSBundle's docstring for why.
 func (p *Packager) handleAAC(av *domain.AVPacket) {
+	p.audioFrameSeen = true
 	frames := splitADTSBundle(av.Data, av.PTSms)
 	if len(frames) == 0 {
 		return
@@ -552,6 +568,27 @@ func (p *Packager) tryCut(now time.Time) {
 
 	if !p.state.CanEmitFirstSegment(now, videoReady, audioReady) {
 		return
+	}
+
+	// Defer pairing-timeout single-track emission while a track is
+	// still being received but its init hasn't built yet. Without this,
+	// for a V+A stream whose video frames arrive but SPS/PPS extraction
+	// takes longer than the 3 s pairing window, the timeout fallback
+	// would emit an audio-only segment first — A's segN advances, V's
+	// doesn't, and the segN divergence baked into the master MPD
+	// causes browser players to play A and V from different media-times
+	// for the rest of the session (test2 saw 5.4 s lip-sync drift here).
+	//
+	// videoPSGivenUp latches when SPS/PPS extraction permanently fails;
+	// only then do we accept the stream as "video genuinely absent" and
+	// allow audio-only emission.
+	if p.state.State() == StateWaitingForPairing {
+		if p.videoFrameSeen && !haveVideo && !p.videoPSGivenUp {
+			return
+		}
+		if p.audioFrameSeen && !haveAudio {
+			return
+		}
 	}
 
 	// First-segment moment: align queues so V and A start at the LATER
