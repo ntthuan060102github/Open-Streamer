@@ -31,6 +31,18 @@ type Segmenter struct {
 	maxFactor int
 
 	lastCut time.Time
+
+	// audioFrameResidualSamples accumulates the fractional-frame
+	// remainder of V/A duration coupling across cuts. AAC frames are
+	// exactly 1024 samples, but V dur × sr / 1000 rarely lands on a
+	// 1024-sample boundary (e.g. 5 s @ 48 kHz = 240 000 samples =
+	// 234.375 frames). Truncating the target frame count produces a
+	// fixed per-cut deficit that compounds into V/A drift over the
+	// session (test2 saw 1.23 s drift after 88 cuts at 8 ms/cut).
+	// Accumulating the sub-frame remainder and bumping targetA up by
+	// one frame whenever the residual exceeds 1024 samples drives the
+	// cumulative error to zero.
+	audioFrameResidualSamples uint64
 }
 
 // NewSegmenter returns a Segmenter targeting segDur per segment with
@@ -54,6 +66,7 @@ func (s *Segmenter) MarkCut(now time.Time) {
 // the new live timeline.
 func (s *Segmenter) Reset() {
 	s.lastCut = time.Time{}
+	s.audioFrameResidualSamples = 0
 }
 
 // CutDecision reports whether the segmenter wants a cut now and what
@@ -64,8 +77,14 @@ type CutDecision struct {
 	Ok bool
 
 	// VideoCount is the number of OLDEST video frames to drain from
-	// the queue. The last drained frame is the trailing IDR (when
-	// available) so the NEXT segment can start at a fresh IDR.
+	// the queue. The last drained frame is the frame just BEFORE the
+	// trailing IDR — the IDR itself STAYS queued so the NEXT segment
+	// starts at a clean SAP boundary (DASH startWithSAP="1"). Without
+	// this off-by-one, strict players (Safari/VT, Chrome-on-Mac
+	// hardware decode) reject every segment after the first with
+	// MEDIA_ERR_DECODE -12909, because each segment after #1 starts
+	// with a P/B slice whose reference frames live in the previous
+	// segment.
 	//
 	// On a safety-net cut with no IDR available, VideoCount = the
 	// entire video queue at the moment of the cut.
@@ -100,14 +119,28 @@ type CutDecision struct {
 //  3. Audio-only stream (no video init / no video frames): cut on
 //     audio span ≥ segDur.
 //  4. Otherwise: hold.
-func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool) CutDecision {
+//
+// audioSR is the audio sample rate (Hz). 0 if audio isn't packed —
+// then the V/A coordination math is skipped and AudioCount stays 0.
+//
+// cutAudioOnly fires only when the stream is genuinely audio-only
+// (haveVideo == false). For a V+A packager whose video queue is
+// temporarily empty (cut just popped V frames, next V hasn't arrived
+// yet, but audio frames keep arriving), the segmenter HOLDS the cut
+// until V arrives. Without this guard, an A-only cut would emit
+// `aSegN++` without `vSegN++`, baking a permanent segment-number
+// divergence (V startN=N, A startN=N+1) that browser DASH players
+// align by segment number — observed on test2 as a 5.4-second
+// content offset visible as severe lip-sync drift even though the
+// manifest tfdt gap was sub-second.
+func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool, audioSR uint64) CutDecision {
 	segDurMS := uint64(s.segDur.Milliseconds()) //nolint:gosec // segDur > 0 by construction
 	maxElapsedMS := segDurMS * uint64(s.maxFactor)
 
 	switch {
 	case haveVideo && q.VideoLen() > 0:
-		return s.cutVideo(now, q, segDurMS, maxElapsedMS, haveAudio)
-	case haveAudio && q.AudioLen() > 0:
+		return s.cutVideo(now, q, segDurMS, maxElapsedMS, haveAudio, audioSR)
+	case !haveVideo && haveAudio && q.AudioLen() > 0:
 		return s.cutAudioOnly(q, segDurMS)
 	}
 	return CutDecision{}
@@ -116,10 +149,10 @@ func (s *Segmenter) Cut(now time.Time, q *FrameQueue, haveVideo, haveAudio bool)
 // cutVideo handles the dual-track or video-only stream. Returns the
 // IDR-aligned cut when possible, the safety-net cut when wallclock has
 // run out, or {Ok:false} when more content is needed.
-func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedMS uint64, haveAudio bool) CutDecision {
+func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedMS uint64, haveAudio bool, audioSR uint64) CutDecision {
 	idx := s.findIDRCutPoint(q, segDurMS)
 	if idx >= 0 {
-		return s.buildCutDecision(q, idx, haveAudio, true)
+		return s.buildCutDecision(q, idx, haveAudio, true, audioSR)
 	}
 
 	// Safety-net: enough wallclock elapsed since last cut without an
@@ -128,21 +161,34 @@ func (s *Segmenter) cutVideo(now time.Time, q *FrameQueue, segDurMS, maxElapsedM
 	if !s.lastCut.IsZero() {
 		elapsed := now.Sub(s.lastCut).Milliseconds()
 		if elapsed > 0 && uint64(elapsed) >= maxElapsedMS { //nolint:gosec // bounded by branch above
-			return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false)
+			return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false, audioSR)
 		}
 	}
 	// Cold-start safety-net: lastCut is zero (first cut ever). Allow
 	// the queue to grow up to maxElapsedMS of PTS span before forcing
 	// a cut; before that, wait for an IDR.
 	if s.lastCut.IsZero() && q.VideoSpanMS() >= maxElapsedMS {
-		return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false)
+		return s.buildCutDecision(q, q.VideoLen()-1, haveAudio, false, audioSR)
 	}
 	return CutDecision{}
 }
 
 // findIDRCutPoint searches for the FIRST IDR whose PTSms is at least
-// segDurMS past the first frame, returning its index. Returns -1 when
-// no such IDR is queued.
+// segDurMS past the first frame, and returns the index of the frame
+// JUST BEFORE that IDR — i.e. the last frame to include in the
+// outgoing segment. The IDR itself stays queued so the NEXT segment
+// starts at a clean SAP boundary. Returns -1 when no qualifying IDR
+// is queued.
+//
+// Cut-just-before-IDR (vs cut-including-IDR) is mandatory for DASH
+// startWithSAP="1": every emitted segment must start with an IDR.
+// The previous return-i form had the IDR closing the current segment,
+// leaving the next segment to start with a P/B slice whose reference
+// frames lived in the previous segment. Tolerant players (Firefox,
+// software-decode Chrome) accepted that and used the prior segment's
+// IDR for refs; strict pipelines (Safari/VideoToolbox, Chrome-on-Mac
+// HW decode) hard-fail with MEDIA_ERR_DECODE -12909
+// (VTDecompressionOutputCallback bad-data) on every segment after #0.
 //
 // Picking the FIRST IDR past segDur (rather than the LATEST in queue)
 // keeps each segment ≤ ~segDur in frame-PTS span, which matters
@@ -167,7 +213,8 @@ func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 		return -1
 	}
 	// Scan from oldest to newest; the FIRST IDR whose PTS is >=
-	// first+segDur is the cut point.
+	// first+segDur defines the cut boundary, and we return the index
+	// of the frame BEFORE it so the IDR stays for the next segment.
 	for i := 1; i < q.VideoLen(); i++ {
 		ptsMS, ok := q.videoPTSAt(i)
 		if !ok {
@@ -176,27 +223,86 @@ func (s *Segmenter) findIDRCutPoint(q *FrameQueue, segDurMS uint64) int {
 		if ptsMS-first.PTSms < segDurMS {
 			continue
 		}
-		// Need an IDR at or past this point. Check if frame i is IDR.
 		if vf, ok := q.videoAt(i); ok && vf.IsIDR {
-			return i
+			return i - 1
 		}
 	}
 	return -1
 }
 
-// buildCutDecision packages the cut-up-to-frame-N answer.
-func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio bool, idrAligned bool) CutDecision {
+// buildCutDecision packages the cut-up-to-frame-N answer. For a V+A
+// stream, AudioCount is COUPLED to V's emitted duration so the
+// per-segment V/A durations match in time-domain — the cure for the
+// bac_ninh_raw 8 s / test2 4 s baked-in drift bug:
+//
+//   - V's emitted ms = (nextPTSms − first.PTSms) if a next frame is
+//     queued; else (cutPTSms − first.PTSms).
+//   - Target audio frames = round(V_ms × audioSR / 1024 / 1000); each
+//     AAC frame is exactly 1024 samples.
+//   - If the audio queue holds at least that many frames, AudioCount =
+//     the target, and writeAudioSegment's dur math (N × 1024 ticks)
+//     produces exactly the same time-domain duration as V's segment.
+//   - If the audio queue is short, return Ok=false to HOLD the cut —
+//     the next tick (50 ms) will retry. Stable-state sources never
+//     trigger the hold; only catch-up bursts on HLS-pull / file
+//     sources need it, and there only at startup.
+//
+// audioSR == 0 means caller wants the legacy count-by-PTS path (audio
+// isn't packed in this shard); aCount stays at 0.
+func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio bool, idrAligned bool, audioSR uint64) CutDecision {
 	if lastVideoIdx < 0 {
 		return CutDecision{}
 	}
 	vCount := lastVideoIdx + 1
-	cutPTSms, _ := q.videoPTSAt(lastVideoIdx)
 	aCount := 0
-	if haveAudio {
-		// Include audio frames whose PTSms is ≤ the cut PTS plus one
-		// frame of slack, so the audio segment spans the same wallclock
-		// window as the video segment.
-		aCount = q.audioCountAtOrBefore(cutPTSms)
+	if haveAudio && audioSR > 0 {
+		first, ok1 := q.FirstVideo()
+		if !ok1 {
+			return CutDecision{}
+		}
+		nextPTSms, hasNext := q.videoPTSAt(vCount)
+		var vDurMs uint64
+		if hasNext && nextPTSms > first.PTSms {
+			vDurMs = nextPTSms - first.PTSms
+		} else if cutPTSms, ok := q.videoPTSAt(lastVideoIdx); ok && cutPTSms > first.PTSms {
+			// Fallback: no frame queued past lastVideoIdx. Use
+			// (cutPTSms − first.PTSms) PLUS one estimated per-frame
+			// interval so the duration matches what computeVideoSegDurTicks
+			// will write to the MPD (which also adds perFrame for the
+			// last frame's own duration). Without this, my V/A coupling
+			// targetA under-counts by one frame per cut and audio drifts
+			// behind video — observed on test2 file://MP4 where the V
+			// queue typically drains completely each cut, making this
+			// fallback the common case (~40 ms/cut compound deficit).
+			vDurMs = cutPTSms - first.PTSms
+			if vCount > 1 {
+				vDurMs += vDurMs / uint64(vCount-1) //nolint:gosec // vCount > 1 by branch
+			}
+		}
+		if vDurMs > 0 {
+			// Exact total samples that match V's duration:
+			//   samples = V_dur_ms × sr / 1000
+			// Round to whole 1024-sample AAC frames carrying the
+			// fractional remainder forward in s.audioFrameResidualSamples
+			// so cumulative A duration converges on cumulative V
+			// duration regardless of how V dur aligns vs the 1024-sample
+			// boundary (root cause of test2's 8 ms-per-cut V/A drift
+			// before this residual accumulator).
+			totalSamples := vDurMs*audioSR/1000 + s.audioFrameResidualSamples
+			targetA := int(totalSamples / 1024) //nolint:gosec
+			residual := totalSamples - uint64(targetA)*1024
+			if q.AudioLen() < targetA {
+				// Hold cut — audio queue hasn't caught up to V's range.
+				// Next tick retries. Without this hold, V and A would
+				// emit different durations and sequential tfdt would
+				// bake permanent drift. The residual is NOT advanced
+				// on hold; we re-compute it next tick from the same V
+				// dur so retries see the same target.
+				return CutDecision{}
+			}
+			aCount = targetA
+			s.audioFrameResidualSamples = residual
+		}
 	}
 	return CutDecision{
 		Ok:           true,
@@ -207,14 +313,30 @@ func (s *Segmenter) buildCutDecision(q *FrameQueue, lastVideoIdx int, haveAudio 
 }
 
 // cutAudioOnly handles audio-only streams. Cuts when audio span >= segDur.
+//
+// Audio-segment size is bounded to ONE segDur worth of frames so the
+// emitted MPD <S d=…> stays close to the operator-configured target
+// (vs the entire queue, which can be up to maxQueueSpanMs = 30 s of
+// audio after a startup burst — that produced 28-second audio
+// segments on bac_ninh / test_copy ABR audio shards when the video
+// queue happened to drain between V cuts and cutAudioOnly fired).
+//
+// Returns Ok=true with AudioCount = the number of frames whose
+// PTSms ≤ first.PTSms + segDurMS, guaranteeing forward progress
+// even when the queue has only the first frame.
 func (s *Segmenter) cutAudioOnly(q *FrameQueue, segDurMS uint64) CutDecision {
-	if q.AudioSpanMS() < segDurMS {
+	first, ok := q.FirstAudio()
+	if !ok || q.AudioSpanMS() < segDurMS {
 		return CutDecision{}
+	}
+	count := q.audioCountAtOrBefore(first.PTSms + segDurMS)
+	if count == 0 {
+		count = 1 // guarantee forward progress; should not normally hit
 	}
 	return CutDecision{
 		Ok:           true,
 		VideoCount:   0,
-		AudioCount:   q.AudioLen(),
+		AudioCount:   count,
 		IsIDRAligned: true, // audio-only is always cleanly cuttable
 	}
 }

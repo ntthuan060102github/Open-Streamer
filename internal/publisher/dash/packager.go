@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/Eyevinn/mp4ff/aac"
+	"github.com/Eyevinn/mp4ff/avc"
+	"github.com/Eyevinn/mp4ff/hevc"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -43,7 +45,18 @@ const (
 	dashAudioMediaPattern = "seg_a_$Number%05d$.m4s"
 	dashVideoInitFile     = "init_v.mp4"
 	dashAudioInitFile     = "init_a.mp4"
-	videoPSAccumCap       = 1 << 20 // 1 MiB cap on SPS/PPS accumulator before giving up
+
+	// videoPSAccumCap bounds the accumulator that holds VPS/SPS/PPS
+	// NAL units (Annex-B framed) until BuildH264Init or BuildH265Init
+	// succeeds. Sized to comfortably hold the relevant NAL units for
+	// HEVC (VPS ~30 B + SPS ~80 B + PPS ~10 B) plus a 16× safety
+	// margin — accumulator only ever stores SPS/PPS bytes after the
+	// per-frame extractor was introduced; the cap is now a sanity
+	// guard, never a normal limit. Before the extractor, every frame's
+	// FULL Annex-B bytes were appended, so a single 1080p IDR
+	// (100-200 KB) plus a few P-frames would burst past 1 MiB and the
+	// packager would latch videoPSGivenUp, breaking 1080p ABR shards.
+	videoPSAccumCap = 4 * 1024
 )
 
 // Config carries the per-stream packager configuration.
@@ -141,6 +154,47 @@ type Packager struct {
 	// the packager's segmenter has fallen permanently behind.
 	videoOverflowDropCount int
 	audioOverflowDropCount int
+
+	// Out-of-order push counters: incremented when PushVideo / PushAudio
+	// receives a frame whose PTSms is strictly less than the queue's
+	// previous tail. Diagnostic for hypothesis-1 (audioCountAtOrBefore
+	// sequential-stop scan misses qualifying frames after an OOO frame
+	// at the front).
+	videoOOOPushCount int
+	audioOOOPushCount int
+
+	// videoFrameSeen / audioFrameSeen latch true on the FIRST handleH264
+	// / handleAAC call respectively. Used by tryCut to distinguish
+	// "track frames flowing but init not yet built" (wait for init) vs
+	// "track genuinely absent" (allow pairing-timeout single-track
+	// emit). Without this, a stream whose video frames arrive seconds
+	// before SPS/PPS extraction completes (file://MP4 with split init
+	// header, or any source where the first IDR is delayed past the
+	// 3 s pairing window) emits an audio segment alone at timeout,
+	// permanently offsetting A's segN from V's segN — observed on
+	// test2 as a 5.4 s lip-sync drift even after V/A duration
+	// coupling fixed the per-cut math.
+	videoFrameSeen bool
+	audioFrameSeen bool
+
+	// firstIDRSeen latches true on the first H.264 IDR (or HEVC IRAP)
+	// pushed into the video queue. Until set, handleH264 DROPS non-key
+	// frames so segment 0's first sample is a SAP — DASH manifests
+	// declare startWithSAP="1" and strict players reject any segment
+	// whose first sample isn't an IDR (Safari/VideoToolbox returns
+	// MEDIA_ERR_DECODE -12909). SPS/PPS accumulation still runs on
+	// every dropped frame so the init segment can build from
+	// pre-IDR parameter sets if the source delivers them that way
+	// (RTMP AVCDecoderConfigurationRecord, MP4 stsd).
+	firstIDRSeen bool
+
+	// Cut-time diagnostic counters and timestamps. starvedAudioCutCount
+	// fires when a Cut decision returned Ok=true but AudioCount=0 while
+	// the queue has audio frames (smoking gun for hypothesis 1 / 2).
+	// lastDiagLogAt rate-limits the diagnostic log to ≤ once per second
+	// per packager — tryCut runs every 50 ms, raw logs would flood.
+	starvedAudioCutCount int
+	lastDiagLogAt        time.Time
 }
 
 // NewPackager constructs a Packager from cfg. Validates required
@@ -284,26 +338,47 @@ func (p *Packager) onAVPacket(av *domain.AVPacket) {
 
 // handleH264 enqueues an H.264 access unit and tries to build the video
 // init segment if it isn't already built.
+//
+// IDR-startup gate: drops every non-key frame until the first IDR
+// arrives. Without this, cold-start frames captured mid-GOP enter
+// the queue and segment 0 ends up starting with a P/B slice — strict
+// hardware decoders (Safari/VT, Chrome-on-Mac VideoToolbox) reject
+// such segments with MEDIA_ERR_DECODE -12909. SPS/PPS extraction
+// still runs on every dropped frame so the init segment can build
+// from any in-band parameter sets that arrive before the first IDR.
 func (p *Packager) handleH264(av *domain.AVPacket) {
+	p.videoFrameSeen = true
 	if p.videoInit == nil && !p.videoPSGivenUp {
 		p.accumulateVideoPS(av.Data)
 		p.tryBuildVideoInit()
 	}
-	// Queue the frame regardless — once init is built, the queue's
-	// existing contents are still valid (Normaliser-anchored PTS).
-	if dropped := p.queue.PushVideo(VideoFrame{
+	if !p.firstIDRSeen {
+		if !av.KeyFrame {
+			return
+		}
+		p.firstIDRSeen = true
+	}
+	p.pushVideoWithDiag(VideoFrame{
 		AnnexB: cloneBytes(av.Data),
 		PTSms:  av.PTSms,
 		DTSms:  av.DTSms,
 		IsIDR:  av.KeyFrame,
-	}); dropped > 0 {
+	})
+	if p.videoInit != nil {
+		p.state.OpenPairingWindow(time.Now())
+	}
+}
+
+// pushVideoWithDiag is the video counterpart of pushAudioWithDiag.
+// Persistent overflow drops indicate the segmenter is unable to cut
+// (typically the pacing gate is permanently behind because cumulative
+// per-segment dur has drifted ahead of wallclock); MPD timeline
+// integrity is already lost at that point and the drop is the lesser
+// evil. OOO pushes signal an upstream Normaliser anomaly.
+func (p *Packager) pushVideoWithDiag(f VideoFrame) {
+	dropped, ooo := p.queue.PushVideo(f)
+	if dropped > 0 {
 		p.videoOverflowDropCount += dropped
-		// Log on transition (every 1000th drop to bound spam). Persistent
-		// drops here indicate the segmenter is unable to cut — typically
-		// the pacing gate is permanently behind because cumulative per-
-		// segment dur has drifted ahead of wallclock (V at >1× wallclock,
-		// hard re-anchors not catching it). MPD timeline integrity is
-		// already lost at this point; the drop is the lesser evil.
 		if p.videoOverflowDropCount == 1 || p.videoOverflowDropCount%1000 == 0 {
 			slog.Warn("dash: video frame queue overflow — dropping oldest",
 				"stream_id", p.cfg.StreamID,
@@ -312,8 +387,16 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 			)
 		}
 	}
-	if p.videoInit != nil {
-		p.state.OpenPairingWindow(time.Now())
+	if ooo {
+		p.videoOOOPushCount++
+		if p.videoOOOPushCount == 1 || p.videoOOOPushCount%100 == 0 {
+			slog.Warn("dash: video OOO push (PTSms regressed vs queue tail)",
+				"stream_id", p.cfg.StreamID,
+				"total_ooo", p.videoOOOPushCount,
+				"frame_pts_ms", f.PTSms,
+				"is_idr", f.IsIDR,
+			)
+		}
 	}
 }
 
@@ -326,6 +409,7 @@ func (p *Packager) handleH264(av *domain.AVPacket) {
 // 4–8 access units. splitADTSBundle splits them and assigns
 // per-frame PTS — see splitADTSBundle's docstring for why.
 func (p *Packager) handleAAC(av *domain.AVPacket) {
+	p.audioFrameSeen = true
 	frames := splitADTSBundle(av.Data, av.PTSms)
 	if len(frames) == 0 {
 		return
@@ -344,33 +428,82 @@ func (p *Packager) handleAAC(av *domain.AVPacket) {
 		}
 	}
 	for _, f := range frames {
-		if dropped := p.queue.PushAudio(f); dropped > 0 {
-			p.audioOverflowDropCount += dropped
-			if p.audioOverflowDropCount == 1 || p.audioOverflowDropCount%1000 == 0 {
-				slog.Warn("dash: audio frame queue overflow — dropping oldest",
-					"stream_id", p.cfg.StreamID,
-					"total_dropped", p.audioOverflowDropCount,
-					"queue_after_drop", p.queue.AudioLen(),
-				)
-			}
-		}
+		p.pushAudioWithDiag(f)
 	}
 	if p.audioInit != nil {
 		p.state.OpenPairingWindow(time.Now())
 	}
 }
 
-// accumulateVideoPS appends Annex-B byte stream to the SPS/PPS buffer,
-// capped at videoPSAccumCap. Latches videoPSGivenUp when the cap is hit
-// without success.
+// pushAudioWithDiag pushes one audio frame to the queue and updates
+// the overflow + OOO diagnostic counters. Extracted from handleAAC so
+// the parent stays under the cognitive-complexity ceiling.
+func (p *Packager) pushAudioWithDiag(f AudioFrame) {
+	dropped, ooo := p.queue.PushAudio(f)
+	if dropped > 0 {
+		p.audioOverflowDropCount += dropped
+		if p.audioOverflowDropCount == 1 || p.audioOverflowDropCount%1000 == 0 {
+			slog.Warn("dash: audio frame queue overflow — dropping oldest",
+				"stream_id", p.cfg.StreamID,
+				"total_dropped", p.audioOverflowDropCount,
+				"queue_after_drop", p.queue.AudioLen(),
+			)
+		}
+	}
+	if ooo {
+		p.audioOOOPushCount++
+		if p.audioOOOPushCount == 1 || p.audioOOOPushCount%100 == 0 {
+			slog.Warn("dash: audio OOO push (PTSms regressed vs queue tail)",
+				"stream_id", p.cfg.StreamID,
+				"total_ooo", p.audioOOOPushCount,
+				"frame_pts_ms", f.PTSms,
+			)
+		}
+	}
+}
+
+// accumulateVideoPS scans this frame's Annex-B bytes for parameter-set
+// NAL units (SPS+PPS for H.264; VPS+SPS+PPS for H.265) and appends
+// only THOSE NAL units to p.videoPS — not the full frame bytes.
+//
+// Rationale: a 1080p H.264 IDR is 100-200 KB; a few P-frames between
+// IDR delivery can push the accumulator past the cap before SPS/PPS
+// arrive (root cause of the bac_ninh/track_1 + test_copy/track_1
+// videoPSGivenUp failure observed on production — same source, same
+// transcoder, only the 1080p shard failed because its frame bytes
+// were larger). The extractor keeps videoPS tiny (~hundreds of bytes
+// of NAL data) so cap pressure never fires under normal operation.
+//
+// Cap is still enforced as an OOM safety net for a degenerate stream
+// that emits SPS/PPS-shaped garbage every frame.
 func (p *Packager) accumulateVideoPS(annexB []byte) {
-	if len(p.videoPS)+len(annexB) > videoPSAccumCap {
+	psBuf := annexB4To3(annexB)
+	var nals [][]byte
+	if p.isHEVC {
+		vpss, spss, ppss := hevc.GetParameterSetsFromByteStream(psBuf)
+		nals = append(nals, vpss...)
+		nals = append(nals, spss...)
+		nals = append(nals, ppss...)
+	} else {
+		spss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_SPS, psBuf, false)
+		ppss := avc.ExtractNalusOfTypeFromByteStream(avc.NALU_PPS, psBuf, false)
+		nals = append(nals, spss...)
+		nals = append(nals, ppss...)
+	}
+	for _, n := range nals {
+		// Append in 4-byte Annex-B framed form so ExtractParameterSets
+		// (which expects an Annex-B byte stream) finds them later.
+		p.videoPS = append(p.videoPS, 0x00, 0x00, 0x00, 0x01)
+		p.videoPS = append(p.videoPS, n...)
+	}
+	if len(p.videoPS) > videoPSAccumCap {
 		p.videoPSGivenUp = true
 		slog.Warn("dash: videoPS cap exceeded without init — giving up video",
-			"stream_id", p.cfg.StreamID, "cap_bytes", videoPSAccumCap)
-		return
+			"stream_id", p.cfg.StreamID,
+			"cap_bytes", videoPSAccumCap,
+			"accumulator_len", len(p.videoPS),
+		)
 	}
-	p.videoPS = append(p.videoPS, annexB...)
 }
 
 // tryBuildVideoInit attempts to build the H.264 or H.265 init segment
@@ -460,6 +593,27 @@ func (p *Packager) tryCut(now time.Time) {
 		return
 	}
 
+	// Defer pairing-timeout single-track emission while a track is
+	// still being received but its init hasn't built yet. Without this,
+	// for a V+A stream whose video frames arrive but SPS/PPS extraction
+	// takes longer than the 3 s pairing window, the timeout fallback
+	// would emit an audio-only segment first — A's segN advances, V's
+	// doesn't, and the segN divergence baked into the master MPD
+	// causes browser players to play A and V from different media-times
+	// for the rest of the session (test2 saw 5.4 s lip-sync drift here).
+	//
+	// videoPSGivenUp latches when SPS/PPS extraction permanently fails;
+	// only then do we accept the stream as "video genuinely absent" and
+	// allow audio-only emission.
+	if p.state.State() == StateWaitingForPairing {
+		if p.videoFrameSeen && !haveVideo && !p.videoPSGivenUp {
+			return
+		}
+		if p.audioFrameSeen && !haveAudio {
+			return
+		}
+	}
+
 	// First-segment moment: align queues so V and A start at the LATER
 	// of the two firsts. This drops the earlier-arrived track's pre-
 	// pairing accumulation (e.g. 4 s of audio that flowed while the
@@ -492,10 +646,24 @@ func (p *Packager) tryCut(now time.Time) {
 		return
 	}
 
-	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio)
+	// Pass audioSR to the segmenter so V/A duration coupling works:
+	// the segmenter computes targetA = round(V_dur_ms × sr / 1024 / 1000)
+	// and either pops exactly that many audio frames (= V dur matches
+	// A dur per cut) or holds the cut until audio catches up. Skip the
+	// coupling (audioSR=0) when this shard doesn't pack audio — those
+	// shards' audio frames are popped & discarded, so the count-by-PTS
+	// legacy path is fine and we don't want to hold V cuts on missing
+	// audio.
+	var audioSR uint64
+	if p.audioInit != nil && p.cfg.PackAudio {
+		audioSR = uint64(p.audioInit.SampleRate) //nolint:gosec // SampleRate > 0
+	}
+	d := p.seg.Cut(now, p.queue, haveVideo, haveAudio, audioSR)
 	if !d.Ok {
 		return
 	}
+
+	p.diagAudioStarvation(now, d, haveAudio)
 
 	flushed := p.writeSegments(now, d)
 	if flushed {
@@ -504,9 +672,64 @@ func (p *Packager) tryCut(now time.Time) {
 		if p.availStart.IsZero() {
 			p.availStart = now
 		}
+		// Safety-net cuts drain the entire video queue without landing
+		// on an IDR boundary, so the next pushed frame could be a P/B
+		// slice that would re-contaminate segment N+1. Re-arm the
+		// startup gate so handleH264 drops non-key frames until the
+		// next IDR arrives, restoring SAP alignment at the cost of a
+		// few hundred ms of skipped frames.
+		if !d.IsIDRAligned {
+			p.firstIDRSeen = false
+		}
 		p.trimWindow()
 		p.publishManifest(now)
 	}
+}
+
+// diagAudioStarvation logs a queue snapshot whenever a Cut decision
+// included video but excluded all audio despite frames being queued —
+// the smoking gun for the bac_ninh_raw / test1 / test5 audio-dead bug.
+// Rate-limited to ≤ 1 log/sec/packager so the 50 ms tryCut cadence
+// can't flood the journal. Caller holds p.mu.
+//
+// Outputs include FirstAudio.PTSms, AudioTail.PTSms, FirstVideo.PTSms,
+// VideoTail.PTSms, plus skippedQualifying — the count of audio frames
+// AFTER the cut boundary whose PTSms also satisfied the threshold but
+// were missed by audioCountAtOrBefore's sequential-stop scan. When
+// skippedQualifying > 0, hypothesis 1 (queue non-monotonic) is
+// confirmed; when 0 with FirstAudio.PTSms > FirstVideo.PTSms+segDur,
+// hypothesis 2 (video PTS regression) is more likely.
+func (p *Packager) diagAudioStarvation(now time.Time, d CutDecision, haveAudio bool) {
+	if !haveAudio || d.AudioCount > 0 || p.queue.AudioLen() == 0 {
+		return
+	}
+	p.starvedAudioCutCount++
+	if !p.lastDiagLogAt.IsZero() && now.Sub(p.lastDiagLogAt) < time.Second {
+		return
+	}
+	p.lastDiagLogAt = now
+	aFirst, _ := p.queue.FirstAudio()
+	aTail, _ := p.queue.AudioTailPTSms()
+	vFirst, _ := p.queue.FirstVideo()
+	vTail, _ := p.queue.VideoTailPTSms()
+	// Re-derive a lower-bound cutPTSms_video without re-running the
+	// segmenter: the SegDur target sits at vFirst+SegDur, and Cut's
+	// audio-count uses the PTS of the chosen IDR which is ≥ vFirst+SegDur.
+	threshold := vFirst.PTSms + uint64(p.cfg.SegDur.Milliseconds()) //nolint:gosec
+	_, skipped := p.queue.audioCountAtOrBeforeWithSkip(threshold)
+	slog.Warn("dash: cut excluded all audio despite queue",
+		"stream_id", p.cfg.StreamID,
+		"starved_count", p.starvedAudioCutCount,
+		"audio_len", p.queue.AudioLen(),
+		"audio_first_ms", aFirst.PTSms,
+		"audio_tail_ms", aTail,
+		"video_len", p.queue.VideoLen(),
+		"video_first_ms", vFirst.PTSms,
+		"video_tail_ms", vTail,
+		"video_count_in_decision", d.VideoCount,
+		"audio_skipped_qualifying", skipped,
+		"pairing_truncated", p.pairingTruncated,
+	)
 }
 
 // truncateAtPairingLocked drops frames whose PTSms is earlier than the

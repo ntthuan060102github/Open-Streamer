@@ -62,24 +62,48 @@ type AudioFrame struct {
 //     queued frame on the track. Used by the segmenter to decide when
 //     there's a full segDur of content available.
 //
-// Bounded retention: Push* enforces maxVideoFrames / maxAudioFrames by
-// dropping the oldest frames when the cap is exceeded. Without this,
-// pathological run-loop states — e.g. the DASH packager's
-// behindPrevSegEnd gate blocking cuts while the per-segment dur drifts
-// ahead of wallclock — let the queue grow without bound and pin tens
+// Bounded retention: Push* enforces a time-span cap (maxQueueSpanMs)
+// plus a frame-count safety net (videoFrameHardCap / audioFrameHardCap)
+// by dropping the oldest frames. Without this, pathological run-loop
+// states — e.g. the DASH packager's behindPrevSegEnd gate blocking
+// cuts while the per-segment dur drifts ahead of wallclock — let the
+// queue grow without bound and pin tens
 // of MB of AnnexB / ADTS bytes per stream. Production hit ~692 MB
 // across 14 streams (May 12 incident: dash.handleH264 = 83% of heap),
 // which the cap converts into a bounded drop instead.
 const (
-	// maxVideoFrames bounds per-track video retention. At 30 fps a
-	// reasonable upper limit on un-popped video is ~30 s — enough to
-	// absorb a few segments' worth of pending frames during pacing-gate
-	// holds, well short of multi-minute accumulation that causes OOM.
-	maxVideoFrames = 900
-	// maxAudioFrames bounds per-track audio retention. AAC at 48 kHz
-	// runs ~47 frames/s, so 900 frames ≈ 19 s of audio — paired with
-	// the video cap, keeps both tracks roughly aligned in retention.
-	maxAudioFrames = 900
+	// maxQueueSpanMs is the per-track time-domain cap (newest.PTSms −
+	// oldest.PTSms ≤ this value). PRIMARY cap.
+	//
+	// Reason it's time-based, not frame-count: a frame-count cap of N
+	// produces unequal time-spans for V vs A because their frame rates
+	// differ (25 fps video → 40 ms/frame; 44.1 kHz AAC → 23 ms/frame).
+	// On a bursty source that saturates both caps, video span ≈ 36 s
+	// and audio span ≈ 21 s, leaving audio_first 15 s AFTER video_first
+	// permanently. The segmenter's audio cut decision uses
+	// `audioCountAtOrBefore(cutPTSms_video)` where cutPTSms_video sits
+	// near video_first + segDur, so the audio frames that should pair
+	// with that video segment are NEVER counted (they've been dropped
+	// off the front of the audio queue under cap pressure). Result: 5/9
+	// production streams emitted exactly 1–2 audio segments at startup
+	// then no more for 11 hours — root cause documented in
+	// docs/DASH_INVESTIGATION_2026-05-13.md.
+	//
+	// 30 s is the smallest value that comfortably exceeds typical
+	// segDur×live_window (4 s × 6 = 24 s) plus headroom for the
+	// pacing-gate hold and one pre-roll segment.
+	maxQueueSpanMs uint64 = 30_000
+
+	// videoFrameHardCap / audioFrameHardCap are SECONDARY caps: an
+	// absolute upper bound on slice length, sized well above what
+	// maxQueueSpanMs would ever permit. They exist as an OOM safety net
+	// for pathological PTS values (regression, overflow) where the
+	// time-span computation can't trim the queue.
+	//
+	// At 60 fps × 60 s = 3600 video frames; at 48 kHz × 70 s = 3 281
+	// audio frames. Both round up to round numbers below.
+	videoFrameHardCap = 3600
+	audioFrameHardCap = 3500
 )
 
 // FrameQueue is the per-Packager FIFO of decoded video + audio access
@@ -103,30 +127,85 @@ func NewFrameQueue() *FrameQueue {
 // PushVideo appends a video frame. The queue takes ownership of f.AnnexB
 // — callers must not retain a reference.
 //
-// Drops the oldest frame(s) when the queue would exceed maxVideoFrames.
-// Returns the number of frames dropped (≥ 0). Production should normally
-// see 0 here; non-zero indicates the segmenter has fallen too far behind
-// and downstream MPD timeline integrity is already compromised — the
-// drop is the lesser evil that prevents OOM.
-func (q *FrameQueue) PushVideo(f VideoFrame) int {
-	dropped := 0
-	if len(q.video) >= maxVideoFrames {
-		dropped = len(q.video) - maxVideoFrames + 1
-		q.video = dropFrontVideo(q.video, dropped)
+// Cap policy:
+//   - PRIMARY: time-span. Drop oldest while
+//     newest.PTSms − oldest.PTSms > maxQueueSpanMs.
+//   - SECONDARY: frame-count hard cap (videoFrameHardCap) — OOM safety
+//     net for pathological PTS values.
+//
+// Returns (droppedOldest, oooDetected). oooDetected=true when the
+// pushed frame's PTSms is strictly less than the queue's prior tail,
+// indicating either a non-monotonic source OR (commonly for H.264)
+// a B-frame whose presentation order is later than its decode order.
+// The flag is informational: B-frame OOO is expected and downstream
+// segmenter math tolerates it; persistent audio OOO is anomalous.
+func (q *FrameQueue) PushVideo(f VideoFrame) (int, bool) {
+	dropped := q.trimVideoToSpan(f.PTSms)
+	if len(q.video) >= videoFrameHardCap {
+		extra := len(q.video) - videoFrameHardCap + 1
+		q.video = dropFrontVideo(q.video, extra)
+		dropped += extra
+	}
+	ooo := false
+	if n := len(q.video); n > 0 && f.PTSms < q.video[n-1].PTSms {
+		ooo = true
 	}
 	q.video = append(q.video, f)
+	return dropped, ooo
+}
+
+// PushAudio appends an audio frame. See PushVideo for cap + OOO
+// semantics. Audio has no B-frames so an OOO push genuinely indicates
+// a non-monotonic source — production should never log this.
+func (q *FrameQueue) PushAudio(f AudioFrame) (int, bool) {
+	dropped := q.trimAudioToSpan(f.PTSms)
+	if len(q.audio) >= audioFrameHardCap {
+		extra := len(q.audio) - audioFrameHardCap + 1
+		q.audio = dropFrontAudio(q.audio, extra)
+		dropped += extra
+	}
+	ooo := false
+	if n := len(q.audio); n > 0 && f.PTSms < q.audio[n-1].PTSms {
+		ooo = true
+	}
+	q.audio = append(q.audio, f)
+	return dropped, ooo
+}
+
+// trimVideoToSpan drops oldest video frames while the gap between
+// newPTSms and the queue's oldest exceeds maxQueueSpanMs. Returns the
+// drop count. No-op when the new frame's PTSms is < the oldest's
+// (defensive: would otherwise underflow uint64 subtraction).
+func (q *FrameQueue) trimVideoToSpan(newPTSms uint64) int {
+	dropped := 0
+	for len(q.video) > 0 {
+		first := q.video[0].PTSms
+		if newPTSms < first {
+			break // OOO new frame; let append handle it without trimming
+		}
+		if newPTSms-first <= maxQueueSpanMs {
+			break
+		}
+		q.video = dropFrontVideo(q.video, 1)
+		dropped++
+	}
 	return dropped
 }
 
-// PushAudio appends an audio frame. Drops the oldest when over the cap;
-// see PushVideo for the rationale.
-func (q *FrameQueue) PushAudio(f AudioFrame) int {
+// trimAudioToSpan is the audio counterpart of trimVideoToSpan.
+func (q *FrameQueue) trimAudioToSpan(newPTSms uint64) int {
 	dropped := 0
-	if len(q.audio) >= maxAudioFrames {
-		dropped = len(q.audio) - maxAudioFrames + 1
-		q.audio = dropFrontAudio(q.audio, dropped)
+	for len(q.audio) > 0 {
+		first := q.audio[0].PTSms
+		if newPTSms < first {
+			break
+		}
+		if newPTSms-first <= maxQueueSpanMs {
+			break
+		}
+		q.audio = dropFrontAudio(q.audio, 1)
+		dropped++
 	}
-	q.audio = append(q.audio, f)
 	return dropped
 }
 
@@ -334,4 +413,40 @@ func (q *FrameQueue) audioCountAtOrBefore(thresholdMS uint64) int {
 		n++
 	}
 	return n
+}
+
+// audioCountAtOrBeforeWithSkip is the diagnostic variant of
+// audioCountAtOrBefore: returns the same count plus skippedQualifying =
+// number of frames at indices ≥ n whose PTSms ≤ thresholdMS (i.e.,
+// frames that would qualify but were excluded because the sequential
+// scan stopped at an OOO frame). When skippedQualifying > 0 the queue
+// is non-monotonic AND the OOO frame sits exactly at the count boundary
+// — a smoking gun for hypothesis 1.
+func (q *FrameQueue) audioCountAtOrBeforeWithSkip(thresholdMS uint64) (count, skippedQualifying int) {
+	for count < len(q.audio) && q.audio[count].PTSms <= thresholdMS {
+		count++
+	}
+	for i := count; i < len(q.audio); i++ {
+		if q.audio[i].PTSms <= thresholdMS {
+			skippedQualifying++
+		}
+	}
+	return count, skippedQualifying
+}
+
+// AudioTailPTSms returns the newest queued audio frame's PTSms and
+// presence flag. Diagnostic helper.
+func (q *FrameQueue) AudioTailPTSms() (uint64, bool) {
+	if len(q.audio) == 0 {
+		return 0, false
+	}
+	return q.audio[len(q.audio)-1].PTSms, true
+}
+
+// VideoTailPTSms returns the newest queued video frame's PTSms.
+func (q *FrameQueue) VideoTailPTSms() (uint64, bool) {
+	if len(q.video) == 0 {
+		return 0, false
+	}
+	return q.video[len(q.video)-1].PTSms, true
 }

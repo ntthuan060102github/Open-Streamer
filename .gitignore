@@ -43,3 +43,6 @@ bin/
 dist/
 
 open_streamer.yaml
+
+# Private investigation notes (per-session, not for repo)
+docs/DASH_INVESTIGATION_*.md

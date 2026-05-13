@@ -42,40 +42,41 @@ func TestCut_BelowSegDurHolds(t *testing.T) {
 	// 1 s of video (25 frames @ 40 ms) — below 2 s target.
 	fillVideo(q, 25, 40, 25)
 
-	d := s.Cut(time.Now(), q, true, true)
+	d := s.Cut(time.Now(), q, true, true, 44100)
 	if d.Ok {
 		t.Fatalf("expected no cut on 1s content (segDur=2s), got %+v", d)
 	}
 }
 
-// TestCut_AtIDRBoundary — segmenter cuts at the trailing IDR once segDur
-// of content is queued.
+// TestCut_AtIDRBoundary — segmenter cuts just BEFORE the trailing IDR
+// once segDur of content is queued; the IDR itself stays for the next
+// segment so every emitted segment starts at a SAP boundary (DASH
+// startWithSAP="1"). Strict players (Safari/VT) reject any segment that
+// doesn't begin with an IDR.
 func TestCut_AtIDRBoundary(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 	// 3 s of video @ 40 ms spacing = 75 frames. GOP=25 (1s) → IDRs at
-	// indexes 0, 25, 50. We expect the cut at index 50 (the trailing
-	// IDR within segDur window).
+	// indexes 0, 25, 50. First IDR past segDur (2 s) is index 50 — cut
+	// drains frames 0..49 (50 frames), leaving the IDR at index 50 as
+	// the new head of the queue for the next segment.
 	fillVideo(q, 75, 40, 25)
 	fillAudio(q, 100, 23) // plenty of audio
 
-	d := s.Cut(time.Now(), q, true, true)
+	d := s.Cut(time.Now(), q, true, true, 44100)
 	if !d.Ok {
 		t.Fatalf("expected cut, got Ok=false")
 	}
 	if !d.IsIDRAligned {
 		t.Errorf("expected IDR-aligned cut, got IsIDRAligned=false")
 	}
-	// The trailing IDR is at index 50 → VideoCount = 51 (drain up to
-	// and including that frame).
-	if d.VideoCount != 51 {
-		t.Errorf("VideoCount = %d, want 51 (drain through IDR at index 50)", d.VideoCount)
+	if d.VideoCount != 50 {
+		t.Errorf("VideoCount = %d, want 50 (drain up to but NOT including IDR at index 50)", d.VideoCount)
 	}
-	// Audio count: frames with PTSms ≤ video[50].PTSms = 50*40 = 2000.
-	// audio PTS = 0, 23, 46, ..., 23*86=1978, 23*87=2001. So 87 frames
-	// (indexes 0..86) are ≤ 2000.
-	if d.AudioCount != 87 {
-		t.Errorf("AudioCount = %d, want 87 (frames ≤ 2000ms)", d.AudioCount)
+	// V/A coupling math: nextPTSms = videoPTSAt(50) = 2000 ms.
+	// totalSamples = 2000 × 44100 / 1000 = 88200; targetA = 88200/1024 = 86.
+	if d.AudioCount != 86 {
+		t.Errorf("AudioCount = %d, want 86 (round(2000ms × 44100/1024/1000))", d.AudioCount)
 	}
 }
 
@@ -83,21 +84,24 @@ func TestCut_AtIDRBoundary(t *testing.T) {
 // whose PTS is at least segDur past the queue's first frame. This
 // keeps segment durs ≤ segDur, preventing the overlapping-timeline
 // problem where frame-PTS-span exceeded inter-cut wallclock and the
-// MPD's (t, d) describes overlapping ranges.
+// MPD's (t, d) describes overlapping ranges. The IDR itself is NOT
+// drained — it stays as the next segment's first frame so the SAP
+// invariant holds across segment boundaries.
 func TestCut_PrefersFirstIDRPastSegDur(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 	// 4 s of video @ 40 ms, GOP=25 → IDRs at 0, 25, 50, 75 (PTS 0, 1000,
 	// 2000, 3000). With segDur=2 s, the first IDR whose PTS ≥ 2000ms
-	// is index 50 (PTS 2000). Cut drains frames 0..50 = 51 frames.
+	// is index 50 (PTS 2000). Cut drains frames 0..49 = 50 frames,
+	// leaving the IDR at index 50 for the next segment.
 	fillVideo(q, 100, 40, 25)
 
-	d := s.Cut(time.Now(), q, true, false)
+	d := s.Cut(time.Now(), q, true, false, 0)
 	if !d.Ok || !d.IsIDRAligned {
 		t.Fatalf("expected IDR cut, got %+v", d)
 	}
-	if d.VideoCount != 51 {
-		t.Errorf("VideoCount = %d, want 51 (drain through index 50, first IDR past segDur)", d.VideoCount)
+	if d.VideoCount != 50 {
+		t.Errorf("VideoCount = %d, want 50 (drain up to but NOT including IDR at index 50)", d.VideoCount)
 	}
 }
 
@@ -122,7 +126,7 @@ func TestCut_NoIDRWaitingForSafetyNet(t *testing.T) {
 	// lastCut is zero (first cut). Span is 4960 ms (124*40). maxFactor=3,
 	// segDur=2s → maxElapsedMS=6000. Span 4960 < 6000 → no cold-start
 	// safety-net yet.
-	d := s.Cut(time.Now(), q, true, false)
+	d := s.Cut(time.Now(), q, true, false, 0)
 	if d.Ok {
 		t.Fatalf("expected hold (span < maxElapsed), got %+v", d)
 	}
@@ -133,7 +137,7 @@ func TestCut_NoIDRWaitingForSafetyNet(t *testing.T) {
 		q.PushVideo(VideoFrame{PTSms: pts, DTSms: pts, IsIDR: false})
 	}
 	// Now span = 199*40 = 7960 ms > 6000 → cold-start safety-net fires.
-	d = s.Cut(time.Now(), q, true, false)
+	d = s.Cut(time.Now(), q, true, false, 0)
 	if !d.Ok {
 		t.Fatal("expected safety-net cut after span exceeds maxElapsed")
 	}
@@ -161,13 +165,13 @@ func TestCut_SafetyNetByElapsedWallclock(t *testing.T) {
 	}
 
 	// Less than 6s elapsed → hold.
-	d := s.Cut(t0.Add(3*time.Second), q, true, false)
+	d := s.Cut(t0.Add(3*time.Second), q, true, false, 0)
 	if d.Ok {
 		t.Fatalf("expected hold (3s < 6s deadline), got %+v", d)
 	}
 
 	// Past the 6s deadline → cut everything.
-	d = s.Cut(t0.Add(7*time.Second), q, true, false)
+	d = s.Cut(t0.Add(7*time.Second), q, true, false, 0)
 	if !d.Ok {
 		t.Fatal("expected wallclock safety-net cut at 7s elapsed")
 	}
@@ -177,27 +181,92 @@ func TestCut_SafetyNetByElapsedWallclock(t *testing.T) {
 }
 
 // TestCut_AudioOnlyStream — no video init at all; segmenter cuts on
-// audio span ≥ segDur.
+// audio span ≥ segDur and emits ~segDur worth of frames per cut (NOT
+// the entire queue — that produced 28-second segments on bursty
+// sources where the queue saturated to maxQueueSpanMs of audio).
 func TestCut_AudioOnlyStream(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
 
 	// 50 audio frames @ 23 ms = ~1.15s — below segDur.
 	fillAudio(q, 50, 23)
-	d := s.Cut(time.Now(), q, false, true)
+	d := s.Cut(time.Now(), q, false, true, 0)
 	if d.Ok {
 		t.Fatalf("audio-only below segDur should hold, got %+v", d)
 	}
 
-	// 100 frames @ 23ms = ~2.3s — above segDur.
+	// 100 frames @ 23ms = ~2.3s — above segDur. Cut takes ~segDur
+	// worth (= floor(2000/23)+1 = 87 frames whose PTSms ≤ 0+2000).
+	// Remaining frames stay queued for the next cut.
 	q2 := NewFrameQueue()
 	fillAudio(q2, 100, 23)
-	d = s.Cut(time.Now(), q2, false, true)
+	d = s.Cut(time.Now(), q2, false, true, 0)
 	if !d.Ok || d.VideoCount != 0 {
 		t.Fatalf("audio-only cut: want Ok=true VideoCount=0, got %+v", d)
 	}
-	if d.AudioCount != 100 {
-		t.Errorf("AudioCount = %d, want 100 (drain all)", d.AudioCount)
+	if d.AudioCount != 87 {
+		t.Errorf("AudioCount = %d, want 87 (~segDur worth, not drain all)", d.AudioCount)
+	}
+
+	// Pathological burst: 1000 frames @ 21 ms = ~21 s queued at once
+	// (simulates 48 kHz AAC where frame spacing = 1024/48000 ≈ 21.3 ms).
+	// Without the segDur cap we'd emit a 21 s segment; with it we emit
+	// ~segDur worth and let subsequent cuts drain the rest.
+	q3 := NewFrameQueue()
+	fillAudio(q3, 1000, 21)
+	d = s.Cut(time.Now(), q3, false, true, 0)
+	if !d.Ok {
+		t.Fatalf("burst audio cut: want Ok=true, got %+v", d)
+	}
+	// At 21 ms spacing, segDur 2 s ≈ 96 frames. Allow slack for off-by-one.
+	if d.AudioCount > 110 {
+		t.Errorf("burst AudioCount = %d, want close to segDur worth (~96), not entire queue", d.AudioCount)
+	}
+}
+
+// TestCut_HybridResidualConverges — the V/A duration coupling math
+// (targetA = V_dur × sr / 1024 / 1000) rarely lands on a whole AAC
+// frame boundary. Without the residual accumulator, integer truncation
+// produces a fixed per-cut deficit that compounds into V/A drift over
+// the session (test2 saw 8 ms/cut × 88 cuts = 0.7 s drift before this
+// fix). This test simulates 100 sequential cuts at 5 s V dur, 48 kHz
+// audio, and asserts cumulative A dur catches up to cumulative V dur
+// within one frame.
+func TestCut_HybridResidualConverges(t *testing.T) {
+	const segDurMs uint64 = 5000
+	const sr uint64 = 48000
+	const nCuts = 100
+	s := NewSegmenter(time.Duration(segDurMs)*time.Millisecond, 3)
+
+	var totalAudioFrames uint64
+	for i := 0; i < nCuts; i++ {
+		q := NewFrameQueue()
+		// 175 frames @ 40 ms = 7 s span; IDR every 50 frames (2 s GOP)
+		// → IDRs at indexes 0, 50, 100, 150. The first IDR past
+		// segDur (5 s) is at index 125 (PTS 5000) — wait, index 150
+		// is at PTS 6000. We expect findIDRCutPoint to pick index
+		// 125's IDR. Actually IDRs are only at multiples of 50, so
+		// first IDR past 5000 ms is at index 150 (PTS 6000 ms).
+		fillVideo(q, 175, 40, 50)
+		// Plenty of audio so the cut isn't held.
+		fillAudio(q, 500, 21) // 48 kHz frames are ~21.33 ms; use 21
+		d := s.Cut(time.Now(), q, true, true, sr)
+		if !d.Ok {
+			t.Fatalf("cut %d held unexpectedly; AudioLen=%d", i, q.AudioLen())
+		}
+		totalAudioFrames += uint64(d.AudioCount) //nolint:gosec
+	}
+
+	// Each V cut spans frames 0..149 (cut just BEFORE the IDR at
+	// index 150, which has PTS 6000 ms and stays for the next
+	// segment). vCount=150; nextPTSms = videoPTSAt(150) = 6000 ms.
+	// Hybrid math: vDurMs = nextPTSms − first.PTSms = 6000.
+	// cumulativeV = nCuts × 6000.
+	cumulativeVMs := uint64(nCuts) * 6000
+	cumulativeAMs := totalAudioFrames * 1024 * 1000 / sr
+	deltaMs := int64(cumulativeVMs) - int64(cumulativeAMs)
+	if deltaMs > 21 || deltaMs < -21 {
+		t.Errorf("cumulative drift after %d cuts = %d ms, want |drift| ≤ 21 ms (one AAC frame at 48 kHz)", nCuts, deltaMs)
 	}
 }
 
@@ -206,7 +275,7 @@ func TestCut_AudioOnlyStream(t *testing.T) {
 func TestCut_NoTracksAtAll(t *testing.T) {
 	s := NewSegmenter(2*time.Second, 3)
 	q := NewFrameQueue()
-	d := s.Cut(time.Now(), q, false, false)
+	d := s.Cut(time.Now(), q, false, false, 0)
 	if d.Ok {
 		t.Errorf("no-tracks Cut should return Ok=false, got %+v", d)
 	}
@@ -227,14 +296,14 @@ func TestMarkCut_ResetsSafetyNet(t *testing.T) {
 	}
 
 	// 5s after MarkCut(t0) — below 6s deadline.
-	if d := s.Cut(t0.Add(5*time.Second), q, true, false); d.Ok {
+	if d := s.Cut(t0.Add(5*time.Second), q, true, false, 0); d.Ok {
 		t.Fatal("5s elapsed should not trip safety-net")
 	}
 
 	// Mark a NEW cut at 4s; subsequent check measures from there.
 	s.MarkCut(t0.Add(4 * time.Second))
 	// At t0+5s, only 1s since the new MarkCut → still below deadline.
-	if d := s.Cut(t0.Add(5*time.Second), q, true, false); d.Ok {
+	if d := s.Cut(t0.Add(5*time.Second), q, true, false, 0); d.Ok {
 		t.Fatal("1s since MarkCut should not trip safety-net")
 	}
 }

@@ -139,8 +139,12 @@ func TestPackager_AVPath_WritesInitAndSegments(t *testing.T) {
 		}
 		pushAV(t, bs, id, domain.AVCodecH264, frame, pts, pts, isKey)
 	}
-	// 30 AAC frames at 23ms cadence (~690ms of audio).
-	for i := 0; i < 30; i++ {
+	// 50 AAC frames at 23ms cadence (~1150ms of audio). Hybrid V/A
+	// coordination requires audio queue to hold targetA frames where
+	// targetA = round(V_dur_ms × sr / 1024 / 1000). For this test's
+	// 800 ms V cut at 44.1 kHz: targetA ≈ 34 — push more than that so
+	// the cut isn't held.
+	for i := 0; i < 50; i++ {
 		pushAV(t, bs, id, domain.AVCodecAAC, testADTSFrame, uint64(i)*23, uint64(i)*23, false) //nolint:gosec
 	}
 
@@ -216,14 +220,61 @@ func TestPackager_PairingGate_HoldsUntilBothTracks(t *testing.T) {
 		t.Fatal("pairing gate failed to hold first flush")
 	}
 
-	// Now push audio. Pairing achieved → segments emit.
-	for i := 0; i < 30; i++ {
+	// Now push audio. Pairing achieved → segments emit. Need at least
+	// targetA frames where targetA = round(V_dur_ms × sr / 1024 / 1000),
+	// = ~34 for 800 ms V cut at 44.1 kHz. Push 50 with slack.
+	for i := 0; i < 50; i++ {
 		pushAV(t, bs, id, domain.AVCodecAAC, testADTSFrame, uint64(i)*23, uint64(i)*23, false) //nolint:gosec
 	}
 	waitForFile(t, filepath.Join(p.cfg.StreamDir, "seg_v_00001.m4s"), 2*time.Second)
 	waitForFile(t, filepath.Join(p.cfg.StreamDir, "seg_a_00001.m4s"), 2*time.Second)
 	cancel()
 	<-doneCh
+}
+
+// TestPackager_AccumulateVideoPS_LargeFramesBeforeSPS — regression
+// test for the bac_ninh/track_1 1080p ABR shard failure. Before the
+// per-frame NAL extractor, accumulateVideoPS blindly appended every
+// frame's full Annex-B bytes to p.videoPS. 1080p frames are 50-200 KB,
+// so after ~10 frames with no inline SPS/PPS the 1 MiB cap fired and
+// videoPSGivenUp latched — even though SPS/PPS would have arrived
+// inline with the next IDR. The extractor must keep p.videoPS tiny
+// regardless of frame size, so the cap never fires under normal
+// operation.
+func TestPackager_AccumulateVideoPS_LargeFramesBeforeSPS(t *testing.T) {
+	p, _, _, done := setupPackager(t, true)
+	defer done()
+
+	// 20 large (150 KB) non-IDR frames with NO SPS/PPS. Total 3 MB —
+	// well past the legacy 1 MiB cap.
+	largeNonIDR := make([]byte, 4+150*1024)
+	largeNonIDR[0], largeNonIDR[1], largeNonIDR[2], largeNonIDR[3] = 0, 0, 0, 1
+	// NAL type 1 = non-IDR slice; rest is junk payload bytes.
+	largeNonIDR[4] = 0x41
+	for i := 5; i < len(largeNonIDR); i++ {
+		largeNonIDR[i] = byte(i & 0xff)
+	}
+	for i := 0; i < 20; i++ {
+		p.accumulateVideoPS(largeNonIDR)
+		if p.videoPSGivenUp {
+			t.Fatalf("accumulator gave up after %d large non-IDR frames (3 MB+); pre-fix bug regressed", i+1)
+		}
+	}
+	if p.videoInit != nil {
+		t.Fatal("videoInit should NOT be built yet — no SPS/PPS seen")
+	}
+	if got := len(p.videoPS); got > 1024 {
+		t.Errorf("p.videoPS = %d bytes after 20 large non-IDR frames; expected tiny (no parameter sets to store)", got)
+	}
+
+	// Now feed an IDR carrying inline SPS+PPS. Extractor must pick
+	// them up; tryBuildVideoInit must succeed.
+	idrWithPS := buildH264IDR()
+	p.accumulateVideoPS(idrWithPS)
+	p.tryBuildVideoInit()
+	if p.videoInit == nil {
+		t.Fatal("videoInit not built after SPS+PPS IDR; extractor missed them")
+	}
 }
 
 // TestPackager_PairingTimeout_VideoOnly — when audio never arrives,
@@ -389,7 +440,9 @@ func TestPackager_ABRMode_NotifiesMaster(t *testing.T) {
 		}
 		pushAV(t, bs, streamID, domain.AVCodecH264, frame, pts, pts, isKey)
 	}
-	for i := 0; i < 30; i++ {
+	// 50 AAC frames at 23 ms; hybrid V/A targetA ≈ 34 for an 800 ms V
+	// cut at 44.1 kHz. Push enough to clear the coordination check.
+	for i := 0; i < 50; i++ {
 		pushAV(t, bs, streamID, domain.AVCodecAAC, testADTSFrame, uint64(i)*23, uint64(i)*23, false) //nolint:gosec
 	}
 
