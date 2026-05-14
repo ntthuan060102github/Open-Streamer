@@ -673,8 +673,9 @@ func (s *Service) monitor(ctx context.Context, streamID domain.StreamCode) {
 	}
 }
 
-// checkHealth detects active-input timeouts and schedules probes for degraded inputs.
-// It holds state.mu only briefly to collect work items, then acts outside the lock.
+// checkHealth detects active-input timeouts, schedules probes for degraded
+// inputs, and sweeps for pending failbacks. It holds state.mu only briefly
+// to collect work items, then acts outside the lock.
 func (s *Service) checkHealth(streamID domain.StreamCode) {
 	s.mu.RLock()
 	state, ok := s.streams[streamID]
@@ -688,6 +689,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 	timedOutPriority := -1
 	timedOutDetail := ""
 	var probeTasks []probeTask
+	needsFailback := false
 
 	state.mu.Lock()
 	if !state.dead {
@@ -695,6 +697,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 			s.collectTimeoutIfNeeded(state, h, priority, now, timeout, &timedOutPriority, &timedOutDetail)
 			s.collectProbeIfNeeded(state, h, priority, now, &probeTasks)
 		}
+		needsFailback = shouldFailbackNow(state, now)
 	}
 	state.mu.Unlock()
 
@@ -714,6 +717,51 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 	for _, task := range probeTasks {
 		go s.runProbe(streamID, state, task) //nolint:contextcheck // probe uses state.monCtx internally
 	}
+	if needsFailback {
+		// Idempotent: tryFailover re-evaluates selectBest under its own lock
+		// and early-returns when best already equals active. Calling it on
+		// every tick costs a constant-time check, with no side effects when
+		// state has changed between this collect and the actual failover.
+		s.tryFailover(streamID, state, SwitchReasonFailback, "")
+	}
+}
+
+// shouldFailbackNow reports whether the stream has a healthy higher-priority
+// input that should preempt the current active. Caller must hold state.mu.
+//
+// Why this lives outside runProbe: the existing failback trigger (line ~987)
+// only fires when a probe completes AFTER failbackSwitchCooldown has elapsed.
+// If a probe runs and succeeds within the cooldown window (e.g. probeCooldown=8s
+// vs switchCooldown=12s — a 4s race window), the input promotes to Idle but
+// no failback ever fires, leaving the stream stuck on the lower-priority
+// fallback (typically a maintenance VOD) until manual intervention. The
+// ca_mau bug observed on prod-flussonic-100 was exactly this race.
+//
+// The sweeper here re-evaluates every monitor tick (2s), so a "missed"
+// failback at probe time gets retried on the next tick with full cooldown
+// elapsed. Idempotent — when best already equals active, tryFailover is a
+// no-op (line ~800 early return).
+//
+// Honors operator overrides via selectBest: if overridePriority pins to a
+// specific input, selectBest returns that input regardless of its actual
+// priority value, which makes `best.Input.Priority < state.active`
+// evaluate against the pinned choice rather than the natural lowest.
+func shouldFailbackNow(state *streamState, now time.Time) bool {
+	if state.exhausted {
+		// Exhausted recovery is RecordPacket / runProbe's job — they emit
+		// SwitchReasonRecovery which restarts the worker even when best
+		// equals active. The sweeper handles only true failbacks
+		// (preempting a lower-priority fallback).
+		return false
+	}
+	if now.Sub(state.lastSwitchAt) < failbackSwitchCooldown {
+		return false
+	}
+	best := selectBest(state)
+	if best == nil {
+		return false
+	}
+	return best.Input.Priority < state.active
 }
 
 // collectTimeoutIfNeeded sets active input as degraded if no packet arrived within the timeout.
