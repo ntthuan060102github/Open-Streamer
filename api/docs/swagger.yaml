@@ -411,22 +411,6 @@ definitions:
       level:
         description: trace | debug | info | warn | error
         type: string
-      trace_modules:
-        description: |-
-          TraceModules selects which modules emit per-function trace logs
-          when Level is "trace". Module names match what each package
-          passes to diag.New (e.g. "ingestor", "transcoder",
-          "publisher.dash"). Empty = no trace output even when Level is
-          trace. Wildcard "*" enables every registered module.
-
-          Per-module gating exists because trace volume is enormous: a
-          "trace everything" run on 21 streams floods journalctl in
-          minutes. Operators flip on one module at a time during a bug
-          hunt — via this field at startup or via POST /admin/trace at
-          runtime (no restart).
-        items:
-          type: string
-        type: array
     type: object
   config.ManagerConfig:
     properties:
@@ -654,8 +638,6 @@ definitions:
     type: object
   domain.EventType:
     enum:
-    - session.opened
-    - session.closed
     - stream.created
     - stream.updated
     - stream.started
@@ -685,6 +667,8 @@ definitions:
     - hook.created
     - hook.updated
     - hook.deleted
+    - session.opened
+    - session.closed
     type: string
     x-enum-comments:
       EventDVRSegmentPruned: retention loop deleted an aged-out segment
@@ -701,8 +685,6 @@ definitions:
       EventPushStarted: dialing target, pre-handshake
       EventStreamUpdated: PUT /streams/{code} on existing record
     x-enum-descriptions:
-    - ""
-    - ""
     - ""
     - PUT /streams/{code} on existing record
     - ""
@@ -732,9 +714,9 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
-    - EventSessionOpened
-    - EventSessionClosed
     - EventStreamCreated
     - EventStreamUpdated
     - EventStreamStarted
@@ -764,6 +746,8 @@ definitions:
     - EventHookCreated
     - EventHookUpdated
     - EventHookDeleted
+    - EventSessionOpened
+    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:

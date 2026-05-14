@@ -2256,13 +2256,6 @@ const docTemplate = `{
                 "level": {
                     "description": "trace | debug | info | warn | error",
                     "type": "string"
-                },
-                "trace_modules": {
-                    "description": "TraceModules selects which modules emit per-function trace logs\nwhen Level is \"trace\". Module names match what each package\npasses to diag.New (e.g. \"ingestor\", \"transcoder\",\n\"publisher.dash\"). Empty = no trace output even when Level is\ntrace. Wildcard \"*\" enables every registered module.\n\nPer-module gating exists because trace volume is enormous: a\n\"trace everything\" run on 21 streams floods journalctl in\nminutes. Operators flip on one module at a time during a bug\nhunt — via this field at startup or via POST /admin/trace at\nruntime (no restart).",
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
                 }
             }
         },
@@ -2527,8 +2520,6 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.updated",
                 "stream.started",
@@ -2557,7 +2548,9 @@ const docTemplate = `{
                 "watermark.asset_deleted",
                 "hook.created",
                 "hook.updated",
-                "hook.deleted"
+                "hook.deleted",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2574,8 +2567,6 @@ const docTemplate = `{
                 "EventStreamUpdated": "PUT /streams/{code} on existing record"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "PUT /streams/{code} on existing record",
                 "",
@@ -2604,11 +2595,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamUpdated",
                 "EventStreamStarted",
@@ -2637,7 +2628,9 @@ const docTemplate = `{
                 "EventWatermarkAssetDeleted",
                 "EventHookCreated",
                 "EventHookUpdated",
-                "EventHookDeleted"
+                "EventHookDeleted",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {

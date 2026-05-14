@@ -13,10 +13,10 @@ import (
 // be parsed.
 func TestParseFFmpegFrameCount(t *testing.T) {
 	cases := []struct {
-		name    string
-		line    string
-		wantN   uint64
-		wantOk  bool
+		name   string
+		line   string
+		wantN  uint64
+		wantOk bool
 	}{
 		{
 			name:   "tight progress line",
