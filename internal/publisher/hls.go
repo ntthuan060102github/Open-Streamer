@@ -554,6 +554,13 @@ func (p *hlsSegmenter) trimDiskLocked() {
 		old := p.onDisk[0]
 		p.onDisk = p.onDisk[1:]
 		_ = os.Remove(filepath.Join(p.streamDir, old.name))
+		logger.Trace("publisher: HLS window trim",
+			"stream_code", p.streamID,
+			"removed", old.name,
+			"window", p.window,
+			"history", p.history,
+			"on_disk_after", len(p.onDisk),
+		)
 	}
 }
 

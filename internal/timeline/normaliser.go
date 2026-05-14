@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // Config controls Normaliser behaviour. The zero value is valid and
@@ -306,6 +307,18 @@ func (n *Normaliser) Apply(p *domain.AVPacket, now time.Time) bool {
 		if target <= track.lastOutputDts {
 			target = track.lastOutputDts + 1
 		}
+		logger.Trace("normaliser: hard reanchor",
+			"session_id", n.sessionID,
+			"track", tk,
+			"reason_ahead", tooFarAhead,
+			"reason_regressed", regressed,
+			"reason_behind", tooFarBehind,
+			"drift_ms", drift,
+			"in_dts_ms", inDts,
+			"prev_output_dts_ms", track.lastOutputDts,
+			"new_output_dts_ms", target,
+			"actual_now_ms", actualNowMs,
+		)
 		track.inputOrigin = inDts
 		track.outputAnchor = target
 		track.lastOutputDts = target

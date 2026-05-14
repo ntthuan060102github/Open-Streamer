@@ -15,6 +15,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // Subscriber is a read cursor into a stream's ring buffer.
@@ -67,7 +68,7 @@ func (rb *ringBuffer) write(pkt Packet) {
 			rb.sessionStartPending = false
 		}
 	}
-	for _, s := range rb.subs {
+	for i, s := range rb.subs {
 		pc := clonePacket(pkt)
 		select {
 		case s.ch <- pc:
@@ -75,6 +76,12 @@ func (rb *ringBuffer) write(pkt Packet) {
 			if rb.drops != nil {
 				rb.drops.Inc()
 			}
+			logger.Trace("buffer: fan-out drop (subscriber chan full)",
+				"subscriber_idx", i,
+				"chan_len", len(s.ch),
+				"chan_cap", cap(s.ch),
+				"subscriber_count", len(rb.subs),
+			)
 		}
 	}
 }
@@ -85,6 +92,15 @@ func (rb *ringBuffer) subscribe(chanSize int) *Subscriber {
 	rb.subs = append(rb.subs, s)
 	rb.mu.Unlock()
 	return s
+}
+
+// subscriberCount returns the number of live consumers attached to the
+// buffer. Trace logs use it to surface fan-out width without giving the
+// caller raw access to the subs slice.
+func (rb *ringBuffer) subscriberCount() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return len(rb.subs)
 }
 
 func (rb *ringBuffer) unsubscribe(s *Subscriber) {
@@ -246,7 +262,13 @@ func (s *Service) Subscribe(id domain.StreamCode) (*Subscriber, error) {
 	if !ok {
 		return nil, fmt.Errorf("buffer: stream %s not found", id)
 	}
-	return rb.subscribe(s.cfg.Capacity), nil
+	sub := rb.subscribe(s.cfg.Capacity)
+	logger.Trace("buffer: subscribe",
+		"stream_code", id,
+		"chan_size", s.cfg.Capacity,
+		"subscriber_count", rb.subscriberCount(),
+	)
+	return sub, nil
 }
 
 // Unsubscribe removes a consumer and closes its channel.
@@ -256,6 +278,10 @@ func (s *Service) Unsubscribe(id domain.StreamCode, sub *Subscriber) {
 	s.mu.RUnlock()
 	if ok {
 		rb.unsubscribe(sub)
+		logger.Trace("buffer: unsubscribe",
+			"stream_code", id,
+			"subscriber_count", rb.subscriberCount(),
+		)
 	}
 }
 

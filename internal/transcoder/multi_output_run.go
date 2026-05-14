@@ -41,6 +41,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // runStreamEncoder is the multi-output equivalent of runProfileEncoder. It
@@ -117,6 +118,14 @@ func (s *Service) runStreamEncoder(
 		if runErr != nil {
 			errMsg = runErr.Error()
 		}
+		logger.Trace("transcoder: ffmpeg crash classified",
+			"stream_code", logStream,
+			"attempt", attempt,
+			"run_dur_ms", runDur.Milliseconds(),
+			"sustained", runDur >= healthSustainDur,
+			"consecutive_fast_crashes", consecutiveFastCrashes,
+			"err", errMsg,
+		)
 		// Multi-output crash affects every profile — record the same error
 		// against each so the per-profile error history accurately shows
 		// "all rungs went down together".
@@ -240,6 +249,7 @@ func (s *Service) runOnceMultiOutput(
 		return true, fmt.Errorf("stderr pipe: %w", err)
 	}
 
+	startWall := time.Now()
 	if err := cmd.Start(); err != nil {
 		cleanupPipes()
 		return true, fmt.Errorf("ffmpeg start: %w", err)
@@ -254,6 +264,12 @@ func (s *Service) runOnceMultiOutput(
 	slog.Info("transcoder: stream encoder started (multi-output)",
 		"stream_code", logStream,
 		"profiles", len(targets),
+	)
+	logger.Trace("transcoder: ffmpeg spawned",
+		"stream_code", logStream,
+		"pid", cmd.Process.Pid,
+		"args", cmd.Args,
+		"output_pipes", len(writers),
 	)
 
 	// Mint a fresh StreamSession on every rendition output buffer. Same
@@ -351,6 +367,14 @@ func (s *Service) runOnceMultiOutput(
 	_ = stdin.Close()
 	stdinWG.Wait()
 	readerWG.Wait()
+
+	logger.Trace("transcoder: ffmpeg exited",
+		"stream_code", logStream,
+		"pid", cmd.Process.Pid,
+		"uptime_ms", time.Since(startWall).Milliseconds(),
+		"wait_err", waitErr,
+		"ctx_cancelled", ctx.Err() != nil,
+	)
 
 	if waitErr != nil && ctx.Err() == nil {
 		stderrCtx := formatStderrTail(tail.snapshot())

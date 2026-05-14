@@ -39,6 +39,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 	"github.com/samber/do/v2"
 )
 
@@ -806,6 +807,7 @@ func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState, re
 	bestInput := best.Input
 	bufID := state.bufferWriteID
 	ctx := state.monCtx
+	sinceLast := time.Since(state.lastSwitchAt)
 	state.mu.Unlock()
 
 	slog.Info("manager: switching input",
@@ -813,6 +815,16 @@ func (s *Service) tryFailover(streamID domain.StreamCode, state *streamState, re
 		"from", prevPriority,
 		"to", bestInput.Priority,
 		"reason", reason,
+	)
+	logger.Trace("manager: tryFailover decision",
+		"stream_code", streamID,
+		"from", prevPriority,
+		"to", bestInput.Priority,
+		"reason", reason,
+		"detail", detail,
+		"was_exhausted", wasExhausted,
+		"since_last_switch_ms", sinceLast.Milliseconds(),
+		"best_url", bestInput.URL,
 	)
 
 	if err := s.ingestor.Start(ctx, streamID, bestInput, bufID); err != nil {
@@ -927,7 +939,17 @@ func (s *Service) runProbe(streamID domain.StreamCode, state *streamState, task 
 	probeCtx, cancel := context.WithTimeout(state.monCtx, probeTimeout)
 	defer cancel()
 
-	if err := s.ingestor.Probe(probeCtx, task.input); err != nil {
+	probeStart := time.Now()
+	probeErr := s.ingestor.Probe(probeCtx, task.input)
+	probeMs := time.Since(probeStart).Milliseconds()
+	logger.Trace("manager: probe outcome",
+		"stream_code", streamID,
+		"input_priority", task.priority,
+		"input_url", task.input.URL,
+		"probe_ms", probeMs,
+		"err", probeErr,
+	)
+	if probeErr != nil {
 		// Probe failure: input is still unhealthy. Record so dashboards can
 		// distinguish "probe loop alive but target down" from "probe loop
 		// dead" (= no probe metrics for N minutes — alert).

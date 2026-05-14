@@ -36,6 +36,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 	"github.com/ntt0601zcoder/open-streamer/pkg/version"
 )
 
@@ -288,6 +289,11 @@ func (r *HLSReader) poll(ctx context.Context, rawURL string, out chan hlsResult)
 
 // deliverNewSegments downloads and queues segments not yet delivered.
 // Returns false when the context was cancelled.
+//
+// Per-chunk + per-poll trace logs surface fetch / channel-block /
+// playlist-state values that pinpoint where the pull cycle stalls
+// (network bandwidth vs downstream consumer vs upstream slow). Off
+// by default; turn on via log.level=trace.
 func (r *HLSReader) deliverNewSegments(
 	ctx context.Context,
 	pl *hlsMediaPlaylist,
@@ -295,24 +301,61 @@ func (r *HLSReader) deliverNewSegments(
 	lastSeq *uint64,
 	out chan hlsResult,
 ) bool {
+	pollStart := time.Now()
+	var newCount int
+	var totalFetchMs, totalSendBlockMs, totalBytes int64
+
 	for _, seg := range pl.segments {
 		if *started && seg.seq <= *lastSeq {
 			continue
 		}
+		newCount++
+		fetchStart := time.Now()
 		data, err := r.fetchSegmentWithRetry(ctx, seg.uri)
+		fetchMs := time.Since(fetchStart).Milliseconds()
 		if err != nil {
 			if ctx.Err() != nil {
 				return false
 			}
 			slog.Warn("hls: segment fetch failed, skipping",
-				"url", seg.uri, "err", err)
+				"url", seg.uri, "fetch_ms", fetchMs, "err", err)
 			continue
 		}
-		if !r.sendResult(ctx, out, hlsResult{data: data}) {
+		totalFetchMs += fetchMs
+		totalBytes += int64(len(data))
+
+		sendStart := time.Now()
+		ok := r.sendResult(ctx, out, hlsResult{data: data})
+		sendBlockMs := time.Since(sendStart).Milliseconds()
+		totalSendBlockMs += sendBlockMs
+
+		logger.Trace("hls: chunk delivered",
+			"url", seg.uri,
+			"seq", seg.seq,
+			"size_bytes", len(data),
+			"fetch_ms", fetchMs,
+			"send_block_ms", sendBlockMs,
+			"chunk_dur_s", seg.duration,
+		)
+
+		if !ok {
 			return false
 		}
 		*lastSeq = seg.seq
 		*started = true
+	}
+
+	if newCount > 0 {
+		logger.Trace("hls: poll cycle summary",
+			"playlist_url", r.input.URL,
+			"target_duration_s", pl.targetDuration,
+			"new_chunks", newCount,
+			"playlist_segments_total", len(pl.segments),
+			"total_fetch_ms", totalFetchMs,
+			"total_send_block_ms", totalSendBlockMs,
+			"total_bytes", totalBytes,
+			"poll_cycle_ms", time.Since(pollStart).Milliseconds(),
+		)
 	}
 	return true
 }

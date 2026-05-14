@@ -19,6 +19,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsdemux"
 	"github.com/ntt0601zcoder/open-streamer/internal/tsmux"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 // packager.go — public Packager + Run loop.
@@ -147,6 +148,13 @@ type Packager struct {
 	onDiskA     []string
 	vSegEntries []SegmentEntry
 	aSegEntries []SegmentEntry
+
+	// behindHoldTicks counts consecutive 50 ms tryCut invocations that
+	// were held by behindPrevSegEnd. Used by the hold trace to rate-limit
+	// log output to ~1 line/s (every 20th tick) and to emit a single
+	// "hold released" event on transition. Resets to 0 on each successful
+	// emit. Diagnostic-only; does not affect cut decisions.
+	behindHoldTicks int
 
 	// Overflow-drop counters surface whenever PushVideo / PushAudio hit
 	// the queue cap and shed the oldest frame to bound memory. Logged
@@ -643,7 +651,44 @@ func (p *Packager) tryCut(now time.Time) {
 	// emit resumes once wallclock catches up to the previous segment's
 	// end, draining the queue at wallclock pace across many cuts.
 	if p.behindPrevSegEnd(now) {
+		// Trace: how far is wallclock behind prev seg end + queue depth
+		// at hold time. Rate-limited via tickCount so 50 ms ticks don't
+		// flood the journal — log once per second per packager.
+		p.behindHoldTicks++
+		if p.behindHoldTicks%20 == 1 { // 20 ticks × 50 ms = ~1 s
+			var vBehindMs, aBehindMs int64
+			if n := len(p.vSegEntries); n > 0 {
+				prevEnd := p.vSegEntries[n-1].StartTicks + p.vSegEntries[n-1].DurTicks
+				nowT := wallclockTicks(now, p.availStart, uint64(VideoTimescale))
+				if nowT < prevEnd {
+					vBehindMs = int64(prevEnd-nowT) * 1000 / int64(VideoTimescale)
+				}
+			}
+			if n := len(p.aSegEntries); n > 0 && p.audioInit != nil {
+				prevEnd := p.aSegEntries[n-1].StartTicks + p.aSegEntries[n-1].DurTicks
+				sr := uint64(p.audioInit.SampleRate) //nolint:gosec
+				nowT := wallclockTicks(now, p.availStart, sr)
+				if nowT < prevEnd {
+					aBehindMs = int64(prevEnd-nowT) * 1000 / int64(sr)
+				}
+			}
+			logger.Trace("dash: tryCut held by behindPrevSegEnd",
+				"stream_id", p.cfg.StreamID,
+				"video_behind_ms", vBehindMs,
+				"audio_behind_ms", aBehindMs,
+				"queue_video", p.queue.VideoLen(),
+				"queue_audio", p.queue.AudioLen(),
+				"hold_ticks", p.behindHoldTicks,
+			)
+		}
 		return
+	}
+	if p.behindHoldTicks > 0 {
+		logger.Trace("dash: behindPrevSegEnd hold released",
+			"stream_id", p.cfg.StreamID,
+			"hold_duration_ms", p.behindHoldTicks*50,
+		)
+		p.behindHoldTicks = 0
 	}
 
 	// Pass audioSR to the segmenter so V/A duration coupling works:
@@ -838,13 +883,38 @@ func (p *Packager) writeVideoSegment(now time.Time, frames []VideoFrame, nextPTS
 		p.vSegN--
 		return false
 	}
+	writeStart := time.Now()
 	if err := writeFileAtomic(filepath.Join(p.cfg.StreamDir, name), data); err != nil {
 		slog.Warn("dash: write video segment", "stream_id", p.cfg.StreamID, "err", err)
 		p.vSegN--
 		return false
 	}
+	writeMs := time.Since(writeStart).Milliseconds()
 	p.onDiskV = append(p.onDiskV, name)
 	p.vSegEntries = append(p.vSegEntries, SegmentEntry{StartTicks: tfdt, DurTicks: segDurTicks})
+
+	// Per-segment trace: how does tfdt vs wallclock-since-AST evolve?
+	// drift_behind_wall_ms > 0 means the segment END is BEHIND wallclock
+	// (live edge lag) — primary symptom when transcoder backed up at any
+	// point in the past, sequential tfdt accumulates the deficit.
+	wallSinceASTMs := int64(0)
+	if !p.availStart.IsZero() {
+		wallSinceASTMs = now.Sub(p.availStart).Milliseconds()
+	}
+	tfdtMs := int64(tfdt) * 1000 / int64(VideoTimescale)
+	segDurMs := int64(segDurTicks) * 1000 / int64(VideoTimescale)
+	logger.Trace("dash: video segment written",
+		"stream_id", p.cfg.StreamID,
+		"name", name,
+		"frame_count", len(frames),
+		"tfdt_ms", tfdtMs,
+		"seg_dur_ms", segDurMs,
+		"end_ms", tfdtMs+segDurMs,
+		"wall_since_ast_ms", wallSinceASTMs,
+		"drift_behind_wall_ms", wallSinceASTMs-(tfdtMs+segDurMs),
+		"bytes", len(data),
+		"write_ms", writeMs,
+	)
 	return true
 }
 

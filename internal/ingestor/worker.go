@@ -16,6 +16,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/tsnorm"
 	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
+	"github.com/ntt0601zcoder/open-streamer/pkg/logger"
 )
 
 const (
@@ -92,6 +93,7 @@ func runPullWorker(
 	tsNorm := tsnorm.New(ctx, cb.normaliserCfg)
 
 	for {
+		openStart := time.Now()
 		if !openSource(ctx, streamID, input, r, cb, &delay, &handedOff) {
 			return
 		}
@@ -100,6 +102,14 @@ func runPullWorker(
 			"stream_code", streamID,
 			"input_priority", input.Priority,
 			"url", input.URL,
+		)
+		logger.Trace("ingestor: source open succeeded",
+			"stream_code", streamID,
+			"input_priority", input.Priority,
+			"url", input.URL,
+			"first_open", !firstOpenDone,
+			"open_ms", time.Since(openStart).Milliseconds(),
+			"prev_backoff_ms", delay.Milliseconds(),
 		)
 		delay = reconnectBaseDelay // reset on successful open
 		// Mint a StreamSession before any packet is written. On the very
@@ -111,8 +121,16 @@ func runPullWorker(
 			cb.onConnect(streamID, input.Priority)
 		}
 
+		readLoopStart := time.Now()
 		readErr := readLoop(ctx, streamID, bufferWriteID, input, r, buf, &cb, norm, tsNorm)
 		_ = r.Close()
+		logger.Trace("ingestor: read loop ended",
+			"stream_code", streamID,
+			"input_priority", input.Priority,
+			"loop_dur_ms", time.Since(readLoopStart).Milliseconds(),
+			"read_err", readErr,
+			"ctx_cancelled", ctx.Err() != nil,
+		)
 
 		if ctx.Err() != nil {
 			return
@@ -522,6 +540,7 @@ func writeOnePacket(wctx writeContext, p *domain.AVPacket) error {
 // caller that skipped Normaliser construction) writeRawTSChunk
 // degrades to the legacy passthrough behaviour.
 func writeRawTSChunk(wctx writeContext, chunk []byte) error {
+	chunkStart := time.Now()
 	cp := append([]byte(nil), chunk...)
 	// Best-effort: stats demuxer drops on backpressure, never blocks
 	// the data path. Feed the raw copy so source-level codec / bitrate
@@ -530,8 +549,11 @@ func writeRawTSChunk(wctx writeContext, chunk []byte) error {
 	wctx.stats.Feed(cp)
 
 	payload := cp
+	var tsnormMs int64
 	if wctx.tsNormaliser != nil {
+		tsnormStart := time.Now()
 		normalised, normErr := wctx.tsNormaliser.Process(cp)
+		tsnormMs = time.Since(tsnormStart).Milliseconds()
 		if normErr != nil {
 			slog.Warn("ingestor: tsnorm demux failed, falling back to passthrough",
 				"stream_code", wctx.streamID,
@@ -551,6 +573,7 @@ func writeRawTSChunk(wctx writeContext, chunk []byte) error {
 			return nil
 		}
 	}
+	bufWriteStart := time.Now()
 	if err := wctx.buf.Write(wctx.bufferWriteID, buffer.Packet{TS: payload}); err != nil {
 		slog.Error("ingestor: buffer write failed (TS normalised)",
 			"stream_code", wctx.streamID,
@@ -569,6 +592,16 @@ func writeRawTSChunk(wctx writeContext, chunk []byte) error {
 	if cb != nil && cb.onPacketBytes != nil {
 		cb.onPacketBytes(wctx.streamID, wctx.input.Priority, len(payload))
 	}
+
+	logger.Trace("ingestor: ts chunk processed",
+		"stream_code", wctx.streamID,
+		"input_priority", wctx.input.Priority,
+		"in_bytes", len(chunk),
+		"out_bytes", len(payload),
+		"tsnorm_ms", tsnormMs,
+		"buf_write_ms", time.Since(bufWriteStart).Milliseconds(),
+		"chunk_total_ms", time.Since(chunkStart).Milliseconds(),
+	)
 	return nil
 }
 
