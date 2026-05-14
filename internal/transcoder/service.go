@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -748,17 +749,102 @@ func formatStderrTail(lines []string) string {
 	return strings.Join(lines, " | ")
 }
 
+// scanLinesOrCR is a bufio.SplitFunc that breaks input on either '\n'
+// or '\r'. Used by logStderr because FFmpeg writes per-second progress
+// updates terminated by '\r' (in-place refresh) and error / info lines
+// terminated by '\n'; the default ScanLines only handles '\n'.
+//
+// Returns one token per line, stripping the terminator. A buffered '\r'
+// followed immediately by '\n' (Windows-style CRLF, exotic case) emits
+// the content once and treats the '\n' as an empty token — caller
+// already skips empty lines so it's harmless.
+func scanLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+// parseFFmpegFrameCount extracts the cumulative video frame count from
+// an FFmpeg progress line of the form "frame= 1234 fps= 25 …". Returns
+// (count, true) on a valid match; (0, false) for any line that doesn't
+// look like progress output. Tolerates the optional whitespace between
+// "frame=" and the number that FFmpeg pads with for column alignment.
+func parseFFmpegFrameCount(line string) (uint64, bool) {
+	// Quick reject — most stderr lines aren't progress lines.
+	idx := strings.Index(line, "frame=")
+	if idx < 0 {
+		return 0, false
+	}
+	rest := strings.TrimLeft(line[idx+len("frame="):], " ")
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	// Confirm this is a progress line (rather than an error log that
+	// happens to contain "frame=") by requiring " fps=" right after.
+	tail := rest[end:]
+	if !strings.HasPrefix(strings.TrimLeft(tail, " "), "fps=") {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(rest[:end], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // logStderr scans FFmpeg stderr, filters out known-benign noise (packet/PPS/
 // MMCO debug spam) at debug level, surfaces real errors at warn, and pushes
 // every warn-level line into tail (when non-nil) for crash diagnostics.
+//
+// Also extracts FFmpeg's per-second progress lines ("frame= N fps= …") to
+// drive the transcoder_frames_total counter — lets dashboards chart per-
+// rendition output FPS without demuxing the encoder bytes ourselves.
+// FFmpeg emits the progress line every ~1 s with a CUMULATIVE frame count;
+// we delta against the previous value so the counter increments by the
+// real number of new frames.
 func (s *Service) logStderr(streamID domain.StreamCode, profile string, r io.Reader, tail *stderrTail) {
 	sc := bufio.NewScanner(r)
 	const maxLine = 64 * 1024
 	buf := make([]byte, maxLine)
 	sc.Buffer(buf, maxLine)
+	// FFmpeg writes per-second progress lines terminated by '\r' (in-
+	// place refresh) and error / info lines terminated by '\n'. Default
+	// ScanLines only splits on '\n' so progress is silently buffered
+	// until a real newline arrives — invisible in journalctl AND
+	// invisible to the frame counter below. Split on either delimiter
+	// so both classes surface line-by-line.
+	sc.Split(scanLinesOrCR)
+	var prevFrames uint64
+	var framesSeeded bool
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
+			continue
+		}
+		// FFmpeg progress line — fast-path before noise filters so a
+		// progress line bracketed by warnings (rare) still drives the
+		// metric. Format: "frame= 1234 fps= 25 q=27.0 ...".
+		if n, ok := parseFFmpegFrameCount(line); ok {
+			if framesSeeded && n >= prevFrames {
+				if delta := n - prevFrames; delta > 0 && s.m != nil && s.m.TranscoderFramesTotal != nil {
+					s.m.TranscoderFramesTotal.
+						WithLabelValues(string(streamID), profile, "video").
+						Add(float64(delta))
+				}
+			}
+			prevFrames = n
+			framesSeeded = true
+			// Progress lines are not errors; skip noise/warn paths.
 			continue
 		}
 		// FFmpeg compensates PTS/DTS jumps (common when ingest fails over between HLS variants).
