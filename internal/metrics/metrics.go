@@ -31,6 +31,21 @@ type Metrics struct {
 	TranscoderRestartsTotal *prometheus.CounterVec
 	// TranscoderQualitiesActive is the number of active ABR renditions per stream.
 	TranscoderQualitiesActive *prometheus.GaugeVec
+	// TranscoderFramesTotal counts encoded frames emitted by the
+	// transcoder, observed downstream at the publisher's per-frame
+	// ingress (DASH packager handleH264 / handleAAC). Use
+	// `rate(transcoder_frames_total[1m])` to chart per-stream FPS;
+	// dips below the source frame rate signal the transcoder is
+	// dropping or queueing frames. Mirrors Flussonic's
+	// "Output frames count" panel shape.
+	//
+	// Labels:
+	//   - stream_code: the parent stream
+	//   - profile: rendition slug ("track_1", "track_2") for ABR
+	//     shards; "v0" for single-rendition streams. Matches the
+	//     Representation id emitted in the MPD.
+	//   - kind: "video" | "audio"
+	TranscoderFramesTotal *prometheus.CounterVec
 
 	// ── DVR ───────────────────────────────────────────────────────────────────
 	// DVRSegmentsWrittenTotal counts TS segments flushed to disk per stream.
@@ -207,6 +222,10 @@ func New(i do.Injector) (*Metrics, error) {
 			Help: "Total FFmpeg process crash-restarts per stream.",
 		}, []string{"stream_code"}),
 
+		TranscoderFramesTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "open_streamer_transcoder_frames_total",
+			Help: "Total encoded frames observed at the publisher's per-frame ingress. Diff vs source FPS = transcoder dropping or queueing.",
+		}, []string{"stream_code", "profile", "kind"}),
 		TranscoderQualitiesActive: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "open_streamer_transcoder_qualities_active",
 			Help: "Number of active ABR rendition profiles per stream.",
