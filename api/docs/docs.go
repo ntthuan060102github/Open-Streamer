@@ -1065,6 +1065,40 @@ const docTemplate = `{
                 }
             }
         },
+        "/streams/{code}/thumbnail.jpg": {
+            "get": {
+                "produces": [
+                    "image/jpeg"
+                ],
+                "tags": [
+                    "streams"
+                ],
+                "summary": "Get latest thumbnail",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Stream code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
         "/vod": {
             "get": {
                 "produces": [

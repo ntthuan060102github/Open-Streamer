@@ -40,6 +40,7 @@ type Server struct {
 	vodH       *handler.VODHandler
 	sessionH   *handler.SessionHandler
 	watermarkH *handler.WatermarkHandler
+	thumbnailH *handler.ThumbnailHandler
 
 	// sessTracker is the shared play-sessions tracker. Used to wrap the
 	// mediaserve mount with a tracking middleware so HLS / DASH segment
@@ -80,6 +81,7 @@ func New(i do.Injector) (*Server, error) {
 		vodH:       do.MustInvoke[*handler.VODHandler](i),
 		sessionH:   do.MustInvoke[*handler.SessionHandler](i),
 		watermarkH: do.MustInvoke[*handler.WatermarkHandler](i),
+		thumbnailH: do.MustInvoke[*handler.ThumbnailHandler](i),
 	}
 	// Tracker is optional: only wrap mediaserve when the sessions feature is
 	// wired in DI. Treats a missing provider as "feature disabled" rather
@@ -194,6 +196,7 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 
 			r.Get("/recordings", s.recordingH.ListByStream)
 			r.Get("/sessions", s.sessionH.ListByStream)
+			r.Get("/thumbnail.jpg", s.thumbnailH.Get)
 		})
 	})
 

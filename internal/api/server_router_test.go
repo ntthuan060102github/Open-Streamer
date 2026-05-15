@@ -37,6 +37,7 @@ func newRouterTestServer() *Server {
 		vodH:       &handler.VODHandler{},
 		sessionH:   &handler.SessionHandler{},
 		watermarkH: &handler.WatermarkHandler{},
+		thumbnailH: &handler.ThumbnailHandler{},
 	}
 }
 

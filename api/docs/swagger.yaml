@@ -2799,6 +2799,28 @@ paths:
       summary: List sessions for a stream
       tags:
       - sessions
+  /streams/{code}/thumbnail.jpg:
+    get:
+      parameters:
+      - description: Stream code
+        in: path
+        name: code
+        required: true
+        type: string
+      produces:
+      - image/jpeg
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Get latest thumbnail
+      tags:
+      - streams
   /vod:
     get:
       produces:

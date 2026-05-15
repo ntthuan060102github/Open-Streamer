@@ -34,6 +34,21 @@ const (
 	// leave the live window — 0 = drop immediately after sliding out.
 	DefaultLiveHistory = 0
 
+	// DefaultThumbnailIntervalSec is how often the thumbnail worker
+	// captures one JPEG when ThumbnailConfig.IntervalSec is zero. 5 s
+	// strikes a balance: rare enough to keep CPU + disk overhead in
+	// the noise for an idle preview, frequent enough that an operator
+	// dashboard reflects "what's happening on the stream right now"
+	// without feeling stale.
+	DefaultThumbnailIntervalSec = 5
+
+	// DefaultThumbnailQuality is the mjpeg `-q:v` value (1 = best,
+	// 31 = worst) when ThumbnailConfig.Quality is zero. 5 produces
+	// visibly clean previews under ~150 KiB on typical 720p sources —
+	// good enough for a preview, light enough that the disk write +
+	// rename cycle stays well under the poll interval.
+	DefaultThumbnailQuality = 5
+
 	// DefaultDVRSegmentDuration is the DVR segment length in seconds when
 	// StreamDVRConfig.SegmentDuration is zero.
 	DefaultDVRSegmentDuration = 4

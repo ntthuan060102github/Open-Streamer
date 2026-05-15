@@ -51,3 +51,11 @@ type dvrDep interface {
 	StartRecording(context.Context, domain.StreamCode, domain.StreamCode, *domain.StreamDVRConfig) (*domain.Recording, error)
 	StopRecording(context.Context, domain.StreamCode) error
 }
+
+// thumbDep is the subset of thumbnail.Service the coordinator needs.
+// Optional — a Coordinator built without a thumbnail dep (test fixtures
+// that don't exercise it) is nil-safe at every call site below.
+type thumbDep interface {
+	Start(context.Context, domain.StreamCode, domain.StreamCode, *domain.ThumbnailConfig) error
+	Stop(domain.StreamCode)
+}

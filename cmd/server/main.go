@@ -34,6 +34,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/store"
 	jsonstore "github.com/ntt0601zcoder/open-streamer/internal/store/json"
 	yamlstore "github.com/ntt0601zcoder/open-streamer/internal/store/yaml"
+	"github.com/ntt0601zcoder/open-streamer/internal/thumbnail"
 	"github.com/ntt0601zcoder/open-streamer/internal/transcoder"
 	"github.com/ntt0601zcoder/open-streamer/internal/vod"
 	"github.com/ntt0601zcoder/open-streamer/internal/watermarks"
@@ -293,6 +294,7 @@ func wireServices(i *do.RootScope) {
 	})
 	do.Provide(i, sessions.New)
 	do.Provide(i, watermarks.New)
+	do.Provide(i, thumbnail.New)
 	do.Provide(i, metrics.New)
 	do.Provide(i, coordinator.New)
 
@@ -304,6 +306,7 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, handler.NewVODHandler)
 	do.Provide(i, handler.NewSessionHandler)
 	do.Provide(i, handler.NewWatermarkHandler)
+	do.Provide(i, handler.NewThumbnailHandler)
 	do.Provide(i, api.New)
 }
 
