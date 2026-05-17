@@ -247,7 +247,7 @@ func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "LIST_FAILED", "list streams", err)
 		return
 	}
-	streams = append(streams, h.listRuntimeStreams(r.Context())...)
+	streams = append(streams, h.listRuntimeStreams()...)
 
 	resp := make([]streamResponse, 0, len(streams))
 	for _, s := range streams {
@@ -260,14 +260,13 @@ func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": resp, "total": len(resp)})
 }
 
-// listRuntimeStreams materialises a *domain.Stream view for every live
-// runtime stream. The on-disk repo never holds these records — they are
-// reconstructed by re-applying the template merge to a stub stream that
-// carries only the code + template reference (mirroring how the runtime
-// stream was Started in the first place). Template lookup failures are
-// tolerated: a runtime stream whose template was just deleted shows up
-// with only its code while the idle reaper finishes tearing it down.
-func (h *StreamHandler) listRuntimeStreams(ctx context.Context) []*domain.Stream {
+// listRuntimeStreams returns one *domain.Stream stub per live runtime
+// stream. The stub carries only the per-stream identity (code + template
+// reference) — symmetric with the response shape used for config streams,
+// which the on-disk repo also serves raw (the template merge is reserved
+// for the coordinator-facing path). Clients that want the effective
+// config fetch the referenced template separately.
+func (h *StreamHandler) listRuntimeStreams() []*domain.Stream {
 	if h.autopublish == nil {
 		return nil
 	}
@@ -278,8 +277,7 @@ func (h *StreamHandler) listRuntimeStreams(ctx context.Context) []*domain.Stream
 	out := make([]*domain.Stream, 0, len(entries))
 	for _, e := range entries {
 		tplCode := e.TemplateCode
-		stub := &domain.Stream{Code: e.Code, Template: &tplCode}
-		out = append(out, h.resolveStream(ctx, stub))
+		out = append(out, &domain.Stream{Code: e.Code, Template: &tplCode})
 	}
 	return out
 }
