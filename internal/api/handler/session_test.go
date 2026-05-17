@@ -33,7 +33,6 @@ func newSessionHandlerWithRouter(t *testing.T) (http.Handler, *sessions.Service)
 		r.Get("/", h.Get)
 		r.Delete("/", h.Delete)
 	})
-	r.Get("/streams/{code}/sessions", h.ListByStream)
 	return r, svc
 }
 
@@ -68,7 +67,9 @@ func TestSessionList(t *testing.T) {
 	}
 }
 
-func TestSessionListByStream(t *testing.T) {
+// Per-stream listing is now /sessions?stream=<code>. The handler must
+// scope the result to that stream and reject malformed codes with 400.
+func TestSessionListFilterByStreamQuery(t *testing.T) {
 	r, svc := newSessionHandlerWithRouter(t)
 
 	svc.TrackHTTP(context.Background(), sessions.HTTPHit{
@@ -79,9 +80,12 @@ func TestSessionListByStream(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/streams/live/sessions", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?stream=live", nil)
 	r.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	var resp struct {
 		Sessions []*domain.PlaySession `json:"sessions"`
 	}
@@ -90,6 +94,34 @@ func TestSessionListByStream(t *testing.T) {
 	}
 	if len(resp.Sessions) != 1 || resp.Sessions[0].StreamCode != "live" {
 		t.Errorf("got %+v, want one session for stream=live", resp.Sessions)
+	}
+}
+
+// Codes containing '/' are now valid; ?stream=region/north/live must
+// resolve to that exact stream rather than 400'ing on the slash.
+func TestSessionListFilterByStreamQuery_SupportsNestedCode(t *testing.T) {
+	r, svc := newSessionHandlerWithRouter(t)
+
+	svc.TrackHTTP(context.Background(), sessions.HTTPHit{
+		StreamCode: "region/north/live", Protocol: domain.SessionProtoHLS, IP: testIP1,
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		sessionsRoutePath+"?stream=region/north/live", nil)
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Sessions []*domain.PlaySession `json:"sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Sessions) != 1 || resp.Sessions[0].StreamCode != "region/north/live" {
+		t.Errorf("got %+v, want session for region/north/live", resp.Sessions)
 	}
 }
 
@@ -207,20 +239,12 @@ func TestSessionListWithStatusClosed(t *testing.T) {
 	}
 }
 
-func TestSessionListByStreamInvalidCode(t *testing.T) {
+// A malformed ?stream=… must return 400 with the validator's reason,
+// not silently swallow the filter into "every stream".
+func TestSessionListFilterByStreamQuery_InvalidCode(t *testing.T) {
 	r, _ := newSessionHandlerWithRouter(t)
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/streams/!!!/sessions", nil)
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status=%d, want 400", rec.Code)
-	}
-}
-
-func TestSessionListByStreamInvalidQuery(t *testing.T) {
-	r, _ := newSessionHandlerWithRouter(t)
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/streams/live/sessions?proto=bogus", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, sessionsRoutePath+"?stream=!!!", nil)
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status=%d, want 400", rec.Code)

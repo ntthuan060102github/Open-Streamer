@@ -106,20 +106,6 @@ definitions:
       priority:
         type: integer
     type: object
-  apidocs.RecordingData:
-    properties:
-      data:
-        $ref: '#/definitions/domain.Recording'
-    type: object
-  apidocs.RecordingList:
-    properties:
-      data:
-        items:
-          $ref: '#/definitions/domain.Recording'
-        type: array
-      total:
-        type: integer
-    type: object
   apidocs.SessionList:
     properties:
       sessions:
@@ -237,7 +223,7 @@ definitions:
       push:
         description: |-
           Push is the list of external destinations the server actively pushes to.
-          Each entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).
+          Each entry defines one push target (social media live ingest, CDN relay, etc.).
         items:
           $ref: '#/definitions/domain.PushDestination'
         type: array
@@ -638,8 +624,6 @@ definitions:
     type: object
   domain.EventType:
     enum:
-    - session.opened
-    - session.closed
     - stream.created
     - stream.updated
     - stream.started
@@ -669,6 +653,8 @@ definitions:
     - hook.created
     - hook.updated
     - hook.deleted
+    - session.opened
+    - session.closed
     type: string
     x-enum-comments:
       EventDVRSegmentPruned: retention loop deleted an aged-out segment
@@ -685,8 +671,6 @@ definitions:
       EventPushStarted: dialing target, pre-handshake
       EventStreamUpdated: PUT /streams/{code} on existing record
     x-enum-descriptions:
-    - ""
-    - ""
     - ""
     - PUT /streams/{code} on existing record
     - ""
@@ -716,9 +700,9 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
-    - EventSessionOpened
-    - EventSessionClosed
     - EventStreamCreated
     - EventStreamUpdated
     - EventStreamStarted
@@ -748,6 +732,8 @@ definitions:
     - EventHookCreated
     - EventHookUpdated
     - EventHookDeleted
+    - EventSessionOpened
+    - EventSessionClosed
   domain.GlobalConfig:
     properties:
       buffer:
@@ -1078,9 +1064,9 @@ definitions:
         type: string
       dvr:
         description: |-
-          DVR is true when playback originated from the DVR / recording route
-          (/recordings/{rid}/...), false for live-edge mediaserve hits. Set
-          by sessions.DVRHTTPMiddleware on the recording sub-router. The flag
+          DVR is true when the playlist request carried any timeshift query
+          parameter (from / delay / dur / ago) — false for live-edge hits. Set
+          by sessions.HTTPMiddleware after detecting the query shape. The flag
           also participates in the session fingerprint, so a viewer watching
           both live and timeshift gets two distinct session records.
         type: boolean
@@ -1198,34 +1184,6 @@ definitions:
     - PushStatusRetrying
     - PushStatusFailed
     - PushStatusDisabled
-  domain.Recording:
-    properties:
-      id:
-        type: string
-      segment_dir:
-        description: |-
-          SegmentDir is the absolute path to the directory holding TS files,
-          playlist.m3u8, and index.json.
-        type: string
-      started_at:
-        type: string
-      status:
-        $ref: '#/definitions/domain.RecordingStatus'
-      stopped_at:
-        type: string
-      stream_code:
-        type: string
-    type: object
-  domain.RecordingStatus:
-    enum:
-    - recording
-    - stopped
-    - failed
-    type: string
-    x-enum-varnames:
-    - RecordingStatusRecording
-    - RecordingStatusStopped
-    - RecordingStatusFailed
   domain.ResizeMode:
     enum:
     - pad
@@ -2103,6 +2061,71 @@ info:
   title: Open Streamer API
   version: "1.0"
 paths:
+  /{code}/index.m3u8:
+    get:
+      parameters:
+      - description: Stream code
+        in: path
+        name: code
+        required: true
+        type: string
+      - description: Absolute start (Unix seconds)
+        in: query
+        name: from
+        type: integer
+      - description: Start N seconds before now
+        in: query
+        name: delay
+        type: integer
+      - description: Alias of delay
+        in: query
+        name: ago
+        type: integer
+      - description: Clip duration in seconds
+        in: query
+        name: dur
+        type: integer
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: VOD m3u8
+          schema:
+            type: string
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: HLS timeshift playlist (DVR)
+      tags:
+      - dvr
+  /{code}/recording_status.json:
+    get:
+      parameters:
+      - description: Stream code (the recording ID)
+        in: path
+        name: code
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: DVR recording status
+      tags:
+      - dvr
   /config:
     get:
       description: Returns available hardware accelerators (OS-detected), static enum
@@ -2424,93 +2447,13 @@ paths:
       summary: Readiness
       tags:
       - system
-  /recordings/{rid}:
-    get:
-      parameters:
-      - description: Recording ID (= stream code)
-        in: path
-        name: rid
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/apidocs.RecordingData'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Get recording
-      tags:
-      - recordings
-  /recordings/{rid}/{file}:
-    get:
-      parameters:
-      - description: Recording ID (= stream code)
-        in: path
-        name: rid
-        required: true
-        type: string
-      - description: Segment filename (e.g. 000000.ts) or playlist.m3u8
-        in: path
-        name: file
-        required: true
-        type: string
-      - description: 'Timeshift: absolute start (RFC3339). Implies M3U8 dispatch'
-        in: query
-        name: from
-        type: string
-      - description: 'Timeshift: relative start (seconds from recording start)'
-        in: query
-        name: offset_sec
-        type: integer
-      - description: 'Timeshift: window length in seconds (default: all remaining)'
-        in: query
-        name: duration
-        type: integer
-      produces:
-      - application/octet-stream
-      responses:
-        "200":
-          description: OK
-          schema:
-            type: file
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Serve recording file (segment or playlist; timeshift via query)
-      tags:
-      - recordings
-  /recordings/{rid}/info:
-    get:
-      parameters:
-      - description: Recording ID (= stream code)
-        in: path
-        name: rid
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            additionalProperties: true
-            type: object
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: DVR recording info
-      tags:
-      - recordings
   /sessions:
     get:
       parameters:
+      - description: Filter by stream code
+        in: query
+        name: stream
+        type: string
       - description: Filter by protocol (hls|dash|rtmp|srt|rtsp)
         in: query
         name: proto
@@ -2530,6 +2473,10 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/apidocs.SessionList'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
       summary: List play sessions
       tags:
       - sessions
@@ -2677,7 +2624,37 @@ paths:
       summary: Create or partial-update stream
       tags:
       - streams
-  /streams/{code}/inputs/switch:
+  /streams/{code}/restart:
+    post:
+      parameters:
+      - description: Stream code
+        in: path
+        name: code
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apidocs.StreamActionData'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Restart stream pipeline
+      tags:
+      - streams
+  /streams/{code}/switch:
     post:
       parameters:
       - description: Stream code
@@ -2713,92 +2690,6 @@ paths:
       summary: Manual input switch
       tags:
       - streams
-  /streams/{code}/recordings:
-    get:
-      parameters:
-      - description: Stream code
-        in: path
-        name: code
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/apidocs.RecordingList'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: List recordings by stream
-      tags:
-      - recordings
-  /streams/{code}/restart:
-    post:
-      parameters:
-      - description: Stream code
-        in: path
-        name: code
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/apidocs.StreamActionData'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-        "500":
-          description: Internal Server Error
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: Restart stream pipeline
-      tags:
-      - streams
-  /streams/{code}/sessions:
-    get:
-      parameters:
-      - description: Stream code
-        in: path
-        name: code
-        required: true
-        type: string
-      - description: Filter by protocol
-        in: query
-        name: proto
-        type: string
-      - description: Filter by status
-        in: query
-        name: status
-        type: string
-      - description: Max sessions to return
-        in: query
-        name: limit
-        type: integer
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/apidocs.SessionList'
-        "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/apidocs.ErrorBody'
-      summary: List sessions for a stream
-      tags:
-      - sessions
   /vod:
     get:
       produces:

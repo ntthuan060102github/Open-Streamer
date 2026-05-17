@@ -103,7 +103,7 @@ const (
 	// packet-timeout window (default 30s).
 	SwitchReasonTimeout SwitchReason = "timeout"
 	// SwitchReasonManual — operator forced the switch via the
-	// /streams/{code}/inputs/switch API.
+	// /streams/{code}/switch API.
 	SwitchReasonManual SwitchReason = "manual"
 	// SwitchReasonFailback — a higher-priority input recovered after
 	// having been degraded; manager switched back to honour priority.
@@ -735,7 +735,7 @@ func (s *Service) checkHealth(streamID domain.StreamCode) {
 // vs switchCooldown=12s — a 4s race window), the input promotes to Idle but
 // no failback ever fires, leaving the stream stuck on the lower-priority
 // fallback (typically a maintenance VOD) until manual intervention. The
-// ca_mau bug observed on prod-flussonic-100 was exactly this race.
+// The production failback-stuck incident this fix targets was exactly this race.
 //
 // The sweeper here re-evaluates every monitor tick (2s), so a "missed"
 // failback at probe time gets retried on the next tick with full cooldown

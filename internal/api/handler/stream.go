@@ -606,7 +606,7 @@ func (h *StreamHandler) Restart(w http.ResponseWriter, r *http.Request) {
 // @Failure     400   {object} apidocs.ErrorBody
 // @Failure     404   {object} apidocs.ErrorBody
 // @Failure     500   {object} apidocs.ErrorBody
-// @Router      /streams/{code}/inputs/switch [post].
+// @Router      /streams/{code}/switch [post].
 func (h *StreamHandler) SwitchInput(w http.ResponseWriter, r *http.Request) {
 	code := domain.StreamCode(chi.URLParam(r, "code"))
 

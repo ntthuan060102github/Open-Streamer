@@ -10,10 +10,13 @@ import (
 // MaxStreamCodeLen is the maximum length of a user-defined stream code.
 const MaxStreamCodeLen = 128
 
-var streamCodePattern = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+// streamCodePattern allows alphanumerics, dash, underscore, and slash.
+// Slashes let operators namespace streams as `region/channel` for routing
+// hierarchies; the route layer treats the whole prefix as one opaque key.
+var streamCodePattern = regexp.MustCompile(`^[A-Za-z0-9_/-]+$`)
 
 // StreamCode is the user-assigned primary key for a stream.
-// Allowed characters: a-z, A-Z, 0-9, underscore.
+// Allowed characters: a-z, A-Z, 0-9, underscore, dash, slash.
 type StreamCode string
 
 // ValidateStreamCode reports whether s is a non-empty valid stream code.
@@ -26,7 +29,13 @@ func ValidateStreamCode(s string) error {
 		return fmt.Errorf("stream code exceeds max length %d", MaxStreamCodeLen)
 	}
 	if !streamCodePattern.MatchString(s) {
-		return errors.New("stream code must contain only a-z, A-Z, 0-9, and _")
+		return errors.New("stream code must contain only A-Z, a-z, 0-9, '_', '-', and '/'")
+	}
+	if strings.HasPrefix(s, "/") || strings.HasSuffix(s, "/") {
+		return errors.New("stream code must not start or end with '/'")
+	}
+	if strings.Contains(s, "//") {
+		return errors.New("stream code must not contain consecutive '/'")
 	}
 	return nil
 }
@@ -77,7 +86,7 @@ type Stream struct {
 	Protocols OutputProtocols `json:"protocols" yaml:"protocols"`
 
 	// Push is the list of external destinations the server actively pushes to.
-	// Each entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).
+	// Each entry defines one push target (social media live ingest, CDN relay, etc.).
 	Push []PushDestination `json:"push" yaml:"push"`
 
 	// DVR overrides the global DVR settings for this specific stream.

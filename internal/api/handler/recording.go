@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +15,12 @@ import (
 	"github.com/samber/do/v2"
 )
 
+// msgRecordingNoData is the user-facing reason returned whenever a stream
+// has no recording payload yet — either the Recording row exists with an
+// empty SegmentDir (writer never armed) or its index.json hasn't been
+// written. Shared so the wording stays consistent across all DVR routes.
+const msgRecordingNoData = "recording has no data yet"
+
 // dvrIndexReader narrows *dvr.Service to the on-disk-read methods this
 // handler uses, so tests can stub out the DVR service without wiring a
 // full buffer + bus + metrics graph behind it. *dvr.Service satisfies
@@ -25,7 +30,10 @@ type dvrIndexReader interface {
 	ParsePlaylist(segDir string) ([]dvr.SegmentMeta, error)
 }
 
-// RecordingHandler handles DVR recording and playback REST endpoints.
+// RecordingHandler serves DVR metadata and timeshift playlists under
+// /<code>/recording_status.json and /<code>/index.m3u8?<timeshift-params>.
+// The standalone /recordings/{rid} CRUD surface was dropped — recordings
+// are 1:1 with streams and addressed by stream code throughout.
 type RecordingHandler struct {
 	dvr     dvrIndexReader
 	recRepo store.RecordingRepository
@@ -39,60 +47,32 @@ func NewRecordingHandler(i do.Injector) (*RecordingHandler, error) {
 	}, nil
 }
 
-// ListByStream lists recording metadata for a stream.
-// @Summary List recordings by stream
-// @Tags recordings
-// @Produce json
-// @Param code path string true "Stream code"
-// @Success 200 {object} apidocs.RecordingList
-// @Failure 500 {object} apidocs.ErrorBody
-// @Router /streams/{code}/recordings [get].
-func (h *RecordingHandler) ListByStream(w http.ResponseWriter, r *http.Request) {
-	streamCode := domain.StreamCode(chi.URLParam(r, "code"))
-	recs, err := h.recRepo.ListByStream(r.Context(), streamCode)
-	if err != nil {
-		serverError(w, r, "LIST_FAILED", "list recordings", err)
+// RecordingStatusJSON returns full DVR metadata for a stream's recording:
+// dvr_range, gaps, segment count, total size, lifecycle status. Served at
+// the file path /<code>/recording_status.json so players and ops scripts
+// can fetch it from the same namespace as the playlist.
+//
+// @Summary  DVR recording status
+// @Tags     dvr
+// @Produce  json
+// @Param    code path string true "Stream code (the recording ID)"
+// @Success  200 {object} map[string]any
+// @Failure  404 {object} apidocs.ErrorBody
+// @Router   /{code}/recording_status.json [get].
+func (h *RecordingHandler) RecordingStatusJSON(w http.ResponseWriter, r *http.Request) {
+	code := domain.StreamCode(chi.URLParam(r, "code"))
+	if err := domain.ValidateStreamCode(string(code)); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_STREAM_CODE", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": recs, "total": len(recs)})
-}
 
-// Get returns one recording's lifecycle metadata by id.
-// @Summary Get recording
-// @Tags recordings
-// @Produce json
-// @Param rid path string true "Recording ID (= stream code)"
-// @Success 200 {object} apidocs.RecordingData
-// @Failure 404 {object} apidocs.ErrorBody
-// @Router /recordings/{rid} [get].
-func (h *RecordingHandler) Get(w http.ResponseWriter, r *http.Request) {
-	rid := domain.RecordingID(chi.URLParam(r, "rid"))
-	rec, err := h.recRepo.FindByID(r.Context(), rid)
-	if err != nil {
-		writeStoreError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": rec})
-}
-
-// Info returns full DVR metadata for a recording: dvr_range, gaps, segment count, total size.
-// Data is read from index.json on disk, so it is always up-to-date.
-// @Summary DVR recording info
-// @Tags recordings
-// @Produce json
-// @Param rid path string true "Recording ID (= stream code)"
-// @Success 200 {object} map[string]any
-// @Failure 404 {object} apidocs.ErrorBody
-// @Router /recordings/{rid}/info [get].
-func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
-	rid := domain.RecordingID(chi.URLParam(r, "rid"))
-	rec, err := h.recRepo.FindByID(r.Context(), rid)
+	rec, err := h.recRepo.FindByID(r.Context(), domain.RecordingID(code))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	if rec.SegmentDir == "" {
-		writeError(w, http.StatusNotFound, "NO_DATA", "recording has no data yet")
+		writeError(w, http.StatusNotFound, "NO_DATA", msgRecordingNoData)
 		return
 	}
 
@@ -102,7 +82,7 @@ func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if idx == nil {
-		writeError(w, http.StatusNotFound, "NO_DATA", "recording has no data yet")
+		writeError(w, http.StatusNotFound, "NO_DATA", msgRecordingNoData)
 		return
 	}
 
@@ -126,142 +106,143 @@ func (h *RecordingHandler) Info(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ServeFile serves files from a DVR recording's SegmentDir. It is the
-// single endpoint behind /recordings/{rid}/{file} — the legacy
-// /playlist.m3u8 and /timeshift.m3u8 routes were collapsed in favour of a
-// uniform dispatcher because everything ultimately resolves to a file in
-// SegmentDir, and the only behavioural fork is "static playlist file" vs
-// "dynamic VOD slice over a time window".
+// ServeTimeshift builds a dynamic VOD M3U8 sliced over a wall-clock window,
+// invoked by the media catch-all when /<code>/index.m3u8 carries any DVR
+// timeshift query params. The live playlist (no params) is served directly
+// from disk by mediaserve and never reaches this handler.
 //
-// Behaviour by request shape:
+// Query parameters:
+//   - from=<unix_seconds>  absolute start time
+//   - delay=<seconds>      start `delay` seconds before now (live-edge offset)
+//   - ago=<seconds>        alias of delay
+//   - dur=<seconds>        clip length; omit for "everything from start"
 //
-//   - file=*.ts                                  — serve the segment as-is
-//   - file=*.m3u8 (no `from`/`offset_sec` query) — serve playlist.m3u8 from disk
-//   - file=*.m3u8 with `from` or `offset_sec`    — build a dynamic VOD slice
-//     (timeshift); see serveTimeshift for query param semantics
+// Precedence: `from` > `delay` > `ago`. When none of the start params are
+// set the handler treats it as "from the beginning of the recording".
 //
-// Other extensions return 404 — DVR only writes .ts + .m3u8 + index.json.
-//
-// @Summary  Serve recording file (segment or playlist; timeshift via query)
-// @Tags     recordings
-// @Produce  octet-stream
-// @Param    rid        path  string true  "Recording ID (= stream code)"
-// @Param    file       path  string true  "Segment filename (e.g. 000000.ts) or playlist.m3u8"
-// @Param    from       query string false "Timeshift: absolute start (RFC3339). Implies M3U8 dispatch"
-// @Param    offset_sec query int    false "Timeshift: relative start (seconds from recording start)"
-// @Param    duration   query int    false "Timeshift: window length in seconds (default: all remaining)"
-// @Success  200 {file} binary
+// @Summary  HLS timeshift playlist (DVR)
+// @Tags     dvr
+// @Produce  plain
+// @Param    code  path  string true  "Stream code"
+// @Param    from  query int    false "Absolute start (Unix seconds)"
+// @Param    delay query int    false "Start N seconds before now"
+// @Param    ago   query int    false "Alias of delay"
+// @Param    dur   query int    false "Clip duration in seconds"
+// @Success  200 {string} string "VOD m3u8"
+// @Failure  400 {object} apidocs.ErrorBody
 // @Failure  404 {object} apidocs.ErrorBody
-// @Router   /recordings/{rid}/{file} [get].
-func (h *RecordingHandler) ServeFile(w http.ResponseWriter, r *http.Request) {
-	rid := domain.RecordingID(chi.URLParam(r, "rid"))
-	file := filepath.Base(chi.URLParam(r, "file")) // strip path traversal
-
-	rec, err := h.recRepo.FindByID(r.Context(), rid)
+// @Router   /{code}/index.m3u8 [get].
+func (h *RecordingHandler) ServeTimeshift(w http.ResponseWriter, r *http.Request) {
+	code := domain.StreamCode(chi.URLParam(r, "code"))
+	if err := domain.ValidateStreamCode(string(code)); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_STREAM_CODE", err.Error())
+		return
+	}
+	rec, err := h.recRepo.FindByID(r.Context(), domain.RecordingID(code))
 	if err != nil {
 		writeStoreError(w, r, err)
 		return
 	}
 	if rec.SegmentDir == "" {
-		writeError(w, http.StatusNotFound, "NO_DATA", "recording has no data yet")
+		writeError(w, http.StatusNotFound, "NO_DATA", msgRecordingNoData)
 		return
 	}
 
-	switch strings.ToLower(filepath.Ext(file)) {
-	case ".m3u8":
-		// Timeshift dispatch: presence of either query param flips the
-		// route to the dynamic slice builder, regardless of which file
-		// name the client used (some players append cache-busters to the
-		// URL — keep the trigger keyed on params, not on path).
-		q := r.URL.Query()
-		if q.Has("from") || q.Has("offset_sec") {
-			h.serveTimeshift(w, r, rec)
-			return
-		}
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-cache")
-		http.ServeFile(w, r, filepath.Join(rec.SegmentDir, "playlist.m3u8"))
-	case ".ts":
-		w.Header().Set("Content-Type", "video/mp2t")
-		http.ServeFile(w, r, filepath.Join(rec.SegmentDir, file))
-	default:
-		writeError(w, http.StatusNotFound, "FILE_NOT_FOUND", "unsupported file type for recording")
-	}
-}
-
-// serveTimeshift builds a dynamic VOD M3U8 sliced over a wall-clock window.
-//
-// Query parameters (mutually exclusive for start point):
-//   - from=<RFC3339>   absolute start time, e.g. 2026-04-06T14:30:00Z
-//   - offset_sec=<N>   seconds from recording start (relative)
-//
-// Optional:
-//   - duration=<N>     window length in seconds (default: all remaining)
-func (h *RecordingHandler) serveTimeshift(w http.ResponseWriter, r *http.Request, rec *domain.Recording) {
-	// Parse all segments from playlist.m3u8.
 	segments, err := h.dvr.ParsePlaylist(rec.SegmentDir)
 	if err != nil || len(segments) == 0 {
 		writeError(w, http.StatusNotFound, "NO_PLAYLIST", "playlist not yet available")
 		return
 	}
 
-	// Determine start time.
-	var startTime time.Time
-	if raw := r.URL.Query().Get("from"); raw != "" {
-		startTime, err = time.Parse(time.RFC3339, raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "INVALID_FROM", "from must be RFC3339, e.g. 2026-04-06T14:30:00Z")
-			return
-		}
-	} else if raw := r.URL.Query().Get("offset_sec"); raw != "" {
-		offsetSec, err := strconv.ParseFloat(raw, 64)
-		if err != nil || offsetSec < 0 {
-			writeError(w, http.StatusBadRequest, "INVALID_OFFSET", "offset_sec must be a non-negative number")
-			return
-		}
-		// Anchor to first segment's wall time + offset.
-		startTime = segments[0].WallTime.Add(time.Duration(offsetSec * float64(time.Second)))
-	} else {
-		// No start → return from beginning (equivalent to full playlist).
-		startTime = segments[0].WallTime
+	startTime, ok := parseTimeshiftStart(r, segments[0].WallTime)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMS",
+			"from must be Unix seconds; delay/ago must be non-negative numbers")
+		return
 	}
 
-	// Determine window duration (0 = unlimited).
-	var windowDur time.Duration
-	if raw := r.URL.Query().Get("duration"); raw != "" {
-		durSec, err := strconv.ParseFloat(raw, 64)
-		if err != nil || durSec <= 0 {
-			writeError(w, http.StatusBadRequest, "INVALID_DURATION", "duration must be a positive number of seconds")
-			return
-		}
-		windowDur = time.Duration(durSec * float64(time.Second))
+	windowDur, ok := parseTimeshiftDuration(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "INVALID_PARAMS",
+			"dur must be a positive number of seconds")
+		return
 	}
 
-	// Slice the segment list to the requested window.
-	// A segment is included if its wall_time >= startTime and it falls within windowDur.
+	window := sliceSegments(segments, startTime, windowDur)
+	if len(window) == 0 {
+		writeError(w, http.StatusNotFound, "NO_SEGMENTS_IN_RANGE",
+			"no segments found for the requested time range")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(renderTimeshiftPlaylist(window)))
+}
+
+// parseTimeshiftStart returns the absolute start time selected by the
+// caller's timeshift params. Order: from > delay > ago > recordingStart.
+// Returns ok=false on malformed numbers.
+func parseTimeshiftStart(r *http.Request, recordingStart time.Time) (time.Time, bool) {
+	q := r.URL.Query()
+	if raw := q.Get("from"); raw != "" {
+		secs, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || secs < 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(secs, 0), true
+	}
+	for _, key := range []string{"delay", "ago"} {
+		if raw := q.Get(key); raw != "" {
+			secs, err := strconv.ParseFloat(raw, 64)
+			if err != nil || secs < 0 {
+				return time.Time{}, false
+			}
+			return time.Now().Add(-time.Duration(secs * float64(time.Second))), true
+		}
+	}
+	return recordingStart, true
+}
+
+// parseTimeshiftDuration parses the optional `dur` window. Zero means
+// "from start to end of available recording".
+func parseTimeshiftDuration(r *http.Request) (time.Duration, bool) {
+	raw := r.URL.Query().Get("dur")
+	if raw == "" {
+		return 0, true
+	}
+	secs, err := strconv.ParseFloat(raw, 64)
+	if err != nil || secs <= 0 {
+		return 0, false
+	}
+	return time.Duration(secs * float64(time.Second)), true
+}
+
+// sliceSegments returns the contiguous run of segments whose wall-time
+// interval intersects [startTime, startTime+windowDur). windowDur=0 means
+// "no upper bound — include everything from startTime onward".
+func sliceSegments(segments []dvr.SegmentMeta, startTime time.Time, windowDur time.Duration) []dvr.SegmentMeta {
 	endTime := startTime.Add(windowDur)
-	window := make([]dvr.SegmentMeta, 0, len(segments))
+	out := make([]dvr.SegmentMeta, 0, len(segments))
 	for _, seg := range segments {
 		if seg.WallTime.IsZero() {
 			continue
 		}
 		segEnd := seg.WallTime.Add(seg.Duration)
-		// Include if segment overlaps [startTime, endTime).
 		if segEnd.Before(startTime) || segEnd.Equal(startTime) {
 			continue
 		}
 		if windowDur > 0 && seg.WallTime.After(endTime) {
 			break
 		}
-		window = append(window, seg)
+		out = append(out, seg)
 	}
+	return out
+}
 
-	if len(window) == 0 {
-		writeError(w, http.StatusNotFound, "NO_SEGMENTS_IN_RANGE", "no segments found for the requested time range")
-		return
-	}
-
-	// Build VOD M3U8.
+// renderTimeshiftPlaylist emits a VOD-style M3U8 for the given slice.
+func renderTimeshiftPlaylist(window []dvr.SegmentMeta) string {
 	maxSec := 1.0
 	for _, seg := range window {
 		if d := seg.Duration.Seconds(); d > maxSec {
@@ -291,9 +272,5 @@ func (h *RecordingHandler) serveTimeshift(w http.ResponseWriter, r *http.Request
 		fmt.Fprintf(&b, "%06d.ts\n", seg.Index)
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(b.String()))
+	return b.String()
 }
