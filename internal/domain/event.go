@@ -62,6 +62,13 @@ const (
 	EventTemplateCreated EventType = "template.created"
 	EventTemplateUpdated EventType = "template.updated"
 	EventTemplateDeleted EventType = "template.deleted"
+
+	// Runtime streams — published by the autopublish service when a
+	// template-prefix match materialises (or expires) a stream that does
+	// NOT exist in the persisted config. Useful for audit logs and the
+	// runtime-stream observability dashboard.
+	EventStreamRuntimeCreated EventType = "stream.runtime_created"
+	EventStreamRuntimeExpired EventType = "stream.runtime_expired"
 )
 
 // Event is an immutable fact describing a domain state change.

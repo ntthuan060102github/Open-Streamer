@@ -283,6 +283,67 @@ func TestTemplate_DeleteMissingReturns404(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
+// Prefix overlap with another template must reject the save before any
+// store mutation. Otherwise the matcher would have two templates owning
+// overlapping prefix space, breaking the auto-publish routing invariant.
+func TestTemplate_PutRejectsOverlappingPrefix(t *testing.T) {
+	tr := newFakeTemplateRepo()
+	require.NoError(t, tr.Save(t.Context(), &domain.Template{
+		Code:     "first",
+		Prefixes: []string{"live"},
+	}))
+
+	h := newTemplateHandler(tr, newFakeStreamRepo(), newStubCoord())
+	// `live/sports` is nested under `live` → overlaps.
+	body, _ := json.Marshal(domain.Template{Prefixes: []string{"live/sports"}})
+	req := withTemplateCode(newReq(t, http.MethodPost, "/templates/second", body), "second")
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	var resp struct {
+		Error           string `json:"error"`
+		ConflictingWith string `json:"conflicting_with"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "PREFIX_OVERLAP", resp.Error)
+	assert.Equal(t, "first", resp.ConflictingWith)
+
+	// Make sure the conflicting record was NOT persisted.
+	_, err := tr.FindByCode(t.Context(), "second")
+	require.Error(t, err)
+}
+
+// Updating an existing template with one of its OWN prior prefixes must
+// succeed — self-overlap is allowed because the update replaces them.
+func TestTemplate_PutSelfPrefixIsNotOverlap(t *testing.T) {
+	tr := newFakeTemplateRepo()
+	require.NoError(t, tr.Save(t.Context(), &domain.Template{
+		Code:     "profile_a",
+		Prefixes: []string{"live"},
+	}))
+
+	h := newTemplateHandler(tr, newFakeStreamRepo(), newStubCoord())
+	body, _ := json.Marshal(domain.Template{Prefixes: []string{"live", "vod"}})
+	req := withTemplateCode(newReq(t, http.MethodPost, "/templates/profile_a", body), "profile_a")
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code,
+		"updating a template's own prefixes must not collide with itself")
+}
+
+// A prefix that fails ValidatePrefix at the handler boundary is a 400,
+// not a 409 — distinguishes "malformed" from "in use".
+func TestTemplate_PutRejectsMalformedPrefix(t *testing.T) {
+	h := newTemplateHandler(newFakeTemplateRepo(), newFakeStreamRepo(), newStubCoord())
+	body, _ := json.Marshal(domain.Template{Prefixes: []string{"/leading-slash"}})
+	req := withTemplateCode(newReq(t, http.MethodPost, "/templates/profile_a", body), "profile_a")
+	rec := httptest.NewRecorder()
+	h.Put(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
 // Force the request body decoder onto an unparseable byte stream so the
 // handler exercises the JSON-decode error branch.
 func TestTemplate_PutInvalidJSONReturns400(t *testing.T) {

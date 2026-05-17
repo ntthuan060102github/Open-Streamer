@@ -18,6 +18,7 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
+	"github.com/ntt0601zcoder/open-streamer/internal/autopublish"
 	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
@@ -132,6 +133,7 @@ func run() error {
 		StreamMgr:        do.MustInvoke[*manager.Service](injector),
 		HooksSvc:         do.MustInvoke[*hooks.Service](injector),
 		SessionsSvc:      do.MustInvoke[*sessions.Service](injector),
+		AutoPublish:      do.MustInvoke[*autopublish.Service](injector),
 		APISrv:           do.MustInvoke[*api.Server](injector),
 		Bus:              do.MustInvoke[events.Bus](injector),
 		StreamRepo:       do.MustInvoke[store.StreamRepository](injector),
@@ -297,6 +299,7 @@ func wireServices(i *do.RootScope) {
 	do.Provide(i, watermarks.New)
 	do.Provide(i, metrics.New)
 	do.Provide(i, coordinator.New)
+	do.Provide(i, autopublish.New)
 
 	// API handlers
 	do.Provide(i, handler.NewStreamHandler)

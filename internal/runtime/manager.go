@@ -13,6 +13,7 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api"
+	"github.com/ntt0601zcoder/open-streamer/internal/autopublish"
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
@@ -42,6 +43,7 @@ type Deps struct {
 	StreamMgr        *manager.Service
 	HooksSvc         *hooks.Service
 	SessionsSvc      *sessions.Service
+	AutoPublish      *autopublish.Service
 	APISrv           *api.Server
 	Bus              events.Bus
 	StreamRepo       store.StreamRepository
@@ -198,6 +200,20 @@ func (m *Manager) applyAll(cfg *domain.GlobalConfig) {
 	// Wire ingestor → publisher RTMP play handler so the shared listener can
 	// serve external play clients in addition to push ingest.
 	m.deps.Ingestor.SetRTMPPlayHandler(m.deps.Publisher.HandleRTMPPlay)
+
+	// Auto-publish: wire the resolver into the RTMP push server so a
+	// template-prefix match can materialise a runtime stream from an
+	// otherwise-unknown publish path. The matcher snapshot must be warm
+	// before encoders can connect, otherwise the first wave of pushes
+	// would race against the first refresh and get rejected.
+	if m.deps.AutoPublish != nil {
+		m.deps.AutoPublish.SetCoordinator(m.deps.Coordinator)
+		if err := m.deps.AutoPublish.RefreshTemplates(m.rootCtx); err != nil {
+			slog.Warn("runtime: autopublish initial template refresh failed", "err", err)
+		}
+		m.deps.Ingestor.SetAutoPublishResolver(m.deps.AutoPublish)
+		go m.deps.AutoPublish.RunReaper(m.rootCtx)
+	}
 
 	// Bootstrap persisted streams.
 	coordinator.BootstrapPersistedStreams(
