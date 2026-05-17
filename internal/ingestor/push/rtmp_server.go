@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,6 +49,42 @@ import (
 	"github.com/ntt0601zcoder/open-streamer/internal/ingestor/pull"
 	"github.com/ntt0601zcoder/open-streamer/internal/timeline"
 )
+
+// rtmpRouteKey reconstructs the routing key from an RTMP session's app +
+// stream name. RTMP carries the path as two pieces — `app` is set during
+// the `connect` AMF command (everything between host and the last `/` the
+// client treats as the app), `streamName` is set during `publish` / `play`
+// (the last URL segment). Combining them with a `/` yields the full URL
+// path, from which we always strip a leading `live/` so 1-segment stream
+// codes map to `rtmp://host/live/<code>` while multi-segment codes map to
+// `rtmp://host/<seg1>/<seg2>/...` directly (no `live/` prefix). A
+// single-segment URL that did not come with the `live/` prefix returns ""
+// — bare codes are rejected so encoders cannot accidentally hit a 1-segment
+// stream from `rtmp://host/<code>`.
+func rtmpRouteKey(app, streamName string) string {
+	app = strings.TrimSpace(app)
+	streamName = strings.TrimSpace(streamName)
+	var combined string
+	switch {
+	case app == "" && streamName == "":
+		return ""
+	case app == "":
+		combined = streamName
+	case streamName == "":
+		combined = app
+	default:
+		combined = app + "/" + streamName
+	}
+	hadLivePrefix := strings.HasPrefix(combined, "live/")
+	combined = strings.TrimPrefix(combined, "live/")
+	if combined == "" {
+		return ""
+	}
+	if !hadLivePrefix && !strings.Contains(combined, "/") {
+		return ""
+	}
+	return combined
+}
 
 // PlayFunc is invoked when an external play client connects to the RTMP
 // server. Implementations should subscribe to the Buffer Hub for `key`
@@ -253,7 +290,15 @@ func (s *RTMPServer) OnRtmpConnect(session *rtmp.ServerSession, _ rtmp.ObjectPai
 // Returning an error rejects the session — lal sends a NetStream.Publish.BadName
 // status code and tears down the connection.
 func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
-	key := session.StreamName()
+	key := rtmpRouteKey(session.AppName(), session.StreamName())
+	if key == "" {
+		slog.Warn("rtmp server: rejected publisher (invalid stream path)",
+			"app", session.AppName(),
+			"stream_name", session.StreamName(),
+			"remote", session.GetStat().RemoteAddr,
+		)
+		return errors.New("rtmp server: invalid stream path")
+	}
 	bufWriteID, streamID, buf, err := s.registry.Acquire(key)
 	if err != nil {
 		slog.Warn("rtmp server: rejected publisher",
@@ -331,14 +376,22 @@ func (s *RTMPServer) OnNewRtmpSubSession(session *rtmp.ServerSession) error {
 	s.mu.Lock()
 	fn := s.playFunc
 	s.mu.Unlock()
+	key := rtmpRouteKey(session.AppName(), session.StreamName())
+	if key == "" {
+		slog.Warn("rtmp server: play rejected (invalid stream path)",
+			"app", session.AppName(),
+			"stream_name", session.StreamName(),
+			"remote", session.GetStat().RemoteAddr,
+		)
+		return errors.New("rtmp server: invalid stream path")
+	}
 	if fn == nil {
 		slog.Warn("rtmp server: play rejected (no PlayFunc registered)",
-			"key", session.StreamName(),
+			"key", key,
 		)
 		return errors.New("rtmp server: play handler not configured")
 	}
 
-	key := session.StreamName()
 	info := PlayInfo{RemoteAddr: session.GetStat().RemoteAddr}
 
 	ctx, cancel := context.WithCancel(context.Background())

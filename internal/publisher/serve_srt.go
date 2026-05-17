@@ -11,8 +11,11 @@ package publisher
 // SRT is a transport protocol — no codec conversion needed; raw MPEG-TS is
 // written directly to each subscribing connection.
 //
-// Client URL: srt://host:port?streamid=live/<stream_code>
-// The bare <stream_code> (without "live/" prefix) is also accepted.
+// Client URL: srt://host:port?streamid=live/<stream_code> for single-segment
+// codes; srt://host:port?streamid=<seg1>/<seg2>/... for multi-segment codes
+// (live/ omitted). Bare single-segment streamids without the live/ prefix
+// are rejected at the buffer-lookup step (they resolve to a non-existent
+// stream code).
 //
 // Each client gets its own goroutine and an independent Buffer Hub subscriber.
 // When the server context is cancelled, all active subscriber connections are
@@ -220,9 +223,21 @@ func (s *Service) srtHandleSubscribe(ctx context.Context, conn srt.Conn) {
 	}
 }
 
-// srtStreamCode extracts the stream code from an SRT streamid.
-// Accepts "live/<code>" or bare "<code>".
+// srtStreamCode extracts the stream code from an SRT streamid. The `live/`
+// prefix is always stripped when present, so single-segment codes are
+// reached via "live/<code>" and multi-segment codes via "<seg1>/<seg2>/..."
+// directly. A bare single-segment streamid (no `live/` prefix and no '/')
+// is rejected — returning "" — so single-segment streams cannot be hit
+// by accident from a half-typed URL.
 func srtStreamCode(streamid string) string {
+	streamid = strings.TrimSpace(streamid)
+	hadLivePrefix := strings.HasPrefix(streamid, "live/")
 	code := strings.TrimPrefix(streamid, "live/")
-	return strings.TrimSpace(code)
+	if code == "" {
+		return ""
+	}
+	if !hadLivePrefix && !strings.Contains(code, "/") {
+		return ""
+	}
+	return code
 }

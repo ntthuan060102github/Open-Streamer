@@ -36,7 +36,9 @@ package publisher
 //     returning it to DESCRIBE/SETUP requests.
 //  4. On stream stop, the mount is removed and the ServerStream is closed.
 //
-// Client URL: rtsp://host:port/live/<stream_code> (port from listeners.rtsp.port)
+// Client URL: rtsp://host:port/live/<stream_code> for single-segment codes;
+// rtsp://host:port/<seg1>/<seg2>/... for multi-segment codes (live/ omitted).
+// Port from listeners.rtsp.port.
 
 import (
 	"context"
@@ -107,8 +109,16 @@ const (
 	rtspPaceMaxLag = 2 * time.Second
 )
 
+// rtspLiveMountPath returns the URL path a stream is mounted at. Single-segment
+// codes (no '/') get the `live/` prefix so clients dial
+// rtsp://host/live/<code>; multi-segment codes are mounted at their raw path
+// (`<seg1>/<seg2>/...`) and clients omit the `live/` prefix entirely.
 func rtspLiveMountPath(code domain.StreamCode) string {
-	return "live/" + string(code)
+	s := string(code)
+	if strings.Contains(s, "/") {
+		return s
+	}
+	return "live/" + s
 }
 
 // RunRTSPPlayServer starts the RTSP play listener.
@@ -173,12 +183,18 @@ func (s *Service) RunRTSPPlayServer(ctx context.Context) error {
 type rtspHandler struct{ svc *Service }
 
 // rtspPathStreamCode extracts the StreamCode from an RTSP request path.
-// Accepts "live/<code>", "/live/<code>", or bare "<code>". Path may also
-// contain a track suffix (e.g. /live/foo/trackID=0) — we trim that.
+// Accepts "/live/<code>" for single-segment codes and "/<seg1>/<seg2>/..."
+// for multi-segment codes (the `live/` prefix is always stripped when present,
+// so a multi-segment code that happens to be addressed via `live/<seg>/<seg>`
+// still resolves correctly). The path may also carry a trailing
+// `/trackID=<N>` segment from SETUP — gortsplib emits that as the control URL
+// for each media — which we strip here. Stream codes only allow
+// `[A-Za-z0-9_/-]`, so `trackID=…` (containing `=`) can never be a real code
+// segment and the strip cannot collide with user data.
 func rtspPathStreamCode(path string) domain.StreamCode {
 	p := strings.TrimPrefix(path, "/")
 	p = strings.TrimPrefix(p, "live/")
-	if i := strings.IndexByte(p, '/'); i > 0 {
+	if i := strings.LastIndex(p, "/trackID="); i >= 0 {
 		p = p[:i]
 	}
 	return domain.StreamCode(strings.TrimSpace(p))
@@ -250,12 +266,26 @@ func (h *rtspHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseC
 
 // lookupStream matches a request path to a registered ServerStream.
 // The SETUP path may have a track suffix (e.g. /live/foo/trackID=0), so we
-// match by exact path or by prefix followed by "/".
+// match by exact path or by prefix followed by "/". Multi-segment codes
+// addressed via the non-canonical `live/<seg>/<seg>` form are matched on a
+// second pass after stripping the `live/` prefix — single-segment codes
+// stay rejected for bare URLs because that branch never runs when the
+// path has no prefix to strip.
 func (h *rtspHandler) lookupStream(path string) *gortsplib.ServerStream {
 	path = strings.TrimPrefix(path, "/")
 	h.svc.mu.Lock()
 	defer h.svc.mu.Unlock()
-	for mountPath, stream := range h.svc.rtspMounts {
+	if s := matchRTSPMount(h.svc.rtspMounts, path); s != nil {
+		return s
+	}
+	if stripped := strings.TrimPrefix(path, "live/"); stripped != path {
+		return matchRTSPMount(h.svc.rtspMounts, stripped)
+	}
+	return nil
+}
+
+func matchRTSPMount(mounts map[string]*gortsplib.ServerStream, path string) *gortsplib.ServerStream {
+	for mountPath, stream := range mounts {
 		if path == mountPath || strings.HasPrefix(path, mountPath+"/") {
 			return stream
 		}
