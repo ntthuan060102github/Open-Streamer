@@ -101,8 +101,27 @@ endpoint or pre-seed `open_streamer.yaml` in your data dir.
 
 Streams are the central entity — each binds N inputs (with priority
 failover), an optional transcoder ladder, output protocols, push
-destinations, and DVR settings. Stream code (`[a-zA-Z0-9_]`) is your
-primary key.
+destinations, and DVR settings. Stream code accepts
+`[A-Za-z0-9_/-]+` — slashes namespace streams as
+`region/north/news`. The route layer keeps the whole prefix as one
+opaque key; `..` and consecutive `/` are rejected.
+
+### URL conventions for push / play
+
+Single-segment codes (`news`) use the `live/` prefix; multi-segment
+codes (`region/north/news`) use the raw path. The server strips a
+leading `live/` when present, so multi-segment codes also work via
+`live/region/north/news` for non-canonical clients. Bare
+single-segment URLs (e.g. `rtmp://host/news`) are rejected so a
+half-typed URL can't accidentally hit a stream.
+
+| Form | RTMP | RTSP | SRT |
+|---|---|---|---|
+| Single-segment `news` | `rtmp://host/live/news` | `rtsp://host/live/news` | `srt://host?streamid=live/news` |
+| Multi-segment `region/north/news` | `rtmp://host/region/north/news` | `rtsp://host/region/north/news` | `srt://host?streamid=region/north/news` |
+
+HLS / DASH delivery URLs (`/{code}/index.m3u8`, `/{code}/index.mpd`)
+always use the raw code without `live/`.
 
 ### Minimum viable: pull HLS, publish HLS
 
@@ -243,7 +262,187 @@ GET /recordings/news/timeshift.m3u8?from=2026-04-26T10:00:00Z&duration=3600
 
 ---
 
-## 5. Hot-reload
+## 5. Templates
+
+A **Template** is a reusable bundle of config-like stream fields —
+Transcoder, Protocols, Push, DVR, Watermark, Thumbnail, Inputs, Tags,
+StreamKey, plus the auto-publish `Prefixes` list. Streams reference at
+most one template via the `template` field; every field the stream
+leaves at its zero value inherits from the template. The
+non-inheritable fields are `code` (per-stream identity) and `disabled`
+(per-stream runtime toggle).
+
+### 5.1 Create a template
+
+Template code accepts `[A-Za-z0-9_-]+` — no `/` because templates live
+in a flat namespace.
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/templates/news_profile -d '{
+  "name": "News profile",
+  "description": "1080p + 720p ABR ladder, HLS + DASH, DVR enabled",
+  "transcoder": {
+    "global": { "hw": "nvenc" },
+    "audio":  { "codec": "aac", "bitrate": 128 },
+    "video": {
+      "profiles": [
+        { "width": 1920, "height": 1080, "bitrate": 5000, "codec": "h264" },
+        { "width": 1280, "height": 720,  "bitrate": 2500, "codec": "h264" }
+      ]
+    }
+  },
+  "protocols": { "hls": true, "dash": true },
+  "dvr": { "enabled": true, "retention_sec": 86400 }
+}'
+```
+
+### 5.2 Reference the template from a stream
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/streams/news -d '{
+  "name": "News Channel",
+  "template": "news_profile",
+  "inputs": [
+    { "url": "https://upstream.example.com/news/playlist.m3u8", "priority": 0 }
+  ]
+}'
+```
+
+The stream now inherits Transcoder, Protocols, and DVR from
+`news_profile`. The on-disk record still carries only `code`, `name`,
+`template`, and `inputs` — clean and minimal. The operator can see
+the inherited fields by fetching the template separately:
+
+```bash
+curl http://localhost:8080/api/v1/templates/news_profile
+```
+
+### 5.3 Override individual fields
+
+Any non-zero value on the stream wins. Example: same template but a
+stream that needs an extra 480p rung and disables DASH.
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/streams/sports -d '{
+  "template": "news_profile",
+  "inputs": [
+    { "url": "rtmp://primary.example.com/live/sports", "priority": 0 }
+  ],
+  "transcoder": {
+    "global": { "hw": "nvenc" },
+    "audio":  { "codec": "aac", "bitrate": 128 },
+    "video": {
+      "profiles": [
+        { "width": 1920, "height": 1080, "bitrate": 5000 },
+        { "width": 1280, "height": 720,  "bitrate": 2500 },
+        { "width": 854,  "height": 480,  "bitrate": 1200 }
+      ]
+    }
+  },
+  "protocols": { "hls": true }
+}'
+```
+
+Note: the override REPLACES the inherited value completely — the
+stream's `transcoder` carries the full 3-rung ladder, the template's
+2-rung ladder is not concatenated.
+
+### 5.4 Hot reload via template update
+
+`POST /templates/{code}` on an existing template walks every running
+stream that inherits from it and dispatches the same diff-based
+`coordinator.Update` used by `POST /streams/{code}`. Stopped streams
+skip the reload — the next start picks up the new template.
+
+```bash
+# Add 480p to the template — every running stream that doesn't
+# already override `transcoder` picks up the new rung.
+curl -XPOST http://localhost:8080/api/v1/templates/news_profile -d '{
+  "transcoder": {
+    "video": {
+      "profiles": [
+        { "width": 1920, "height": 1080, "bitrate": 5000 },
+        { "width": 1280, "height": 720,  "bitrate": 2500 },
+        { "width": 854,  "height": 480,  "bitrate": 1200 }
+      ]
+    }
+  },
+  "protocols": { "hls": true, "dash": true },
+  "dvr": { "enabled": true, "retention_sec": 86400 }
+}'
+```
+
+### 5.5 Auto-publish via prefix matching
+
+Templates can declare a `prefixes` list. When an encoder pushes (RTMP)
+to a path matching one of the prefixes on a segment boundary AND the
+template has a `publish://` input, the server materialises a **runtime
+stream** on the fly — no `POST /streams/{code}` needed beforehand.
+
+```bash
+curl -XPOST http://localhost:8080/api/v1/templates/auto_news -d '{
+  "name": "Auto-news template",
+  "prefixes": ["live"],
+  "inputs": [{ "url": "publish://" }],
+  "protocols": { "hls": true }
+}'
+```
+
+Now an encoder pushing to `rtmp://host:1935/live/foo` triggers a new
+runtime stream with code `live/foo` (the FULL incoming path, not just
+the suffix). The stream appears in `GET /streams` with
+`source: "runtime"`. Runtime streams are RAM-only — they are NOT
+persisted and disappear 30 s after the last packet reaches the buffer
+hub. Stop the encoder → the reaper tears down the pipeline.
+
+```bash
+curl http://localhost:8080/api/v1/streams
+# {
+#   "data": [
+#     { "code": "live/foo", "template": "auto_news",
+#       "source": "runtime", "runtime": { ... } },
+#     ...
+#   ]
+# }
+```
+
+**Prefix rules**:
+
+- Prefix `live` matches `live/foo/bar` and `live` itself but NOT
+  `livestream/foo` (segment boundary).
+- Prefixes are unique across templates — `POST /templates/{code}` returns
+  409 `PREFIX_OVERLAP` when any prefix is a path-prefix of another
+  template's prefix (including equality).
+- Without at least one `publish://` input on the template, prefix match
+  rejects the push (debug-logged "matching template has no publish://
+  input").
+
+### 5.6 Deleting a template
+
+`DELETE /templates/{code}` refuses with 409 `TEMPLATE_IN_USE` while
+any stream still references it. The response lists the dependent stream
+codes so the operator knows which to detach:
+
+```bash
+curl -XDELETE http://localhost:8080/api/v1/templates/news_profile
+# 409 Conflict
+# { "error": "TEMPLATE_IN_USE", "streams": ["news", "sports"], ... }
+
+# Detach a stream by setting template: null, or pick another template
+curl -XPOST http://localhost:8080/api/v1/streams/news -d '{ "template": null, "transcoder": {...}, "protocols": {...} }'
+```
+
+### 5.7 Response shape note
+
+`GET /streams/{code}` and `GET /streams` return the **raw** stored
+record — overrides only, never merged with the template. Clients that
+need the effective config fetch the template separately. Mixing the two
+shapes would obscure which fields the operator actually set vs. which
+come from the template.
+
+---
+
+## 6. Hot-reload
 
 `PUT /streams/{code}` (or repeat `POST`) merges only the changed fields:
 
@@ -280,7 +479,7 @@ curl -XDELETE http://localhost:8080/api/v1/streams/news
 
 ---
 
-## 6. Hooks (webhooks + file sink)
+## 7. Hooks (webhooks + file sink)
 
 Subscribe to lifecycle events with one of two delivery backends:
 
@@ -363,7 +562,7 @@ reference](./APP_FLOW.md#events-reference).
 
 ---
 
-## 7. copy:// and mixer:// — in-process re-stream
+## 8. copy:// and mixer:// — in-process re-stream
 
 Re-stream another in-process stream as input. No network round-trip; the
 downstream stream subscribes directly to the upstream's published
@@ -412,7 +611,7 @@ Both streams must already exist; mixer:// validates at save time
 
 ---
 
-## 8. Watermarks
+## 9. Watermarks
 
 Apply text or image overlays to the encoded video. Two-step workflow
 for image watermarks: upload to the asset library, then reference by
@@ -539,7 +738,7 @@ client-side in your player.
 
 ---
 
-## 9. Play sessions — who's watching?
+## 10. Play sessions — who's watching?
 
 Open Streamer tracks every active player across all delivery
 protocols (HLS / DASH / RTMP / SRT / RTSP). State is in-memory only —
@@ -635,7 +834,7 @@ term persistence is the hook's responsibility.
 
 ---
 
-## 10. Operations
+## 11. Operations
 
 ### Health checks
 
@@ -697,7 +896,7 @@ journalctl -u open-streamer | grep -E '(failover|crashed|degraded)'
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
@@ -718,7 +917,7 @@ in the runtime snapshot means.
 
 ---
 
-## 12. Production checklist
+## 13. Production checklist
 
 - [ ] FFmpeg installed with required encoders (boot probe will catch this)
 - [ ] HLS + DASH dirs are different (when both enabled)
@@ -732,7 +931,7 @@ in the runtime snapshot means.
 
 ---
 
-## 13. Updating
+## 14. Updating
 
 ```bash
 # Use the provided installer for atomic upgrades on systemd hosts:

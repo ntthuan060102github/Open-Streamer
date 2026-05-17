@@ -37,9 +37,11 @@ Legend:
 |---|---|---|
 | Stream repository — JSON | Complete | Default; flat-file under `storage.json_dir` |
 | Stream repository — YAML | Complete | Single `open_streamer.yaml` per data dir |
+| Template repository | Complete | Both JSON + YAML backends; persisted under top-level `templates` key |
 | Recording / Hook / VOD repositories | Complete | Both backends |
-| REST API — streams CRUD + start/stop/restart | Complete | `chi/v5` router under `/streams` |
-| REST API — `PUT /streams/{code}` hot-reload | Complete | Diff-based; only changed components restart |
+| REST API — streams CRUD + start/stop/restart | Complete | `chi/v5` router under `/streams`. Stream codes may contain `/` (namespacing) — the dispatcher uses chi's catch-all and splits the trailing `/restart` / `/switch` action off the code |
+| REST API — templates CRUD | Complete | `/templates` list + `/templates/{code}` get/post(upsert)/delete. `Put` validates prefix uniqueness across templates (409 `PREFIX_OVERLAP`) and hot-reloads every running stream referencing the template via `coordinator.Update`. `Delete` refuses (409 `TEMPLATE_IN_USE`) when any stream still references it |
+| REST API — `PUT /streams/{code}` hot-reload | Complete | Diff-based; only changed components restart. Validates `Stream.Template` references exist (400 `TEMPLATE_NOT_FOUND`) so orphan references can't be persisted |
 | REST API — input switch | Complete | `POST /streams/{code}/inputs/switch` forces active priority |
 | REST API — recordings | Complete | CRUD + unified `/{file}` dispatch (playlist.m3u8 vs timeshift via `?from=` / `?offset_sec=` query) + segment serve + info |
 | REST API — hooks CRUD + test (HTTP & File) | Complete | `DeliverTestEvent` routes per hook type |
@@ -67,6 +69,66 @@ Legend:
 | `PlaybackBufferID` resolver | Complete | Picks best rendition for ABR, else logical stream code |
 | Capacity tunable | Complete | `buffer.capacity` (default 1024) |
 | `Delete` closes subscriber channels | Complete | Subscribers see `ok=false` on `<-Recv()` so mixer/copy taps observe upstream tear-down and reconnect — fix for the "downstream silently dies after upstream restart" class of bugs |
+
+---
+
+## Templates & Auto-Publish (`internal/domain/template.go` + `internal/autopublish`)
+
+Templates are reusable bundles of config-like stream fields. A stream
+references at most one template via the `template` field; every field
+the stream leaves at its zero value inherits from the template. The
+non-inheritable fields are `Code` (per-stream identity) and `Disabled`
+(per-stream runtime toggle). For the merge semantics and resolution
+sites see [ARCHITECTURE.md § Templates](./ARCHITECTURE.md#templates-internaldomaintemplatego--internalapihandlertemplatego);
+for the on-the-wire URL conventions see [URL routing](#stream-codes--url-routing) below.
+
+| Feature | Status | Notes |
+|---|---|---|
+| Template domain model | Complete | Bundles `Inputs`, `Tags`, `StreamKey`, `Transcoder`, `Protocols`, `Push`, `DVR`, `Watermark`, `Thumbnail`, `Prefixes`. Code regex `[A-Za-z0-9_-]+` (no `/` — flat namespace) |
+| `domain.ResolveStream(stream, tpl)` merge | Complete | Zero-value = inherit: nil pointer / empty slice / empty string / all-zero `OutputProtocols`. Stream's non-zero value always wins. Returns a copy when merge happens; same pointer when no template / no merge needed |
+| Template CRUD endpoints | Complete | `GET /templates`, `GET /templates/{code}`, `POST /templates/{code}` (upsert), `DELETE /templates/{code}` |
+| Cross-template prefix uniqueness | Complete | `Put` scans every other template via `templateRepo.List` and returns 409 `PREFIX_OVERLAP` with `conflicting_with` + `overlaps` payload when any prefix is a path-prefix of another's prefix |
+| Template hot reload on update | Complete | `Put` walks every stream referencing the template, computes resolved view under OLD and NEW template, and dispatches `coordinator.Update(old, new)` for every RUNNING dependent. Coordinator's diff engine then routes the change minimally; stopped streams skip the reload |
+| Template `Delete` reference guard | Complete | Returns 409 `TEMPLATE_IN_USE` with `streams[]` payload when any stream still references the template. Operators must detach (`POST /streams/{code}` with `template: null`) before retrying |
+| Stream `Template` reference validation | Complete | `StreamHandler.Put` returns 400 `TEMPLATE_NOT_FOUND` when `body.Template` points at a missing template. Silently persisting orphan references would leave the runtime resolver unable to fill inherited fields |
+| Resolution at bootstrap + reconciler | Complete | `coordinator.BootstrapPersistedStreams` and `Coordinator.reconcileOnce` both call `c.resolveTemplate(ctx, s)` before `Start` so pipelines see the inherited config across restarts |
+| API responses are raw | Complete | `GET /streams` / `GET /streams/{code}` return the on-disk record unchanged — overrides only, never merged with the template. Clients that want the effective config fetch the template separately |
+| Stream response `source` tag | Complete | Every entry carries `source: "config" \| "runtime"` so clients can filter / label correctly |
+| `GET /streams/{code}` runtime-stream fallback | Complete | When the on-disk repo misses, the handler calls `autopublish.Lookup` and returns a stub `{code, template, source: "runtime"}` so a runtime stream resolves to 200 instead of 404 |
+
+### Auto-publish (runtime streams via template prefix)
+
+| Feature | Status | Notes |
+|---|---|---|
+| Prefix list on template (`Prefixes []string`) | Complete | URL-path prefixes that trigger auto-publish. Match honours segment boundaries — `live` matches `live/foo/bar` but NOT `livestream/foo` (`domain.PrefixMatches`) |
+| Prefix format validation | Complete | `[A-Za-z0-9_/-]+`, no leading `/`, no `//`, no `..`, max 128 chars; per-template duplicates rejected at `ValidatePrefixes` |
+| Matcher snapshot (`internal/autopublish/matcher.go`) | Complete | `prefix → templateCode` map built from `templateRepo.List`; held in `atomic.Pointer[matcher]` so push-server-goroutine lookups are lock-free. Entries sorted by descending prefix length (longest match wins) |
+| Matcher hot reload | Complete | `Service.RefreshTemplates` swaps the snapshot atomically after every template `Put` / `Delete` from the handler |
+| Push-server fallback | Complete | RTMP push server (`acquireOrAutoPublish`): on `registry.Acquire` miss, calls `AutoPublishResolver.ResolveOrCreate(ctx, path)`. Pass nil to disable auto-publish entirely (legacy "stream not registered" rejection). SRT push is not wired (no SRT push server exists); RTSP push is not a feature |
+| Runtime stream materialisation | Complete | `ResolveOrCreate`: validate stream code → verify matched template has a `publish://` input (`TemplateAcceptsPush`) → resolve stub `{Code, Template}` against template → `coordinator.Start(resolved)` → record entry + spawn liveness observer. Write lock held across Start + insert so concurrent pushes to the same path collapse to a single Start |
+| `ErrNoMatch` / `ErrTemplateNoPush` sentinels | Complete | `ResolveOrCreate` returns these for missing prefix and template-without-publish cases; caller surfaces as a publish rejection |
+| Runtime stream identity | Complete | Stream code = full incoming push path (no prefix stripping). E.g. push `rtmp://host/live/foo/bar` with prefix `live/` → runtime stream code `live/foo/bar` |
+| Idle reaper (30 s) | Complete | `Service.RunReaper` sweeps every 5 s and stops any entry whose `lastPacketAt` < `now − 30 s` via `coordinator.Stop` + entry removal + observer cancel. `IdleTimeout` + `reapInterval` exported as constants for tests |
+| Liveness observer | Complete | Per-entry goroutine subscribes to the buffer hub for the runtime stream's code; updates `entry.lastPacketAt` (atomic.Int64) on every packet. Detached from the request context so it outlives the push callback |
+| Runtime stream events | Complete | `stream.runtime_created` on materialisation, `stream.runtime_expired` on idle eviction. Payload carries `template_code` |
+| API visibility in `GET /streams` | Complete | `listRuntimeStreams()` emits a `{Code, Template}` stub per entry; `withStatus` tags it `source: "runtime"`. Symmetric with config streams which the on-disk repo also serves raw |
+| Per-stream lookup (`Lookup`) | Complete | `autopublish.Service.Lookup(code)` returns `(RuntimeEntry, true)` so the stream handler's `Get` path resolves runtime codes |
+
+---
+
+## Stream codes & URL routing
+
+Stream codes accept `[A-Za-z0-9_/-]+` (no `..`, no leading / trailing
+`/`, no `//`). The slash enables namespacing as `region/north/live`;
+the route layer treats the whole prefix as one opaque key.
+
+| Form | URL convention | Notes |
+|---|---|---|
+| Single-segment (`foo`) | `rtmp://host/live/foo`, `rtsp://host/live/foo`, `srt://host?streamid=live/foo` | The `live/` prefix is mandatory for single-segment codes; bare `rtmp://host/foo` etc. is rejected so a half-typed URL can't accidentally hit a stream |
+| Multi-segment (`region/north/news`) | `rtmp://host/region/north/news` | No prefix. A leading `live/` is also accepted and stripped, so multi-segment codes are reachable via either form |
+| HLS / DASH delivery | `/{code}/index.m3u8`, `/{code}/index.mpd` | Raw stream code, no `live/` prefix. Chi catch-all dispatcher routes multi-segment codes through the same handler |
+
+Enforced in: `rtmpRouteKey` ([internal/ingestor/push/rtmp_server.go](../internal/ingestor/push/rtmp_server.go)), `rtspPathStreamCode` + `lookupStream` ([internal/publisher/serve_rtsp.go](../internal/publisher/serve_rtsp.go)), `srtStreamCode` ([internal/publisher/serve_srt.go](../internal/publisher/serve_srt.go)).
 
 ---
 

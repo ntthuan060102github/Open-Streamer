@@ -581,7 +581,7 @@ sequenceDiagram
     Note over Coord: 3) clone.Watermark.ImagePath = resolved path<br/>4) clone.Watermark.AssetID = "" (cleared)
     Coord->>TC: Start(ctx, code, rawID, &clone, targets)
     TC->>TC: buildVideoFilter → applyWatermark
-    TC->>FF: ffmpeg -vf "...,movie='/var/.../8a3f….png'[wm];[mid][wm]overlay=..."
+    TC->>FF: ffmpeg -vf '...,movie=(resolved path) (wm) ; (mid) (wm) overlay=...'
 ```
 
 Failure modes the coordinator handles inline:
