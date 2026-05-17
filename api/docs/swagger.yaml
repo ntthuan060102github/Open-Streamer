@@ -236,6 +236,13 @@ definitions:
         items:
           type: string
         type: array
+      template:
+        description: |-
+          Template references a Template by its code; the template's config-like
+          fields fill in any field this stream leaves at its zero value. nil
+          means no template inheritance — the stream stands alone. See
+          ResolveStream in template.go for the merge rules.
+        type: string
       thumbnail:
         allOf:
         - $ref: '#/definitions/domain.ThumbnailConfig'
@@ -624,6 +631,8 @@ definitions:
     type: object
   domain.EventType:
     enum:
+    - session.opened
+    - session.closed
     - stream.created
     - stream.updated
     - stream.started
@@ -653,8 +662,9 @@ definitions:
     - hook.created
     - hook.updated
     - hook.deleted
-    - session.opened
-    - session.closed
+    - template.created
+    - template.updated
+    - template.deleted
     type: string
     x-enum-comments:
       EventDVRSegmentPruned: retention loop deleted an aged-out segment
@@ -671,6 +681,8 @@ definitions:
       EventPushStarted: dialing target, pre-handshake
       EventStreamUpdated: PUT /streams/{code} on existing record
     x-enum-descriptions:
+    - ""
+    - ""
     - ""
     - PUT /streams/{code} on existing record
     - ""
@@ -702,7 +714,10 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
     x-enum-varnames:
+    - EventSessionOpened
+    - EventSessionClosed
     - EventStreamCreated
     - EventStreamUpdated
     - EventStreamStarted
@@ -732,8 +747,9 @@ definitions:
     - EventHookCreated
     - EventHookUpdated
     - EventHookDeleted
-    - EventSessionOpened
-    - EventSessionClosed
+    - EventTemplateCreated
+    - EventTemplateUpdated
+    - EventTemplateDeleted
   domain.GlobalConfig:
     properties:
       buffer:
@@ -1312,6 +1328,52 @@ definitions:
     - StatusActive
     - StatusDegraded
     - StatusStopped
+  domain.Template:
+    properties:
+      code:
+        description: Code is the unique key chosen by the operator.
+        type: string
+      description:
+        type: string
+      dvr:
+        allOf:
+        - $ref: '#/definitions/domain.StreamDVRConfig'
+        description: |-
+          DVR overrides the global DVR settings. Streams that inherit this
+          template inherit the DVR configuration unless they set their own.
+      name:
+        description: |-
+          Name and Description are template-level metadata. They describe the
+          template to operators and are NOT propagated into streams that
+          inherit from it (those keep their own Name / Description fields).
+        type: string
+      protocols:
+        allOf:
+        - $ref: '#/definitions/domain.OutputProtocols'
+        description: Protocols defines which delivery protocols are opened.
+      push:
+        description: Push is the list of external destinations the server actively
+          pushes to.
+        items:
+          $ref: '#/definitions/domain.PushDestination'
+        type: array
+      thumbnail:
+        allOf:
+        - $ref: '#/definitions/domain.ThumbnailConfig'
+        description: Thumbnail controls periodic screenshot generation.
+      transcoder:
+        allOf:
+        - $ref: '#/definitions/domain.TranscoderConfig'
+        description: |-
+          Transcoder controls encoding/decoding settings. nil means no
+          transcoding for streams inheriting this template (unless they set
+          their own Transcoder).
+      watermark:
+        allOf:
+        - $ref: '#/definitions/domain.WatermarkConfig'
+        description: Watermark is an optional text or image overlay applied before
+          encoding.
+    type: object
   domain.ThumbnailConfig:
     properties:
       enabled:
@@ -2690,6 +2752,112 @@ paths:
       summary: Manual input switch
       tags:
       - streams
+  /templates:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: List templates
+      tags:
+      - templates
+  /templates/{code}:
+    delete:
+      parameters:
+      - description: Template code
+        in: path
+        name: code
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Delete template
+      tags:
+      - templates
+    get:
+      parameters:
+      - description: Template code
+        in: path
+        name: code
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Get template
+      tags:
+      - templates
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Template code
+        in: path
+        name: code
+        required: true
+        type: string
+      - description: Template configuration
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/domain.Template'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apidocs.ErrorBody'
+      summary: Create or update template
+      tags:
+      - templates
   /vod:
     get:
       produces:

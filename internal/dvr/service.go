@@ -134,9 +134,9 @@ func (s *Service) StartRecording(ctx context.Context, streamID domain.StreamCode
 	if dvrCfg.StoragePath != "" {
 		rootDir = dvrCfg.StoragePath
 	}
-	segDir, err := filepath.Abs(filepath.Join(rootDir, string(streamID)))
+	segDir, err := resolveSegDir(rootDir, string(streamID))
 	if err != nil {
-		return nil, fmt.Errorf("dvr: resolve segment dir: %w", err)
+		return nil, err
 	}
 	if err := os.MkdirAll(segDir, 0o755); err != nil {
 		return nil, fmt.Errorf("dvr: mkdir %s: %w", segDir, err)

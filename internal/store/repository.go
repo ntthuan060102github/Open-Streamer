@@ -26,6 +26,15 @@ type StreamRepository interface {
 	Delete(ctx context.Context, code domain.StreamCode) error
 }
 
+// TemplateRepository persists reusable Template configurations referenced
+// by streams via Stream.Template.
+type TemplateRepository interface {
+	Save(ctx context.Context, tpl *domain.Template) error
+	FindByCode(ctx context.Context, code domain.TemplateCode) (*domain.Template, error)
+	List(ctx context.Context) ([]*domain.Template, error)
+	Delete(ctx context.Context, code domain.TemplateCode) error
+}
+
 // RecordingRepository persists DVR recording metadata.
 type RecordingRepository interface {
 	Save(ctx context.Context, rec *domain.Recording) error

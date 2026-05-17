@@ -26,14 +26,15 @@ import (
 
 // Coordinator starts and stops the full per-stream pipeline.
 type Coordinator struct {
-	buf        *buffer.Service
-	mgr        mgrDep
-	tc         tcDep
-	pub        pubDep
-	dvr        dvrDep
-	bus        events.Bus
-	m          *metrics.Metrics
-	streamRepo store.StreamRepository
+	buf          *buffer.Service
+	mgr          mgrDep
+	tc           tcDep
+	pub          pubDep
+	dvr          dvrDep
+	bus          events.Bus
+	m            *metrics.Metrics
+	streamRepo   store.StreamRepository
+	templateRepo store.TemplateRepository
 
 	// upstreamLookup resolves another stream by code; used by detectABRCopy
 	// to inspect the upstream's transcoder ladder shape before deciding
@@ -82,15 +83,17 @@ func (d *streamDegradation) any() bool {
 // New registers a Coordinator with the DI injector.
 func New(i do.Injector) (*Coordinator, error) {
 	repo := do.MustInvoke[store.StreamRepository](i)
+	templates := do.MustInvoke[store.TemplateRepository](i)
 	c := &Coordinator{
-		buf:        do.MustInvoke[*buffer.Service](i),
-		mgr:        do.MustInvoke[*manager.Service](i),
-		tc:         do.MustInvoke[*transcoder.Service](i),
-		pub:        do.MustInvoke[*publisher.Service](i),
-		dvr:        do.MustInvoke[*dvr.Service](i),
-		bus:        do.MustInvoke[events.Bus](i),
-		m:          do.MustInvoke[*metrics.Metrics](i),
-		streamRepo: repo,
+		buf:          do.MustInvoke[*buffer.Service](i),
+		mgr:          do.MustInvoke[*manager.Service](i),
+		tc:           do.MustInvoke[*transcoder.Service](i),
+		pub:          do.MustInvoke[*publisher.Service](i),
+		dvr:          do.MustInvoke[*dvr.Service](i),
+		bus:          do.MustInvoke[events.Bus](i),
+		m:            do.MustInvoke[*metrics.Metrics](i),
+		streamRepo:   repo,
+		templateRepo: templates,
 		upstreamLookup: func(code domain.StreamCode) (*domain.Stream, bool) {
 			s, err := repo.FindByCode(context.Background(), code)
 			if err != nil {
@@ -113,6 +116,22 @@ func New(i do.Injector) (*Coordinator, error) {
 	c.tc.SetUnhealthyCallback(c.handleTranscoderUnhealthy)
 	c.tc.SetHealthyCallback(c.handleTranscoderHealthy)
 	return c, nil
+}
+
+// resolveTemplate merges a stream with its referenced template, if any.
+// Returns the stream unchanged when there is no template reference or the
+// template lookup fails (the template repo is allowed to be nil in tests).
+// All bootstrap / reconcile call sites use this helper so the pipeline
+// always sees the inherited config.
+func (c *Coordinator) resolveTemplate(ctx context.Context, s *domain.Stream) *domain.Stream {
+	if s == nil || s.Template == nil || c.templateRepo == nil {
+		return s
+	}
+	tpl, err := c.templateRepo.FindByCode(ctx, *s.Template)
+	if err != nil {
+		return s
+	}
+	return domain.ResolveStream(s, tpl)
 }
 
 // newForTesting builds a Coordinator from pre-constructed deps, for use in tests.
@@ -796,7 +815,8 @@ func BootstrapPersistedStreams(ctx context.Context, log *slog.Logger, repo store
 			log.Debug("bootstrap: skip stream (no inputs)", "stream_code", st.Code)
 			continue
 		}
-		if err := coord.Start(ctx, st); err != nil {
+		resolved := coord.resolveTemplate(ctx, st)
+		if err := coord.Start(ctx, resolved); err != nil {
 			log.Warn("bootstrap: stream start failed", "stream_code", st.Code, "err", err)
 			continue
 		}
@@ -866,7 +886,7 @@ func (c *Coordinator) reconcileOnce(ctx context.Context) {
 			continue
 		}
 		slog.Info("coordinator: reconciler starting stopped stream", "stream_code", st.Code)
-		if err := c.Start(ctx, st); err != nil {
+		if err := c.Start(ctx, c.resolveTemplate(ctx, st)); err != nil {
 			slog.Warn("coordinator: reconciler start failed",
 				"stream_code", st.Code, "err", err)
 		}

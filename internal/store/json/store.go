@@ -33,6 +33,7 @@ const dbFile = "open_streamer.json"
 // Additional top-level keys (e.g. "global") can be added here as the product grows.
 type db struct {
 	Streams    map[string]*domain.Stream    `json:"streams"`
+	Templates  map[string]*domain.Template  `json:"templates,omitempty"`
 	Recordings map[string]*domain.Recording `json:"recordings"`
 	Hooks      map[string]*domain.Hook      `json:"hooks"`
 	VOD        map[string]*domain.VODMount  `json:"vod,omitempty"`
@@ -56,6 +57,9 @@ func New(dir string) (*Store, error) {
 
 // Streams returns a StreamRepository backed by this Store.
 func (s *Store) Streams() store.StreamRepository { return &streamRepo{s} }
+
+// Templates returns a TemplateRepository backed by this Store.
+func (s *Store) Templates() store.TemplateRepository { return &templateRepo{s} }
 
 // Recordings returns a RecordingRepository backed by this Store.
 func (s *Store) Recordings() store.RecordingRepository { return &recordingRepo{s} }
@@ -87,6 +91,9 @@ func (s *Store) readDB() (db, error) {
 	}
 	if d.Streams == nil {
 		d.Streams = make(map[string]*domain.Stream)
+	}
+	if d.Templates == nil {
+		d.Templates = make(map[string]*domain.Template)
 	}
 	if d.Recordings == nil {
 		d.Recordings = make(map[string]*domain.Recording)
@@ -145,6 +152,7 @@ func (s *Store) modify(fn func(*db) error) error {
 func emptyDB() db {
 	return db{
 		Streams:    make(map[string]*domain.Stream),
+		Templates:  make(map[string]*domain.Template),
 		Recordings: make(map[string]*domain.Recording),
 		Hooks:      make(map[string]*domain.Hook),
 		VOD:        make(map[string]*domain.VODMount),
@@ -203,6 +211,62 @@ func (r *streamRepo) List(_ context.Context, _ store.StreamFilter) ([]*domain.St
 func (r *streamRepo) Delete(_ context.Context, code domain.StreamCode) error {
 	return r.s.modify(func(d *db) error {
 		delete(d.Streams, string(code))
+		return nil
+	})
+}
+
+// --- TemplateRepository ---
+
+type templateRepo struct{ s *Store }
+
+// Save implements store.TemplateRepository.
+func (r *templateRepo) Save(_ context.Context, tpl *domain.Template) error {
+	return r.s.modify(func(d *db) error {
+		d.Templates[string(tpl.Code)] = tpl
+		return nil
+	})
+}
+
+// FindByCode implements store.TemplateRepository.
+func (r *templateRepo) FindByCode(_ context.Context, code domain.TemplateCode) (*domain.Template, error) {
+	var result *domain.Template
+	err := r.s.readAll(func(d db) error {
+		t, ok := d.Templates[string(code)]
+		if !ok {
+			return fmt.Errorf("template %s: %w", code, store.ErrNotFound)
+		}
+		result = t
+		return nil
+	})
+	return result, err
+}
+
+// List implements store.TemplateRepository.
+func (r *templateRepo) List(_ context.Context) ([]*domain.Template, error) {
+	var result []*domain.Template
+	err := r.s.readAll(func(d db) error {
+		result = make([]*domain.Template, 0, len(d.Templates))
+		for _, t := range d.Templates {
+			result = append(result, t)
+		}
+		slices.SortFunc(result, func(a, b *domain.Template) int {
+			if a.Code < b.Code {
+				return -1
+			}
+			if a.Code > b.Code {
+				return 1
+			}
+			return 0
+		})
+		return nil
+	})
+	return result, err
+}
+
+// Delete implements store.TemplateRepository.
+func (r *templateRepo) Delete(_ context.Context, code domain.TemplateCode) error {
+	return r.s.modify(func(d *db) error {
+		delete(d.Templates, string(code))
 		return nil
 	})
 }

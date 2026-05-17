@@ -57,6 +57,12 @@ type Stream struct {
 	// Code is the unique key chosen by the user ([a-zA-Z0-9_]).
 	Code StreamCode `json:"code" yaml:"code"`
 
+	// Template references a Template by its code; the template's config-like
+	// fields fill in any field this stream leaves at its zero value. nil
+	// means no template inheritance — the stream stands alone. See
+	// ResolveStream in template.go for the merge rules.
+	Template *TemplateCode `json:"template,omitempty" yaml:"template,omitempty"`
+
 	Name        string   `json:"name" yaml:"name"`
 	Description string   `json:"description" yaml:"description"`
 	Tags        []string `json:"tags" yaml:"tags"`
