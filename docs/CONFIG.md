@@ -257,7 +257,13 @@ Hot-applied — change without restart.
 Stored per-stream. Edit via `POST /api/v1/streams/{code}` (partial merge).
 
 ```yaml
-code:        news                # Required. [a-zA-Z0-9_], max 128 chars.
+code:        news                # Required. [A-Za-z0-9_/-]+, max 128 chars.
+                                 # Slashes namespace streams (e.g. "region/north/news").
+                                 # `..` and consecutive `/` are rejected.
+template:    null                # Optional. References a Template by its code.
+                                 # null = no inheritance. Set to e.g. "news_profile"
+                                 # to fill in every config-like field this stream
+                                 # leaves at its zero value. See § 4 (Template config).
 name:        "News Channel"
 description: ""
 tags:        ["news", "production"]
@@ -469,7 +475,65 @@ VAAPI / VideoToolbox don't have `-preset` — value dropped silently (encoder us
 
 ---
 
-## 4. Hook config
+## 4. Template config
+
+Stored separately from streams (`/api/v1/templates` endpoint, top-level
+`templates` key in JSON / YAML store). A template bundles config-like
+stream fields; streams reference one via `Stream.template` and inherit
+every field they leave at the zero value. Template code is
+`[A-Za-z0-9_-]+` (no `/` — flat namespace), max 128 chars.
+
+```yaml
+code:        news_profile        # Required. [A-Za-z0-9_-]+, max 128 chars.
+name:        "News profile"      # Operator-facing label.
+description: ""
+tags:        ["news"]            # Inherited by streams that leave tags empty.
+stream_key:  ""                  # Inherited push auth token; "" = no inheritance.
+
+prefixes:    ["live"]            # Optional. Each URL-path prefix that triggers
+                                 # auto-publish. Match honours segment boundaries —
+                                 # "live" matches "live/foo/bar" but NOT
+                                 # "livestream/foo". Prefixes are globally unique
+                                 # across templates (POST returns 409 PREFIX_OVERLAP
+                                 # when any prefix is a path-prefix of another's).
+                                 # Requires at least one publish:// in `inputs`
+                                 # for auto-publish to actually materialise streams.
+
+inputs:                          # Inherited by streams that leave inputs empty.
+  - url:      "publish://"       # Required for prefix-driven auto-publish to fire.
+    priority: 0
+                                 # Same Input shape as a Stream — see § 3.
+
+transcoder:  { ... }             # All same shapes as Stream config — see § 3.
+protocols:   { hls: true, dash: true }
+push:        [ ... ]
+dvr:         { enabled: true, retention_sec: 86400 }
+watermark:   { ... }
+thumbnail:   null
+```
+
+**Inheritance rule** (`domain.ResolveStream`): zero value on the stream
+= inherit. Pointer fields (`transcoder`, `dvr`, `watermark`,
+`thumbnail`) inherit when null. Slice fields (`inputs`, `tags`,
+`push`) inherit when empty. String fields (`name`, `description`,
+`stream_key`) inherit when empty. The `protocols` struct inherits when
+ALL its bool flags are false. Non-inheritable: `code` (per-stream
+identity) and `disabled` (per-stream runtime toggle).
+
+**Storage**: persisted in the same backend as streams (JSON / YAML)
+under the top-level `templates` map. Survives restarts. Runtime
+streams materialised via prefix auto-publish are NOT persisted — they
+live in memory only and the idle reaper stops them 30 s after the
+last packet.
+
+**Endpoints**: `GET /templates` · `GET /templates/{code}` ·
+`POST /templates/{code}` (upsert) · `DELETE /templates/{code}`.
+`DELETE` refuses with 409 `TEMPLATE_IN_USE` when any stream still
+references the template — detach the streams first.
+
+---
+
+## 5. Hook config
 
 ```yaml
 id:           "ops-pager"           # Required. Unique hook ID.
@@ -500,7 +564,7 @@ For event payload schemas see [APP_FLOW.md § Events reference](./APP_FLOW.md#ev
 
 ---
 
-## 5. Defaults reference
+## 6. Defaults reference
 
 Single source of truth: [internal/domain/defaults.go](../internal/domain/defaults.go).
 
@@ -560,7 +624,7 @@ Single source of truth: [internal/domain/defaults.go](../internal/domain/default
 
 ---
 
-## 6. Worked examples
+## 7. Worked examples
 
 ### Pull HLS, transcode 3 rungs NVENC, publish HLS + DASH + RTSP, push to YouTube + Twitch, record DVR
 

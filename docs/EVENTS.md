@@ -37,11 +37,13 @@ from the operator-configured per-hook fields — useful for routing keys.
 
 | Type | Emitter | Triggers when | Payload |
 |---|---|---|---|
-| `stream.created` | API handler ([stream.go:268](../internal/api/handler/stream.go)) | `POST /streams/{code}` succeeds with a fresh code | _empty_ |
-| `stream.updated` | API handler ([stream.go:278](../internal/api/handler/stream.go)) | `POST /streams/{code}` succeeds on an existing code | `was_running: bool`, `now_enabled: bool`, `disabled: bool` |
-| `stream.started` | Coordinator ([coordinator.go:312](../internal/coordinator/coordinator.go)) | Pipeline goes from stopped → running (Start succeeds) | _empty_ |
-| `stream.stopped` | Coordinator ([coordinator.go:426](../internal/coordinator/coordinator.go)) | Pipeline goes from running → stopped (Stop / shutdown) | _empty_ |
-| `stream.deleted` | API handler ([stream.go:518](../internal/api/handler/stream.go)) | `DELETE /streams/{code}` succeeds | _empty_ |
+| `stream.created` | API handler ([stream.go](../internal/api/handler/stream.go)) | `POST /streams/{code}` succeeds with a fresh code | _empty_ |
+| `stream.updated` | API handler ([stream.go](../internal/api/handler/stream.go)) | `POST /streams/{code}` succeeds on an existing code | `was_running: bool`, `now_enabled: bool`, `disabled: bool` |
+| `stream.started` | Coordinator ([coordinator.go](../internal/coordinator/coordinator.go)) | Pipeline goes from stopped → running (Start succeeds) | _empty_ |
+| `stream.stopped` | Coordinator ([coordinator.go](../internal/coordinator/coordinator.go)) | Pipeline goes from running → stopped (Stop / shutdown) | _empty_ |
+| `stream.deleted` | API handler ([stream.go](../internal/api/handler/stream.go)) | `DELETE /streams/{code}` succeeds | _empty_ |
+| `stream.runtime_created` | Autopublish ([service.go](../internal/autopublish/service.go)) | A template-prefix match materialises a runtime stream (encoder pushed to a path matching a template prefix; the matched template carries a `publish://` input). Runtime streams are NEVER in the on-disk repo | `template_code: string` |
+| `stream.runtime_expired` | Autopublish ([service.go](../internal/autopublish/service.go)) | Idle reaper stops a runtime stream after 30 s without a packet on the buffer hub | `template_code: string` |
 
 ### 2.2 Input health
 
@@ -127,6 +129,19 @@ infrastructure-as-code drift detection.
 
 Beware the recursion risk: a `hook.*` event subscriber that creates /
 updates / deletes hooks will trigger more `hook.*` events.
+
+### 2.10 Template lifecycle (meta-events)
+
+Audit events for the template system. Updates fire AFTER every
+dependent stream's pipeline has been hot-reloaded so downstream
+consumers can assume the new resolved config is live by the time the
+event is delivered.
+
+| Type | Emitter | Triggers when | Payload |
+|---|---|---|---|
+| `template.created` | API handler ([template.go](../internal/api/handler/template.go)) | `POST /templates/{code}` succeeds with a fresh code | `template_code: string` |
+| `template.updated` | API handler ([template.go](../internal/api/handler/template.go)) | `POST /templates/{code}` succeeds on an existing code; dependent running streams have been hot-reloaded via `coordinator.Update` | `template_code: string` |
+| `template.deleted` | API handler ([template.go](../internal/api/handler/template.go)) | `DELETE /templates/{code}` succeeds (no streams reference the template) | `template_code: string` |
 
 ---
 

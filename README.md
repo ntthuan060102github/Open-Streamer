@@ -6,7 +6,7 @@
 [![Coverage](https://codecov.io/gh/ntt0601zcoder/open-streamer/branch/main/graph/badge.svg)](https://codecov.io/gh/ntt0601zcoder/open-streamer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-availability live media server in pure Go. Ingests from any
+A high-availability live media server in Go. Ingests from any
 common protocol, normalises through an internal MPEG-TS pipeline,
 optionally transcodes with FFmpeg, and publishes over HLS, DASH, RTMP,
 RTSP, and SRT — all from one binary, one process per host.
@@ -142,7 +142,23 @@ regenerate from annotations).
 - **HLS + DASH ABR** — master playlist + per-track variants;
   `#EXT-X-DISCONTINUITY` per failover.
 - **RTSP / RTMP / SRT play** — shared listeners (one port per
-  protocol); clients use `/{protocol}://host/live/{code}`.
+  protocol). Single-segment codes use the `live/` prefix:
+  `rtmp://host/live/news`. Multi-segment codes are addressed at their
+  raw path: `rtmp://host/region/north/news`. The server strips a
+  leading `live/` when present, so either form reaches multi-segment
+  streams.
+- **Templates** — reusable bundle of stream config (transcoder,
+  protocols, push, DVR, watermark, thumbnail, inputs, tags,
+  stream-key). Reference one from a stream via the `template` field
+  and the stream inherits every config-like field it leaves at the
+  zero value. Updating the template hot-reloads every running stream
+  that inherits from it.
+- **Auto-publish** — a template can declare URL-path prefixes. When
+  an encoder pushes to a path matching one of the prefixes and the
+  template carries a `publish://` input, the server materialises a
+  **runtime stream** on the fly. Runtime streams are RAM-only, appear
+  in `GET /streams` with `source: "runtime"`, and disappear 30 s
+  after the last packet.
 - **Push out** — RTMP/RTMPS to platforms (YouTube, Facebook, Twitch,
   CDN). Per-destination state visible at
   `runtime.publisher.pushes[]`.
@@ -195,7 +211,8 @@ Repository layout:
 cmd/server/           # main entrypoint
 internal/
   api/                # chi router + handlers
-  api/handler/        # HTTP handlers
+  api/handler/        # HTTP handlers (incl. /templates CRUD)
+  autopublish/        # template-prefix matcher + runtime stream registry + idle reaper
   buffer/             # ring buffer + fan-out
   coordinator/        # pipeline lifecycle + diff engine
   ingestor/           # pull workers (RTMP/RTSP/SRT/HLS/...) + push servers
@@ -207,8 +224,8 @@ internal/
   hooks/              # webhook (HTTP) + file sink delivery
   sessions/           # play-session tracker (HLS/DASH/RTMP/SRT/RTSP viewers)
   watermarks/         # asset library backing /watermarks REST API
-  domain/             # types + defaults + resolvers (single source of truth)
-  store/              # repository pattern (json / yaml backends)
+  domain/             # types + defaults + resolvers (incl. Template / ResolveStream)
+  store/              # repository pattern (json / yaml backends; Stream + Template repos)
   runtime/            # service lifecycle wrapper
 config/               # bootstrap config (storage backend selection)
 build/                # systemd unit + installer
