@@ -7,7 +7,8 @@ package publisher
 // ingestor's RTMP server delegates to HandleRTMPPlay below. Wired in
 // runtime.Manager via ing.SetRTMPPlayHandler(pub.HandleRTMPPlay).
 //
-// Client URL: rtmp://host:port/live/<stream_code>
+// Client URL: rtmp://host:port/live/<stream_code> for single-segment codes;
+// rtmp://host:port/<seg1>/<seg2>/... for multi-segment codes (live/ omitted).
 //
 // Data flow per session:
 //

@@ -8,8 +8,73 @@ import (
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
+
+// ─── rtspPathStreamCode / rtspLiveMountPath ──────────────────────────────────
+//
+// Single-segment codes are addressed via `live/<code>`; multi-segment codes
+// are addressed via `<seg1>/<seg2>/...` directly with `live/` always stripped
+// when present. SETUP paths carry a `/trackID=<N>` control suffix from
+// gortsplib which we strip before returning the canonical code.
+
+func TestRTSPPathStreamCode(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		path string
+		want domain.StreamCode
+	}{
+		{"single segment with live prefix", "/live/foo", "foo"},
+		{"single segment without leading slash", "live/foo", "foo"},
+		{"multi-segment direct", "/foo/bar", "foo/bar"},
+		{"multi-segment with non-canonical live prefix", "/live/foo/bar", "foo/bar"},
+		{"single segment setup trackID", "/live/foo/trackID=0", "foo"},
+		{"multi-segment setup trackID", "/foo/bar/trackID=1", "foo/bar"},
+		{"deep multi-segment setup trackID", "/a/b/c/trackID=2", "a/b/c"},
+		{"empty path", "", ""},
+		{"only slash", "/", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, rtspPathStreamCode(tc.path))
+		})
+	}
+}
+
+func TestRTSPLiveMountPath(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "live/foo", rtspLiveMountPath("foo"),
+		"single-segment codes mount under the live/ prefix")
+	assert.Equal(t, "foo/bar", rtspLiveMountPath("foo/bar"),
+		"multi-segment codes mount at their raw path with no live/ prefix")
+	assert.Equal(t, "a/b/c", rtspLiveMountPath("a/b/c"))
+}
+
+// matchRTSPMount must locate a mount for both the canonical path and (for
+// multi-segment codes) the non-canonical `live/<code>` form. Bare
+// single-segment paths must NOT match — they have nothing to strip and the
+// 1-seg mount sits behind `live/`.
+func TestLookupStreamMultiSegment(t *testing.T) {
+	t.Parallel()
+
+	mounts := map[string]*gortsplib.ServerStream{
+		"live/foo": {}, // 1-segment stream "foo" mounted at live/foo
+		"foo/bar":  {}, // 2-segment stream "foo/bar" mounted directly
+	}
+
+	// Single-segment: only `live/<code>` matches; bare path is rejected.
+	require.NotNil(t, matchRTSPMount(mounts, "live/foo"), "live/foo matches mount live/foo")
+	require.NotNil(t, matchRTSPMount(mounts, "live/foo/trackID=0"), "SETUP path matches mount via prefix")
+	require.Nil(t, matchRTSPMount(mounts, "foo"), "bare 1-seg path must not match")
+
+	// Multi-segment: canonical matches directly.
+	require.NotNil(t, matchRTSPMount(mounts, "foo/bar"))
+	require.NotNil(t, matchRTSPMount(mounts, "foo/bar/trackID=1"))
+}
 
 // computeVideoRTP must never emit an RTP timestamp ≤ the last one sent.
 // Real-world trigger: HLS source jitter where DTS dips a few tens of ms
