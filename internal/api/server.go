@@ -33,6 +33,7 @@ type Server struct {
 
 	// Handler references stored for router rebuilding on config change.
 	streamH    *handler.StreamHandler
+	templateH  *handler.TemplateHandler
 	recordingH *handler.RecordingHandler
 	hookH      *handler.HookHandler
 	configH    *handler.ConfigHandler
@@ -73,6 +74,7 @@ func New(i do.Injector) (*Server, error) {
 		hlsDir:     pub.HLS.Dir,
 		dashDir:    dashDir,
 		streamH:    do.MustInvoke[*handler.StreamHandler](i),
+		templateH:  do.MustInvoke[*handler.TemplateHandler](i),
 		recordingH: do.MustInvoke[*handler.RecordingHandler](i),
 		hookH:      do.MustInvoke[*handler.HookHandler](i),
 		configH:    do.MustInvoke[*handler.ConfigHandler](i),
@@ -169,6 +171,17 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	// (code, action) from the suffix. See dispatch.go for the rules.
 	r.Get("/streams", s.streamH.List)
 	r.HandleFunc("/streams/*", s.dispatchStreamsSubpath())
+
+	// Templates. Codes are single-segment (a-zA-Z0-9_-) so the chi
+	// single-param routes are fine — no catch-all dispatcher needed.
+	r.Route("/templates", func(r chi.Router) {
+		r.Get("/", s.templateH.List)
+		r.Route("/{code}", func(r chi.Router) {
+			r.Get("/", s.templateH.Get)
+			r.Post("/", s.templateH.Put)
+			r.Delete("/", s.templateH.Delete)
+		})
+	})
 
 	r.Route("/sessions", func(r chi.Router) {
 		r.Get("/", s.sessionH.List)

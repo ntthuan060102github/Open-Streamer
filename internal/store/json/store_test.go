@@ -151,6 +151,61 @@ func TestJSONStreamRepo_Delete(t *testing.T) {
 	assert.True(t, errors.Is(err, store.ErrNotFound))
 }
 
+// --- TemplateRepository ---
+
+func TestJSONTemplateRepo_SaveAndFindByCode(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Templates()
+
+	want := storetest.NewFullTemplate("profile_a")
+	require.NoError(t, repo.Save(ctx, want))
+
+	got, err := repo.FindByCode(ctx, "profile_a")
+	require.NoError(t, err)
+	assert.Equal(t, want.Code, got.Code)
+	assert.Equal(t, want.Name, got.Name)
+	assert.Equal(t, want.Description, got.Description)
+	assert.Equal(t, want.Protocols, got.Protocols)
+	require.Len(t, got.Push, 1)
+	assert.Equal(t, want.Push[0].URL, got.Push[0].URL)
+	require.NotNil(t, got.DVR)
+	assert.Equal(t, want.DVR.RetentionSec, got.DVR.RetentionSec)
+}
+
+func TestJSONTemplateRepo_FindByCode_NotFound(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Templates()
+	_, err := repo.FindByCode(ctx, "nope")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, store.ErrNotFound))
+}
+
+func TestJSONTemplateRepo_ListSorted(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Templates()
+
+	require.NoError(t, repo.Save(ctx, storetest.NewFullTemplate("b_template")))
+	require.NoError(t, repo.Save(ctx, storetest.NewFullTemplate("a_template")))
+
+	all, err := repo.List(ctx)
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	assert.Equal(t, domain.TemplateCode("a_template"), all[0].Code, "List must be sorted by code asc")
+	assert.Equal(t, domain.TemplateCode("b_template"), all[1].Code)
+}
+
+func TestJSONTemplateRepo_Delete(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Templates()
+
+	tpl := storetest.NewFullTemplate("delete_me")
+	require.NoError(t, repo.Save(ctx, tpl))
+	require.NoError(t, repo.Delete(ctx, "delete_me"))
+
+	_, err := repo.FindByCode(ctx, "delete_me")
+	assert.True(t, errors.Is(err, store.ErrNotFound))
+}
+
 // --- RecordingRepository ---
 
 func TestJSONRecordingRepo_SaveAndFindByID(t *testing.T) {

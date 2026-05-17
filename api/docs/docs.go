@@ -863,6 +863,166 @@ const docTemplate = `{
                 }
             }
         },
+        "/templates": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "templates"
+                ],
+                "summary": "List templates",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
+        "/templates/{code}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "templates"
+                ],
+                "summary": "Get template",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Template code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "templates"
+                ],
+                "summary": "Create or update template",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Template code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Template configuration",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/domain.Template"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "templates"
+                ],
+                "summary": "Delete template",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Template code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
         "/vod": {
             "get": {
                 "produces": [
@@ -1925,6 +2085,10 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "template": {
+                    "description": "Template references a Template by its code; the template's config-like\nfields fill in any field this stream leaves at its zero value. nil\nmeans no template inheritance — the stream stands alone. See\nResolveStream in template.go for the merge rules.",
+                    "type": "string"
+                },
                 "thumbnail": {
                     "description": "Thumbnail controls periodic screenshot generation for preview images.",
                     "allOf": [
@@ -2424,6 +2588,9 @@ const docTemplate = `{
                 "hook.created",
                 "hook.updated",
                 "hook.deleted",
+                "template.created",
+                "template.updated",
+                "template.deleted",
                 "session.opened",
                 "session.closed"
             ],
@@ -2472,6 +2639,9 @@ const docTemplate = `{
                 "",
                 "",
                 "",
+                "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
@@ -2504,6 +2674,9 @@ const docTemplate = `{
                 "EventHookCreated",
                 "EventHookUpdated",
                 "EventHookDeleted",
+                "EventTemplateCreated",
+                "EventTemplateUpdated",
+                "EventTemplateDeleted",
                 "EventSessionOpened",
                 "EventSessionClosed"
             ]
@@ -3106,6 +3279,69 @@ const docTemplate = `{
                 "StatusDegraded",
                 "StatusStopped"
             ]
+        },
+        "domain.Template": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "description": "Code is the unique key chosen by the operator.",
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "dvr": {
+                    "description": "DVR overrides the global DVR settings. Streams that inherit this\ntemplate inherit the DVR configuration unless they set their own.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.StreamDVRConfig"
+                        }
+                    ]
+                },
+                "name": {
+                    "description": "Name and Description are template-level metadata. They describe the\ntemplate to operators and are NOT propagated into streams that\ninherit from it (those keep their own Name / Description fields).",
+                    "type": "string"
+                },
+                "protocols": {
+                    "description": "Protocols defines which delivery protocols are opened.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.OutputProtocols"
+                        }
+                    ]
+                },
+                "push": {
+                    "description": "Push is the list of external destinations the server actively pushes to.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.PushDestination"
+                    }
+                },
+                "thumbnail": {
+                    "description": "Thumbnail controls periodic screenshot generation.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.ThumbnailConfig"
+                        }
+                    ]
+                },
+                "transcoder": {
+                    "description": "Transcoder controls encoding/decoding settings. nil means no\ntranscoding for streams inheriting this template (unless they set\ntheir own Transcoder).",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.TranscoderConfig"
+                        }
+                    ]
+                },
+                "watermark": {
+                    "description": "Watermark is an optional text or image overlay applied before encoding.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/domain.WatermarkConfig"
+                        }
+                    ]
+                }
+            }
         },
         "domain.ThumbnailConfig": {
             "type": "object",

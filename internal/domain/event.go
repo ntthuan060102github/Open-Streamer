@@ -55,6 +55,13 @@ const (
 	EventHookCreated EventType = "hook.created"
 	EventHookUpdated EventType = "hook.updated"
 	EventHookDeleted EventType = "hook.deleted"
+
+	// Templates — published by template handler on REST CRUD. Update fires
+	// after every dependent stream's pipeline has been hot-reloaded so
+	// downstream consumers can assume the new resolved config is live.
+	EventTemplateCreated EventType = "template.created"
+	EventTemplateUpdated EventType = "template.updated"
+	EventTemplateDeleted EventType = "template.deleted"
 )
 
 // Event is an immutable fact describing a domain state change.

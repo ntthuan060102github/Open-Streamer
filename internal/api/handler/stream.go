@@ -54,12 +54,13 @@ type streamPublisherDep interface {
 
 // StreamHandler handles stream lifecycle REST endpoints.
 type StreamHandler struct {
-	streamRepo  store.StreamRepository
-	coordinator streamCoordinator
-	manager     streamManagerDep
-	transcoder  streamTranscoderDep
-	publisher   streamPublisherDep
-	bus         events.Bus
+	streamRepo   store.StreamRepository
+	templateRepo store.TemplateRepository
+	coordinator  streamCoordinator
+	manager      streamManagerDep
+	transcoder   streamTranscoderDep
+	publisher    streamPublisherDep
+	bus          events.Bus
 }
 
 // streamResponse is the API representation of a stream.
@@ -158,13 +159,33 @@ func buildMediaSummary(
 // NewStreamHandler creates a StreamHandler and registers it with the DI injector.
 func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 	return &StreamHandler{
-		streamRepo:  do.MustInvoke[store.StreamRepository](i),
-		coordinator: do.MustInvoke[*coordinator.Coordinator](i),
-		manager:     do.MustInvoke[*manager.Service](i),
-		transcoder:  do.MustInvoke[*transcoder.Service](i),
-		publisher:   do.MustInvoke[*publisher.Service](i),
-		bus:         do.MustInvoke[events.Bus](i),
+		streamRepo:   do.MustInvoke[store.StreamRepository](i),
+		templateRepo: do.MustInvoke[store.TemplateRepository](i),
+		coordinator:  do.MustInvoke[*coordinator.Coordinator](i),
+		manager:      do.MustInvoke[*manager.Service](i),
+		transcoder:   do.MustInvoke[*transcoder.Service](i),
+		publisher:    do.MustInvoke[*publisher.Service](i),
+		bus:          do.MustInvoke[events.Bus](i),
 	}, nil
+}
+
+// resolveStream merges a stream with the config of its referenced template
+// (if any). The coordinator always operates on the resolved view: the raw
+// stream that lives in the repo carries only the per-stream overrides, the
+// template fills in everything left at its zero value. Returns the stream
+// untouched when there is no template reference, the template is missing
+// from the repo, or any error occurs — the caller can keep operating on
+// the raw config and the worst case is that the operator sees a "template
+// not found" log line.
+func (h *StreamHandler) resolveStream(ctx context.Context, s *domain.Stream) *domain.Stream {
+	if s == nil || s.Template == nil || h.templateRepo == nil {
+		return s
+	}
+	tpl, err := h.templateRepo.FindByCode(ctx, *s.Template)
+	if err != nil {
+		return s
+	}
+	return domain.ResolveStream(s, tpl)
 }
 
 // List streams; optional ?status=idle|active|degraded|stopped.
@@ -271,6 +292,19 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	nowEnabled := exists && cur.Disabled && !body.Disabled
 	freshlyCreated := !exists && !body.Disabled && len(body.Inputs) > 0
 
+	// Reject a save that points at a non-existent template — silently
+	// persisting it would leave the runtime resolution unable to fill
+	// in the inherited fields and produce a confusing partial config.
+	// The nil-check on templateRepo lets the harness skip this gate in
+	// tests that build the handler without the template wiring.
+	if body.Template != nil && h.templateRepo != nil {
+		if _, err := h.templateRepo.FindByCode(r.Context(), *body.Template); err != nil {
+			writeError(w, http.StatusBadRequest, "TEMPLATE_NOT_FOUND",
+				"referenced template does not exist: "+string(*body.Template))
+			return
+		}
+	}
+
 	// Save first so the pipeline continues with the old config if persistence fails.
 	if err := h.streamRepo.Save(r.Context(), body); err != nil {
 		serverError(w, r, "SAVE_FAILED", "save stream", err)
@@ -283,14 +317,20 @@ func (h *StreamHandler) Put(w http.ResponseWriter, r *http.Request) {
 	// (HLS/DASH/RTMP/transcoder/manager) is killed instantly. WithoutCancel keeps
 	// request-scoped values (logging tags) but drops the cancel signal.
 	pipelineCtx := context.WithoutCancel(r.Context())
+	// Resolve through the template before handing to the coordinator so
+	// inherited fields are visible to the pipeline diff / start path. The
+	// raw stream stays on disk; only the in-memory view that drives the
+	// runtime is merged.
+	resolvedCur := h.resolveStream(pipelineCtx, cur)
+	resolvedBody := h.resolveStream(pipelineCtx, body)
 	switch {
 	case wasRunning:
-		if err := h.coordinator.Update(pipelineCtx, cur, body); err != nil {
+		if err := h.coordinator.Update(pipelineCtx, resolvedCur, resolvedBody); err != nil {
 			serverError(w, r, "UPDATE_FAILED", "update stream pipeline", err)
 			return
 		}
 	case nowEnabled, freshlyCreated:
-		if err := h.coordinator.Start(pipelineCtx, body); err != nil {
+		if err := h.coordinator.Start(pipelineCtx, resolvedBody); err != nil {
 			serverError(w, r, "START_FAILED", "start stream pipeline", err)
 			return
 		}
@@ -586,7 +626,7 @@ func (h *StreamHandler) Restart(w http.ResponseWriter, r *http.Request) {
 	pipelineCtx := context.WithoutCancel(r.Context())
 	h.coordinator.Stop(pipelineCtx, code)
 
-	if err := h.coordinator.Start(pipelineCtx, stream); err != nil {
+	if err := h.coordinator.Start(pipelineCtx, h.resolveStream(pipelineCtx, stream)); err != nil {
 		serverError(w, r, "START_FAILED", "restart stream pipeline", err)
 		return
 	}

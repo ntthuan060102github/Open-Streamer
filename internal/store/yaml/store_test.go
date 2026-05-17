@@ -71,6 +71,36 @@ func TestYAMLStreamRepo_Delete(t *testing.T) {
 	assert.True(t, errors.Is(err, store.ErrNotFound))
 }
 
+// --- TemplateRepository ---
+
+func TestYAMLTemplateRepo_SaveAndFindByCode(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Templates()
+
+	want := storetest.NewFullTemplate("profile_a")
+	require.NoError(t, repo.Save(ctx, want))
+
+	got, err := repo.FindByCode(ctx, "profile_a")
+	require.NoError(t, err)
+	assert.Equal(t, want.Code, got.Code)
+	assert.Equal(t, want.Name, got.Name)
+	assert.Equal(t, want.Protocols, got.Protocols)
+	require.Len(t, got.Push, 1)
+	assert.Equal(t, want.Push[0].URL, got.Push[0].URL)
+}
+
+func TestYAMLTemplateRepo_Delete(t *testing.T) {
+	ctx := context.Background()
+	repo := newStore(t).Templates()
+
+	require.NoError(t, repo.Save(ctx, storetest.NewFullTemplate("delete_me")))
+	require.NoError(t, repo.Delete(ctx, "delete_me"))
+
+	_, err := repo.FindByCode(ctx, "delete_me")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, store.ErrNotFound))
+}
+
 // --- RecordingRepository ---
 
 func TestYAMLRecordingRepo_SaveAndFindByID(t *testing.T) {

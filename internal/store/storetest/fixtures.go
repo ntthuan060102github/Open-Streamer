@@ -120,6 +120,33 @@ func NewFullRecording(id domain.RecordingID, code domain.StreamCode) *domain.Rec
 	}
 }
 
+// NewFullTemplate returns a Template with every config-like field populated.
+// Useful for round-trip tests that need to verify nothing is silently
+// dropped by serialisation.
+func NewFullTemplate(code domain.TemplateCode) *domain.Template {
+	return &domain.Template{
+		Code:        code,
+		Name:        "Profile A",
+		Description: "Full template fixture",
+		Transcoder: &domain.TranscoderConfig{
+			Video: domain.VideoTranscodeConfig{
+				Profiles: []domain.VideoProfile{{
+					Width:   1280,
+					Height:  720,
+					Bitrate: 2000,
+					Codec:   domain.VideoCodecH264,
+				}},
+			},
+		},
+		Protocols: domain.OutputProtocols{HLS: true, DASH: true},
+		Push: []domain.PushDestination{{
+			URL:     "rtmp://target.example.com/live/key",
+			Enabled: true,
+		}},
+		DVR: &domain.StreamDVRConfig{Enabled: true, RetentionSec: 3600},
+	}
+}
+
 // NewFullHook returns a Hook with every field populated.
 func NewFullHook(id domain.HookID) *domain.Hook {
 	return &domain.Hook{

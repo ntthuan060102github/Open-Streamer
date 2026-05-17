@@ -181,6 +181,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 			return fmt.Errorf("json store: %w", err)
 		}
 		do.ProvideValue(i, s.Streams())
+		do.ProvideValue(i, s.Templates())
 		do.ProvideValue(i, s.Recordings())
 		do.ProvideValue(i, s.Hooks())
 		do.ProvideValue(i, s.GlobalConfig())
@@ -192,6 +193,7 @@ func wireStorage(i *do.RootScope, cfg config.StorageConfig) error {
 			return fmt.Errorf("yaml store: %w", err)
 		}
 		do.ProvideValue(i, s.Streams())
+		do.ProvideValue(i, s.Templates())
 		do.ProvideValue(i, s.Recordings())
 		do.ProvideValue(i, s.Hooks())
 		do.ProvideValue(i, s.GlobalConfig())
@@ -298,6 +300,7 @@ func wireServices(i *do.RootScope) {
 
 	// API handlers
 	do.Provide(i, handler.NewStreamHandler)
+	do.Provide(i, handler.NewTemplateHandler)
 	do.Provide(i, handler.NewRecordingHandler)
 	do.Provide(i, handler.NewHookHandler)
 	do.Provide(i, handler.NewConfigHandler)
