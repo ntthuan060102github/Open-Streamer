@@ -2585,7 +2585,9 @@
                 "hook.deleted",
                 "template.created",
                 "template.updated",
-                "template.deleted"
+                "template.deleted",
+                "stream.runtime_created",
+                "stream.runtime_expired"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2635,6 +2637,8 @@
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
@@ -2671,7 +2675,9 @@
                 "EventHookDeleted",
                 "EventTemplateCreated",
                 "EventTemplateUpdated",
-                "EventTemplateDeleted"
+                "EventTemplateDeleted",
+                "EventStreamRuntimeCreated",
+                "EventStreamRuntimeExpired"
             ]
         },
         "domain.GlobalConfig": {
@@ -3291,9 +3297,23 @@
                         }
                     ]
                 },
+                "inputs": {
+                    "description": "Inputs are inherited by streams that leave Inputs empty. A template\ncarrying a publish:// input is also the trigger that makes Prefixes\nmatching produce a runtime stream — without an input source there\nis nothing for the runtime stream to subscribe to.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/domain.Input"
+                    }
+                },
                 "name": {
-                    "description": "Name and Description are template-level metadata. They describe the\ntemplate to operators and are NOT propagated into streams that\ninherit from it (those keep their own Name / Description fields).",
+                    "description": "Name and Description are template-level metadata. Name surfaces in\nthe API for human-readable lists; Description carries the rationale\nbehind the template's settings. Streams inheriting this template\nkeep their own Name / Description fields — the template metadata is\nfor operator-facing tooling, not for downstream consumers.",
                     "type": "string"
+                },
+                "prefixes": {
+                    "description": "Prefixes is the list of URL-path prefixes that trigger auto-publish.\nWhen an encoder pushes to a path whose first segment(s) match any\nprefix here AND this template has at least one publish:// input, a\nruntime stream is created on the fly. Prefixes must not overlap any\nother template's prefix (validated at save time).",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "protocols": {
                     "description": "Protocols defines which delivery protocols are opened.",
@@ -3308,6 +3328,17 @@
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/domain.PushDestination"
+                    }
+                },
+                "stream_key": {
+                    "description": "StreamKey is the shared push-authentication secret for streams that\ninherit this template. Empty means no secret is templated and each\nstream may set its own (or none).",
+                    "type": "string"
+                },
+                "tags": {
+                    "description": "Tags propagate to inheriting streams when the stream leaves Tags\nempty. Useful for grouping every stream that follows a common\nprofile under one operational label.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
                     }
                 },
                 "thumbnail": {

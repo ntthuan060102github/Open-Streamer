@@ -665,6 +665,8 @@ definitions:
     - template.created
     - template.updated
     - template.deleted
+    - stream.runtime_created
+    - stream.runtime_expired
     type: string
     x-enum-comments:
       EventDVRSegmentPruned: retention loop deleted an aged-out segment
@@ -715,6 +717,8 @@ definitions:
     - ""
     - ""
     - ""
+    - ""
+    - ""
     x-enum-varnames:
     - EventSessionOpened
     - EventSessionClosed
@@ -750,6 +754,8 @@ definitions:
     - EventTemplateCreated
     - EventTemplateUpdated
     - EventTemplateDeleted
+    - EventStreamRuntimeCreated
+    - EventStreamRuntimeExpired
   domain.GlobalConfig:
     properties:
       buffer:
@@ -1341,12 +1347,33 @@ definitions:
         description: |-
           DVR overrides the global DVR settings. Streams that inherit this
           template inherit the DVR configuration unless they set their own.
+      inputs:
+        description: |-
+          Inputs are inherited by streams that leave Inputs empty. A template
+          carrying a publish:// input is also the trigger that makes Prefixes
+          matching produce a runtime stream — without an input source there
+          is nothing for the runtime stream to subscribe to.
+        items:
+          $ref: '#/definitions/domain.Input'
+        type: array
       name:
         description: |-
-          Name and Description are template-level metadata. They describe the
-          template to operators and are NOT propagated into streams that
-          inherit from it (those keep their own Name / Description fields).
+          Name and Description are template-level metadata. Name surfaces in
+          the API for human-readable lists; Description carries the rationale
+          behind the template's settings. Streams inheriting this template
+          keep their own Name / Description fields — the template metadata is
+          for operator-facing tooling, not for downstream consumers.
         type: string
+      prefixes:
+        description: |-
+          Prefixes is the list of URL-path prefixes that trigger auto-publish.
+          When an encoder pushes to a path whose first segment(s) match any
+          prefix here AND this template has at least one publish:// input, a
+          runtime stream is created on the fly. Prefixes must not overlap any
+          other template's prefix (validated at save time).
+        items:
+          type: string
+        type: array
       protocols:
         allOf:
         - $ref: '#/definitions/domain.OutputProtocols'
@@ -1356,6 +1383,20 @@ definitions:
           pushes to.
         items:
           $ref: '#/definitions/domain.PushDestination'
+        type: array
+      stream_key:
+        description: |-
+          StreamKey is the shared push-authentication secret for streams that
+          inherit this template. Empty means no secret is templated and each
+          stream may set its own (or none).
+        type: string
+      tags:
+        description: |-
+          Tags propagate to inheriting streams when the stream leaves Tags
+          empty. Useful for grouping every stream that follows a common
+          profile under one operational label.
+        items:
+          type: string
         type: array
       thumbnail:
         allOf:

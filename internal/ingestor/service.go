@@ -73,6 +73,10 @@ type Service struct {
 	// created the RTMP server. Drained and applied in Run; nil once the
 	// server is live (subsequent registrations call rtmpSrv directly).
 	pendingPushCallbacks map[domain.StreamCode]push.StreamCallbacks
+	// pendingAutoPublish holds an auto-publish resolver registered before
+	// Run created the RTMP server. Same deferred-wiring pattern as the
+	// PlayFunc / push callbacks above.
+	pendingAutoPublish push.AutoPublishResolver
 }
 
 // New creates a Service and registers it with the DI injector.
@@ -166,6 +170,23 @@ func (s *Service) SetRTMPPlayHandler(fn push.PlayFunc) {
 	s.mu.Unlock()
 }
 
+// SetAutoPublishResolver installs the fallback resolver consulted by the
+// RTMP push server when an encoder targets a key that is not in the
+// registry. Same deferred-wiring semantics as SetRTMPPlayHandler — safe
+// to call before or after Run.
+func (s *Service) SetAutoPublishResolver(r push.AutoPublishResolver) {
+	s.mu.Lock()
+	srv := s.rtmpSrv
+	s.mu.Unlock()
+	if srv != nil {
+		srv.SetAutoPublishResolver(r)
+		return
+	}
+	s.mu.Lock()
+	s.pendingAutoPublish = r
+	s.mu.Unlock()
+}
+
 // Run starts the shared push/play listeners (RTMP) and blocks until ctx is
 // cancelled. Other shared listeners (SRT, RTSP) are owned by the publisher and
 // run from runtime.Manager; the same network port serves both ingest and play
@@ -189,6 +210,10 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.pendingPlayFunc != nil {
 			rtmpSrv.SetPlayFunc(s.pendingPlayFunc)
 			s.pendingPlayFunc = nil
+		}
+		if s.pendingAutoPublish != nil {
+			rtmpSrv.SetAutoPublishResolver(s.pendingAutoPublish)
+			s.pendingAutoPublish = nil
 		}
 		// Wire pending push callbacks (deferred from startPushRegistration
 		// when the server didn't exist yet — typical on cold start where

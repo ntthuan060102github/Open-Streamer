@@ -130,6 +130,21 @@ type StreamCallbacks struct {
 	OnDisconnect func(err error)
 }
 
+// AutoPublishResolver materialises a runtime stream when the registry has
+// no entry for an incoming push path. Implementations look the path up
+// against a set of template prefixes; on a match they synthesise the
+// stream (no config record needed) and register it with the ingestor so
+// the push server's subsequent registry.Acquire succeeds. Returns
+// ErrNoMatch (or a similar sentinel — caller compares with errors.Is)
+// when no template prefix accepts the path.
+//
+// The push server treats this interface as optional: nil disables auto-
+// publish, in which case any push to an unregistered path is rejected
+// with the existing "stream not registered" semantics.
+type AutoPublishResolver interface {
+	ResolveOrCreate(ctx context.Context, path string) (domain.StreamCode, error)
+}
+
 // RTMPServer accepts RTMP push connections from encoders, validates them
 // against the push Registry, and writes decoded AVPackets into the Buffer
 // Hub. External RTMP play clients are served via the optional PlayFunc.
@@ -142,6 +157,7 @@ type RTMPServer struct {
 	pubs     map[*rtmp.ServerSession]*pubState
 	subs     map[*rtmp.ServerSession]*subState
 	playFunc PlayFunc
+	resolver AutoPublishResolver
 
 	// streamCallbacks: streamID → per-stream callback set. Populated by
 	// the ingestor.Service at startPushRegistration time so the closures
@@ -196,6 +212,48 @@ func (s *RTMPServer) SetPlayFunc(fn PlayFunc) {
 	s.mu.Lock()
 	s.playFunc = fn
 	s.mu.Unlock()
+}
+
+// SetAutoPublishResolver installs the fallback resolver consulted when a
+// pusher targets a key that is not in the registry. Passing nil disables
+// auto-publish (the server reverts to rejecting unregistered pushes).
+// Safe to call concurrently with Run.
+func (s *RTMPServer) SetAutoPublishResolver(r AutoPublishResolver) {
+	s.mu.Lock()
+	s.resolver = r
+	s.mu.Unlock()
+}
+
+// acquireOrAutoPublish tries to claim the registry slot for key. On miss,
+// the auto-publish resolver (when wired) is consulted: it walks template
+// prefixes, materialises a runtime stream if one matches, and registers
+// the slot synchronously. The acquire is then retried. Any non-nil error
+// surfaces as a publish-rejection at the caller.
+func (s *RTMPServer) acquireOrAutoPublish(
+	key, remoteAddr string,
+) (domain.StreamCode, domain.StreamCode, *buffer.Service, error) {
+	bufWriteID, streamID, buf, err := s.registry.Acquire(key)
+	if err == nil {
+		return bufWriteID, streamID, buf, nil
+	}
+	s.mu.Lock()
+	resolver := s.resolver
+	s.mu.Unlock()
+	if resolver == nil {
+		return "", "", nil, err
+	}
+	// Use a fresh background context — the resolver may outlive the
+	// callback (it spawns goroutines for the runtime stream). lal's
+	// OnNewRtmpPubSession blocks until we return, so the timeout is
+	// effectively the publish handshake's own deadline; nothing extra
+	// to enforce here.
+	code, rerr := resolver.ResolveOrCreate(context.Background(), key)
+	if rerr != nil {
+		slog.Debug("rtmp server: auto-publish resolver declined",
+			"key", key, "remote", remoteAddr, "err", rerr)
+		return "", "", nil, err // surface the original "not registered" error
+	}
+	return s.registry.Acquire(string(code))
 }
 
 // SetStreamCallbacks installs the per-session callback set for streamID.
@@ -299,7 +357,7 @@ func (s *RTMPServer) OnNewRtmpPubSession(session *rtmp.ServerSession) error {
 		)
 		return errors.New("rtmp server: invalid stream path")
 	}
-	bufWriteID, streamID, buf, err := s.registry.Acquire(key)
+	bufWriteID, streamID, buf, err := s.acquireOrAutoPublish(key, session.GetStat().RemoteAddr)
 	if err != nil {
 		slog.Warn("rtmp server: rejected publisher",
 			"key", key,

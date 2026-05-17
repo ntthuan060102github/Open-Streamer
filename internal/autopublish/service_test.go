@@ -1,0 +1,278 @@
+package autopublish
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/ntt0601zcoder/open-streamer/internal/buffer"
+	"github.com/ntt0601zcoder/open-streamer/internal/domain"
+	"github.com/ntt0601zcoder/open-streamer/internal/store"
+)
+
+// ─── fakes ───────────────────────────────────────────────────────────────────
+
+type fakeTemplateRepo struct {
+	mu sync.Mutex
+	m  map[domain.TemplateCode]*domain.Template
+}
+
+func newFakeTemplateRepo() *fakeTemplateRepo {
+	return &fakeTemplateRepo{m: make(map[domain.TemplateCode]*domain.Template)}
+}
+
+func (r *fakeTemplateRepo) put(t *domain.Template) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := *t
+	r.m[t.Code] = &cp
+}
+
+func (r *fakeTemplateRepo) Save(_ context.Context, t *domain.Template) error {
+	r.put(t)
+	return nil
+}
+
+func (r *fakeTemplateRepo) FindByCode(_ context.Context, code domain.TemplateCode) (*domain.Template, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v, ok := r.m[code]; ok {
+		cp := *v
+		return &cp, nil
+	}
+	return nil, store.ErrNotFound
+}
+
+func (r *fakeTemplateRepo) List(_ context.Context) ([]*domain.Template, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*domain.Template, 0, len(r.m))
+	for _, v := range r.m {
+		cp := *v
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+func (r *fakeTemplateRepo) Delete(_ context.Context, code domain.TemplateCode) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.m, code)
+	return nil
+}
+
+// stubCoord records Start/Stop calls so tests can assert lifecycle.
+type stubCoord struct {
+	mu       sync.Mutex
+	started  []*domain.Stream
+	stopped  []domain.StreamCode
+	startErr error
+}
+
+func (c *stubCoord) Start(_ context.Context, s *domain.Stream) error {
+	if c.startErr != nil {
+		return c.startErr
+	}
+	c.mu.Lock()
+	c.started = append(c.started, s)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *stubCoord) Stop(_ context.Context, code domain.StreamCode) {
+	c.mu.Lock()
+	c.stopped = append(c.stopped, code)
+	c.mu.Unlock()
+}
+
+func (c *stubCoord) IsRunning(_ domain.StreamCode) bool { return false }
+
+func newServiceWithDeps(t *testing.T) (*Service, *fakeTemplateRepo, *stubCoord) {
+	t.Helper()
+	tr := newFakeTemplateRepo()
+	cd := &stubCoord{}
+	s := &Service{
+		templates: tr,
+		coord:     cd,
+		buf:       buffer.NewServiceForTesting(1024),
+		entries:   make(map[domain.StreamCode]*runtimeEntry),
+	}
+	s.cur.Store(newMatcher(nil))
+	return s, tr, cd
+}
+
+// ─── tests ───────────────────────────────────────────────────────────────────
+
+// ResolveOrCreate must find a matching template, verify it accepts push,
+// build the resolved stream, and dispatch coordinator.Start. The runtime
+// registry should hold a single entry afterwards.
+func TestResolveOrCreate_HappyPath(t *testing.T) {
+	s, tr, cd := newServiceWithDeps(t)
+	tr.put(&domain.Template{
+		Code:     "profile-a",
+		Prefixes: []string{"live/"},
+		Inputs:   []domain.Input{{URL: "publish://"}},
+	})
+	require.NoError(t, s.RefreshTemplates(context.Background()))
+
+	code, err := s.ResolveOrCreate(context.Background(), "live/foo")
+	require.NoError(t, err)
+	assert.Equal(t, domain.StreamCode("live/foo"), code)
+
+	cd.mu.Lock()
+	require.Len(t, cd.started, 1, "coordinator.Start must fire once for a fresh runtime stream")
+	started := cd.started[0]
+	cd.mu.Unlock()
+	assert.Equal(t, domain.StreamCode("live/foo"), started.Code)
+	require.NotNil(t, started.Template)
+	assert.Equal(t, domain.TemplateCode("profile-a"), *started.Template)
+	require.Len(t, started.Inputs, 1, "runtime stream must inherit publish:// input from template")
+	assert.Equal(t, "publish://", started.Inputs[0].URL)
+}
+
+// Concurrent callers racing on the same path must not produce two Start
+// calls — the first wins, the others observe an already-running stream
+// and return its code.
+func TestResolveOrCreate_DedupsConcurrentCallers(t *testing.T) {
+	s, tr, cd := newServiceWithDeps(t)
+	tr.put(&domain.Template{
+		Code:     "profile-a",
+		Prefixes: []string{"live"},
+		Inputs:   []domain.Input{{URL: "publish://"}},
+	})
+	require.NoError(t, s.RefreshTemplates(context.Background()))
+
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for range 25 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.ResolveOrCreate(context.Background(), "live/foo"); err == nil {
+				ok.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(25), ok.Load(), "every caller should see success")
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
+	assert.Len(t, cd.started, 1, "Start may fire only once")
+}
+
+func TestResolveOrCreate_NoMatchReturnsErr(t *testing.T) {
+	s, _, _ := newServiceWithDeps(t)
+	require.NoError(t, s.RefreshTemplates(context.Background()))
+
+	_, err := s.ResolveOrCreate(context.Background(), "unknown/foo")
+	require.ErrorIs(t, err, ErrNoMatch)
+}
+
+// A matched template that lacks a publish:// input must produce
+// ErrTemplateNoPush; the runtime registry stays empty.
+func TestResolveOrCreate_TemplateWithoutPushRejected(t *testing.T) {
+	s, tr, cd := newServiceWithDeps(t)
+	tr.put(&domain.Template{
+		Code:     "profile-a",
+		Prefixes: []string{"live"},
+		Inputs:   []domain.Input{{URL: "rtmp://upstream/key"}}, // not publish://
+	})
+	require.NoError(t, s.RefreshTemplates(context.Background()))
+
+	_, err := s.ResolveOrCreate(context.Background(), "live/foo")
+	require.ErrorIs(t, err, ErrTemplateNoPush)
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
+	assert.Empty(t, cd.started)
+}
+
+// Invalid stream codes (e.g. contain "..") must be rejected at the
+// boundary even when a template prefix accepts the path.
+func TestResolveOrCreate_InvalidStreamCodeRejected(t *testing.T) {
+	s, tr, _ := newServiceWithDeps(t)
+	tr.put(&domain.Template{
+		Code:     "profile-a",
+		Prefixes: []string{"live"},
+		Inputs:   []domain.Input{{URL: "publish://"}},
+	})
+	require.NoError(t, s.RefreshTemplates(context.Background()))
+
+	_, err := s.ResolveOrCreate(context.Background(), "live/../escape")
+	require.Error(t, err)
+}
+
+// A Start failure must surface to the caller AND leave no entry behind
+// (otherwise the reaper would never clean it up).
+func TestResolveOrCreate_StartFailureLeavesNoEntry(t *testing.T) {
+	s, tr, cd := newServiceWithDeps(t)
+	cd.startErr = errors.New("boom")
+	tr.put(&domain.Template{
+		Code:     "profile-a",
+		Prefixes: []string{"live"},
+		Inputs:   []domain.Input{{URL: "publish://"}},
+	})
+	require.NoError(t, s.RefreshTemplates(context.Background()))
+
+	_, err := s.ResolveOrCreate(context.Background(), "live/foo")
+	require.Error(t, err)
+	assert.False(t, s.IsRuntime("live/foo"))
+}
+
+// reapOnce must stop any entry whose lastPacketAt is older than IdleTimeout
+// and leave fresher entries untouched.
+func TestReapOnce_EvictsIdleEntries(t *testing.T) {
+	s, _, cd := newServiceWithDeps(t)
+
+	stale := &runtimeEntry{code: "live/old", templateCode: "p"}
+	stale.lastPacketAt.Store(time.Now().Add(-2 * IdleTimeout).UnixNano())
+	stale.cancelObs = func() {}
+
+	fresh := &runtimeEntry{code: "live/new", templateCode: "p"}
+	fresh.lastPacketAt.Store(time.Now().UnixNano())
+	fresh.cancelObs = func() {}
+
+	s.entries[stale.code] = stale
+	s.entries[fresh.code] = fresh
+
+	s.reapOnce(context.Background())
+
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
+	require.Len(t, cd.stopped, 1)
+	assert.Equal(t, domain.StreamCode("live/old"), cd.stopped[0])
+	assert.True(t, s.IsRuntime("live/new"), "fresh entry must stay registered")
+	assert.False(t, s.IsRuntime("live/old"), "idle entry must be unregistered")
+}
+
+// IsRuntime is the cheap read path used by the stream handler to tag list
+// entries; verify under both branches.
+func TestIsRuntime(t *testing.T) {
+	s, _, _ := newServiceWithDeps(t)
+	entry := &runtimeEntry{code: "live/foo", cancelObs: func() {}}
+	entry.lastPacketAt.Store(time.Now().UnixNano())
+	s.entries[entry.code] = entry
+
+	assert.True(t, s.IsRuntime("live/foo"))
+	assert.False(t, s.IsRuntime("live/nope"))
+}
+
+// ListRuntime returns one entry per live runtime stream with the
+// template code attached.
+func TestListRuntime_ReturnsAllEntries(t *testing.T) {
+	s, _, _ := newServiceWithDeps(t)
+	for _, code := range []domain.StreamCode{"live/a", "live/b"} {
+		e := &runtimeEntry{code: code, templateCode: "p", cancelObs: func() {}}
+		e.lastPacketAt.Store(time.Now().UnixNano())
+		s.entries[code] = e
+	}
+
+	list := s.ListRuntime()
+	assert.Len(t, list, 2)
+}

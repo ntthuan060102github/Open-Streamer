@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/ntt0601zcoder/open-streamer/internal/autopublish"
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
@@ -60,8 +61,30 @@ type StreamHandler struct {
 	manager      streamManagerDep
 	transcoder   streamTranscoderDep
 	publisher    streamPublisherDep
+	autopublish  runtimeStreamLister
 	bus          events.Bus
 }
+
+// runtimeStreamLister narrows the autopublish service to the two methods
+// the stream list endpoint needs. Defined as an interface so tests can
+// supply a tiny fake instead of the full autopublish wiring.
+// *autopublish.Service satisfies this implicitly.
+type runtimeStreamLister interface {
+	ListRuntime() []autopublish.RuntimeEntry
+	IsRuntime(code domain.StreamCode) bool
+}
+
+// StreamSource tags whether a Stream record originated from the config
+// store or from auto-publish (a template-prefix match that materialised
+// a runtime stream on the fly). Surfaced on every list / get response
+// so clients can filter or label correctly.
+type StreamSource string
+
+// StreamSource values.
+const (
+	StreamSourceConfig  StreamSource = "config"
+	StreamSourceRuntime StreamSource = "runtime"
+)
 
 // streamResponse is the API representation of a stream.
 // Persisted config from domain.Stream is embedded at top level; everything
@@ -69,6 +92,7 @@ type StreamHandler struct {
 // lives under a single `runtime` envelope so clients have one root for live data.
 type streamResponse struct {
 	*domain.Stream
+	Source  StreamSource          `json:"source"`
 	Runtime manager.RuntimeStatus `json:"runtime"`
 }
 
@@ -109,7 +133,11 @@ func (h *StreamHandler) withStatus(s *domain.Stream) streamResponse {
 		rt.Inputs = []manager.InputHealthSnapshot{}
 	}
 	rt.Media = buildMediaSummary(s, rt.Inputs, rt.ActiveInputPriority)
-	return streamResponse{Stream: s, Runtime: rt}
+	source := StreamSourceConfig
+	if h.autopublish != nil && h.autopublish.IsRuntime(s.Code) {
+		source = StreamSourceRuntime
+	}
+	return streamResponse{Stream: s, Source: source, Runtime: rt}
 }
 
 // buildMediaSummary derives the runtime media envelope (UI panel data) from
@@ -158,7 +186,7 @@ func buildMediaSummary(
 
 // NewStreamHandler creates a StreamHandler and registers it with the DI injector.
 func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
-	return &StreamHandler{
+	h := &StreamHandler{
 		streamRepo:   do.MustInvoke[store.StreamRepository](i),
 		templateRepo: do.MustInvoke[store.TemplateRepository](i),
 		coordinator:  do.MustInvoke[*coordinator.Coordinator](i),
@@ -166,7 +194,11 @@ func NewStreamHandler(i do.Injector) (*StreamHandler, error) {
 		transcoder:   do.MustInvoke[*transcoder.Service](i),
 		publisher:    do.MustInvoke[*publisher.Service](i),
 		bus:          do.MustInvoke[events.Bus](i),
-	}, nil
+	}
+	if ap, err := do.Invoke[*autopublish.Service](i); err == nil {
+		h.autopublish = ap
+	}
+	return h, nil
 }
 
 // resolveStream merges a stream with the config of its referenced template
@@ -215,6 +247,7 @@ func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "LIST_FAILED", "list streams", err)
 		return
 	}
+	streams = append(streams, h.listRuntimeStreams(r.Context())...)
 
 	resp := make([]streamResponse, 0, len(streams))
 	for _, s := range streams {
@@ -225,6 +258,30 @@ func (h *StreamHandler) List(w http.ResponseWriter, r *http.Request) {
 		resp = append(resp, sr)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": resp, "total": len(resp)})
+}
+
+// listRuntimeStreams materialises a *domain.Stream view for every live
+// runtime stream. The on-disk repo never holds these records — they are
+// reconstructed by re-applying the template merge to a stub stream that
+// carries only the code + template reference (mirroring how the runtime
+// stream was Started in the first place). Template lookup failures are
+// tolerated: a runtime stream whose template was just deleted shows up
+// with only its code while the idle reaper finishes tearing it down.
+func (h *StreamHandler) listRuntimeStreams(ctx context.Context) []*domain.Stream {
+	if h.autopublish == nil {
+		return nil
+	}
+	entries := h.autopublish.ListRuntime()
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]*domain.Stream, 0, len(entries))
+	for _, e := range entries {
+		tplCode := e.TemplateCode
+		stub := &domain.Stream{Code: e.Code, Template: &tplCode}
+		out = append(out, h.resolveStream(ctx, stub))
+	}
+	return out
 }
 
 // Get returns one stream by code.

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/ntt0601zcoder/open-streamer/internal/autopublish"
 	"github.com/ntt0601zcoder/open-streamer/internal/coordinator"
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 	"github.com/ntt0601zcoder/open-streamer/internal/events"
@@ -17,11 +19,14 @@ import (
 // TemplateHandler handles template CRUD endpoints. On Save it also hot-reloads
 // every stream that inherits from the template by recomputing the resolved
 // stream config (template merged with stream-level overrides) and calling
-// coordinator.Update for each running dependent.
+// coordinator.Update for each running dependent. After every Save / Delete
+// it asks the autopublish service to rebuild its in-memory prefix matcher
+// so the new prefix list takes effect on the next push attempt.
 type TemplateHandler struct {
 	templateRepo store.TemplateRepository
 	streamRepo   store.StreamRepository
 	coordinator  streamCoordinator
+	autopublish  *autopublish.Service
 	bus          events.Bus
 }
 
@@ -31,8 +36,23 @@ func NewTemplateHandler(i do.Injector) (*TemplateHandler, error) {
 		templateRepo: do.MustInvoke[store.TemplateRepository](i),
 		streamRepo:   do.MustInvoke[store.StreamRepository](i),
 		coordinator:  do.MustInvoke[*coordinator.Coordinator](i),
+		autopublish:  do.MustInvoke[*autopublish.Service](i),
 		bus:          do.MustInvoke[events.Bus](i),
 	}, nil
+}
+
+// refreshAutoPublish rebuilds the autopublish service's matcher snapshot
+// after a template was saved or deleted. Nil-safe so tests that construct
+// the handler without a wired autopublish service still work; failures
+// are logged at WARN — the matcher will catch up on the next save and
+// runtime streams are not data-critical.
+func (h *TemplateHandler) refreshAutoPublish(ctx context.Context) {
+	if h.autopublish == nil {
+		return
+	}
+	if err := h.autopublish.RefreshTemplates(ctx); err != nil {
+		slog.Warn("template handler: autopublish refresh failed", "err", err)
+	}
 }
 
 // publishTemplateEvent emits a template lifecycle meta-event. Nil-safe so
@@ -114,6 +134,24 @@ func (h *TemplateHandler) Put(w http.ResponseWriter, r *http.Request) {
 	}
 	body.Code = code // URL param wins so the persisted record can't drift
 
+	if err := domain.ValidatePrefixes(body.Prefixes); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_PREFIX", err.Error())
+		return
+	}
+	if conflict, err := h.findConflictingPrefix(r.Context(), code, body.Prefixes); err != nil {
+		serverError(w, r, "LIST_FAILED", "scan templates for prefix conflicts", err)
+		return
+	} else if conflict != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":            "PREFIX_OVERLAP",
+			"message":          conflict.message,
+			"conflicting_with": string(conflict.otherTemplate),
+			"prefix":           conflict.ourPrefix,
+			"overlaps":         conflict.otherPrefix,
+		})
+		return
+	}
+
 	prior, _ := h.templateRepo.FindByCode(r.Context(), code)
 	created := prior == nil
 
@@ -130,6 +168,8 @@ func (h *TemplateHandler) Put(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "RELOAD_FAILED", "reload dependent streams", err)
 		return
 	}
+
+	h.refreshAutoPublish(pipelineCtx)
 
 	eventType := domain.EventTemplateUpdated
 	status := http.StatusOK
@@ -187,6 +227,7 @@ func (h *TemplateHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		serverError(w, r, "DELETE_FAILED", "delete template", err)
 		return
 	}
+	h.refreshAutoPublish(r.Context())
 	h.publishTemplateEvent(r, domain.EventTemplateDeleted, code)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -236,4 +277,52 @@ func (h *TemplateHandler) findReferencingStreams(ctx context.Context, code domai
 		}
 	}
 	return refs, nil
+}
+
+// prefixConflict describes an overlap between two prefixes that belong to
+// different templates. Surfaced in the API response so the operator can
+// see exactly which other template owns the conflicting prefix.
+type prefixConflict struct {
+	otherTemplate domain.TemplateCode
+	ourPrefix     string
+	otherPrefix   string
+	message       string
+}
+
+// findConflictingPrefix scans every OTHER template and returns the first
+// (ours, theirs) pair where the prefixes overlap. self is excluded from
+// the scan so an update to an existing template doesn't conflict with
+// its own previous prefixes. Returns nil when there are no conflicts.
+func (h *TemplateHandler) findConflictingPrefix(
+	ctx context.Context,
+	self domain.TemplateCode,
+	prefixes []string,
+) (*prefixConflict, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	all, err := h.templateRepo.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, other := range all {
+		if other == nil || other.Code == self {
+			continue
+		}
+		for _, ours := range prefixes {
+			for _, theirs := range other.Prefixes {
+				if !domain.PrefixesOverlap(ours, theirs) {
+					continue
+				}
+				return &prefixConflict{
+					otherTemplate: other.Code,
+					ourPrefix:     ours,
+					otherPrefix:   theirs,
+					message: "prefix " + ours + " overlaps with " + theirs +
+						" owned by template " + string(other.Code),
+				}, nil
+			}
+		}
+	}
+	return nil, nil
 }
