@@ -490,134 +490,6 @@ const docTemplate = `{
                 }
             }
         },
-        "/recordings/{rid}": {
-            "get": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Get recording",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Recording ID (= stream code)",
-                        "name": "rid",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.RecordingData"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/recordings/{rid}/info": {
-            "get": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "DVR recording info",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Recording ID (= stream code)",
-                        "name": "rid",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": true
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/recordings/{rid}/{file}": {
-            "get": {
-                "produces": [
-                    "application/octet-stream"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "Serve recording file (segment or playlist; timeshift via query)",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Recording ID (= stream code)",
-                        "name": "rid",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Segment filename (e.g. 000000.ts) or playlist.m3u8",
-                        "name": "file",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Timeshift: absolute start (RFC3339). Implies M3U8 dispatch",
-                        "name": "from",
-                        "in": "query"
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Timeshift: relative start (seconds from recording start)",
-                        "name": "offset_sec",
-                        "in": "query"
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Timeshift: window length in seconds (default: all remaining)",
-                        "name": "duration",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "file"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
         "/sessions": {
             "get": {
                 "produces": [
@@ -628,6 +500,12 @@ const docTemplate = `{
                 ],
                 "summary": "List play sessions",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Filter by stream code",
+                        "name": "stream",
+                        "in": "query"
+                    },
                     {
                         "type": "string",
                         "description": "Filter by protocol (hls|dash|rtmp|srt|rtsp)",
@@ -652,6 +530,12 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/apidocs.SessionList"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
                         }
                     }
                 }
@@ -878,7 +762,53 @@ const docTemplate = `{
                 }
             }
         },
-        "/streams/{code}/inputs/switch": {
+        "/streams/{code}/restart": {
+            "post": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "streams"
+                ],
+                "summary": "Restart stream pipeline",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Stream code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.StreamActionData"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
+        "/streams/{code}/switch": {
             "post": {
                 "produces": [
                     "application/json"
@@ -926,138 +856,6 @@ const docTemplate = `{
                     },
                     "500": {
                         "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/streams/{code}/recordings": {
-            "get": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "recordings"
-                ],
-                "summary": "List recordings by stream",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.RecordingList"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/streams/{code}/restart": {
-            "post": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "streams"
-                ],
-                "summary": "Restart stream pipeline",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.StreamActionData"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    },
-                    "500": {
-                        "description": "Internal Server Error",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.ErrorBody"
-                        }
-                    }
-                }
-            }
-        },
-        "/streams/{code}/sessions": {
-            "get": {
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "sessions"
-                ],
-                "summary": "List sessions for a stream",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Stream code",
-                        "name": "code",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Filter by protocol",
-                        "name": "proto",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Filter by status",
-                        "name": "status",
-                        "in": "query"
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Max sessions to return",
-                        "name": "limit",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/apidocs.SessionList"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
                         "schema": {
                             "$ref": "#/definitions/apidocs.ErrorBody"
                         }
@@ -1675,6 +1473,105 @@ const docTemplate = `{
                     }
                 }
             }
+        },
+        "/{code}/index.m3u8": {
+            "get": {
+                "produces": [
+                    "text/plain"
+                ],
+                "tags": [
+                    "dvr"
+                ],
+                "summary": "HLS timeshift playlist (DVR)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Stream code",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Absolute start (Unix seconds)",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Start N seconds before now",
+                        "name": "delay",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Alias of delay",
+                        "name": "ago",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Clip duration in seconds",
+                        "name": "dur",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "VOD m3u8",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
+        },
+        "/{code}/recording_status.json": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "dvr"
+                ],
+                "summary": "DVR recording status",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Stream code (the recording ID)",
+                        "name": "code",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apidocs.ErrorBody"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -1839,28 +1736,6 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "priority": {
-                    "type": "integer"
-                }
-            }
-        },
-        "apidocs.RecordingData": {
-            "type": "object",
-            "properties": {
-                "data": {
-                    "$ref": "#/definitions/domain.Recording"
-                }
-            }
-        },
-        "apidocs.RecordingList": {
-            "type": "object",
-            "properties": {
-                "data": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/domain.Recording"
-                    }
-                },
-                "total": {
                     "type": "integer"
                 }
             }
@@ -2031,7 +1906,7 @@ const docTemplate = `{
                     ]
                 },
                 "push": {
-                    "description": "Push is the list of external destinations the server actively pushes to.\nEach entry defines one push target (YouTube, Facebook, Twitch, CDN relay, etc.).",
+                    "description": "Push is the list of external destinations the server actively pushes to.\nEach entry defines one push target (social media live ingest, CDN relay, etc.).",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/domain.PushDestination"
@@ -2520,8 +2395,6 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
-                "session.opened",
-                "session.closed",
                 "stream.created",
                 "stream.updated",
                 "stream.started",
@@ -2550,7 +2423,9 @@ const docTemplate = `{
                 "watermark.asset_deleted",
                 "hook.created",
                 "hook.updated",
-                "hook.deleted"
+                "hook.deleted",
+                "session.opened",
+                "session.closed"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2567,8 +2442,6 @@ const docTemplate = `{
                 "EventStreamUpdated": "PUT /streams/{code} on existing record"
             },
             "x-enum-descriptions": [
-                "",
-                "",
                 "",
                 "PUT /streams/{code} on existing record",
                 "",
@@ -2597,11 +2470,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
+                "",
+                "",
                 ""
             ],
             "x-enum-varnames": [
-                "EventSessionOpened",
-                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamUpdated",
                 "EventStreamStarted",
@@ -2630,7 +2503,9 @@ const docTemplate = `{
                 "EventWatermarkAssetDeleted",
                 "EventHookCreated",
                 "EventHookUpdated",
-                "EventHookDeleted"
+                "EventHookDeleted",
+                "EventSessionOpened",
+                "EventSessionClosed"
             ]
         },
         "domain.GlobalConfig": {
@@ -2953,7 +2828,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "dvr": {
-                    "description": "DVR is true when playback originated from the DVR / recording route\n(/recordings/{rid}/...), false for live-edge mediaserve hits. Set\nby sessions.DVRHTTPMiddleware on the recording sub-router. The flag\nalso participates in the session fingerprint, so a viewer watching\nboth live and timeshift gets two distinct session records.",
+                    "description": "DVR is true when the playlist request carried any timeshift query\nparameter (from / delay / dur / ago) — false for live-edge hits. Set\nby sessions.HTTPMiddleware after detecting the query shape. The flag\nalso participates in the session fingerprint, so a viewer watching\nboth live and timeshift gets two distinct session records.",
                     "type": "boolean"
                 },
                 "id": {
@@ -3076,43 +2951,6 @@ const docTemplate = `{
                 "PushStatusRetrying",
                 "PushStatusFailed",
                 "PushStatusDisabled"
-            ]
-        },
-        "domain.Recording": {
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "string"
-                },
-                "segment_dir": {
-                    "description": "SegmentDir is the absolute path to the directory holding TS files,\nplaylist.m3u8, and index.json.",
-                    "type": "string"
-                },
-                "started_at": {
-                    "type": "string"
-                },
-                "status": {
-                    "$ref": "#/definitions/domain.RecordingStatus"
-                },
-                "stopped_at": {
-                    "type": "string"
-                },
-                "stream_code": {
-                    "type": "string"
-                }
-            }
-        },
-        "domain.RecordingStatus": {
-            "type": "string",
-            "enum": [
-                "recording",
-                "stopped",
-                "failed"
-            ],
-            "x-enum-varnames": [
-                "RecordingStatusRecording",
-                "RecordingStatusStopped",
-                "RecordingStatusFailed"
             ]
         },
         "domain.ResizeMode": {

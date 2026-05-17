@@ -3,10 +3,9 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -94,9 +93,7 @@ func (f *fakeRecRepo) Delete(_ context.Context, id domain.RecordingID) error {
 	return nil
 }
 
-// stubDVR implements dvrIndexReader with controllable returns. nil on a
-// field means "use the natural disk-loader" — but tests override per
-// case to avoid fs side-effects.
+// stubDVR implements dvrIndexReader with controllable returns.
 type stubDVR struct {
 	indexByDir map[string]*domain.DVRIndex
 	indexErr   error
@@ -118,9 +115,6 @@ func (s *stubDVR) ParsePlaylist(segDir string) ([]dvr.SegmentMeta, error) {
 	return s.playByDir[segDir], nil
 }
 
-// newRecHandlerForTest is the recording-handler analogue of
-// newStreamHandlerForTest. Returns the handler + the fake repo + the stub
-// DVR so tests can drive both.
 func newRecHandlerForTest(t *testing.T) (*RecordingHandler, *fakeRecRepo, *stubDVR) {
 	t.Helper()
 	repo := newFakeRecRepo()
@@ -132,61 +126,28 @@ func newRecHandlerForTest(t *testing.T) (*RecordingHandler, *fakeRecRepo, *stubD
 	return h, repo, d
 }
 
-// ─── ListByStream ─────────────────────────────────────────────────────────────
-
-func TestRecordingHandler_ListByStream(t *testing.T) {
-	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
-	repo.seed(&domain.Recording{ID: "live", StreamCode: "live"})
-
-	w := httptest.NewRecorder()
-	h.ListByStream(w, chiReq(t, http.MethodGet, "/streams/live/recordings", nil, map[string]string{"code": "live"}))
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), `"total":1`)
+// recReq builds a request whose chi route context exposes "code" as the
+// URL param the catch-all dispatcher would have populated in production.
+// All recording routes are GET-only — the method parameter is kept so the
+// helper signature reads symmetrically with chiReq, even though every
+// caller passes http.MethodGet today.
+func recReq(t *testing.T, method, target, code string) *http.Request { //nolint:unparam // see doc
+	t.Helper()
+	return chiReq(t, method, target, nil, map[string]string{"code": code})
 }
 
-func TestRecordingHandler_ListByStream_RepoError(t *testing.T) {
-	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
-	repo.listErr = errors.New("backend unreachable")
-	w := httptest.NewRecorder()
-	h.ListByStream(w, chiReq(t, http.MethodGet, "/streams/live/recordings", nil, map[string]string{"code": "live"}))
-	assert.Equal(t, http.StatusInternalServerError, w.Code)
-}
+// ─── RecordingStatusJSON ─────────────────────────────────────────────────────
 
-// ─── Get ─────────────────────────────────────────────────────────────────────
-
-func TestRecordingHandler_Get_Found(t *testing.T) {
-	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
-	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", Status: domain.RecordingStatusRecording})
-
-	w := httptest.NewRecorder()
-	h.Get(w, chiReq(t, http.MethodGet, "/recordings/live", nil, map[string]string{"rid": "live"}))
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), `"status":"recording"`)
-}
-
-func TestRecordingHandler_Get_NotFound(t *testing.T) {
-	t.Parallel()
-	h, _, _ := newRecHandlerForTest(t)
-	w := httptest.NewRecorder()
-	h.Get(w, chiReq(t, http.MethodGet, "/recordings/missing", nil, map[string]string{"rid": "missing"}))
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-// ─── Info ────────────────────────────────────────────────────────────────────
-
-func TestRecordingHandler_Info_NoSegmentDirReturns404(t *testing.T) {
+func TestRecordingStatusJSON_NoSegmentDir_404(t *testing.T) {
 	t.Parallel()
 	h, repo, _ := newRecHandlerForTest(t)
 	repo.seed(&domain.Recording{ID: "blank", StreamCode: "blank"}) // SegmentDir empty
 	w := httptest.NewRecorder()
-	h.Info(w, chiReq(t, http.MethodGet, "/recordings/blank/info", nil, map[string]string{"rid": "blank"}))
+	h.RecordingStatusJSON(w, recReq(t, http.MethodGet, "/blank/recording_status.json", "blank"))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-func TestRecordingHandler_Info_HappyPath(t *testing.T) {
+func TestRecordingStatusJSON_HappyPath(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
@@ -199,169 +160,191 @@ func TestRecordingHandler_Info_HappyPath(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	h.Info(w, chiReq(t, http.MethodGet, "/recordings/live/info", nil, map[string]string{"rid": "live"}))
+	h.RecordingStatusJSON(w, recReq(t, http.MethodGet, "/live/recording_status.json", "live"))
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), `"segment_count":42`)
 }
 
-func TestRecordingHandler_Info_IndexErrorReturns500(t *testing.T) {
+func TestRecordingStatusJSON_NotFound(t *testing.T) {
+	t.Parallel()
+	h, _, _ := newRecHandlerForTest(t)
+	w := httptest.NewRecorder()
+	h.RecordingStatusJSON(w, recReq(t, http.MethodGet, "/missing/recording_status.json", "missing"))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestRecordingStatusJSON_IndexErrorReturns500(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
 	d.indexErr = errors.New("disk gone")
 	w := httptest.NewRecorder()
-	h.Info(w, chiReq(t, http.MethodGet, "/recordings/live/info", nil, map[string]string{"rid": "live"}))
+	h.RecordingStatusJSON(w, recReq(t, http.MethodGet, "/live/recording_status.json", "live"))
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
-func TestRecordingHandler_Info_NilIndexReturns404(t *testing.T) {
+func TestRecordingStatusJSON_NilIndexReturns404(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
-	d.indexByDir[dir] = nil // explicit nil — handler must treat as "no data yet"
+	d.indexByDir[dir] = nil
 	w := httptest.NewRecorder()
-	h.Info(w, chiReq(t, http.MethodGet, "/recordings/live/info", nil, map[string]string{"rid": "live"}))
+	h.RecordingStatusJSON(w, recReq(t, http.MethodGet, "/live/recording_status.json", "live"))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-// ─── ServeFile ──────────────────────────────────────────────────────────────
-
-func TestRecordingHandler_ServeFile_PlaylistFromDisk(t *testing.T) {
+func TestRecordingStatusJSON_InvalidStreamCode_400(t *testing.T) {
 	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
+	h, _, _ := newRecHandlerForTest(t)
+	w := httptest.NewRecorder()
+	h.RecordingStatusJSON(w, recReq(t, http.MethodGet, "/$bad/recording_status.json", "$bad"))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// ─── ServeTimeshift (from/delay/dur/ago params) ─────────────────────────────
+
+func TestServeTimeshift_NoPlaylistReturns404(t *testing.T) {
+	t.Parallel()
+	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
-	playlist := filepath.Join(dir, "playlist.m3u8")
-	require.NoError(t, os.WriteFile(playlist, []byte("#EXTM3U\n#EXT-X-VERSION:3\n"), 0o644))
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
-
+	d.playByDir[dir] = nil
 	w := httptest.NewRecorder()
-	h.ServeFile(w, chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8", nil, map[string]string{
-		"rid": "live", "file": "playlist.m3u8",
-	}))
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "application/vnd.apple.mpegurl", w.Header().Get("Content-Type"))
-	assert.Contains(t, w.Body.String(), "#EXTM3U")
-}
-
-func TestRecordingHandler_ServeFile_TSSegment(t *testing.T) {
-	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
-	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "000001.ts"), []byte("\x47\x00"), 0o644))
-	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
-
-	w := httptest.NewRecorder()
-	h.ServeFile(w, chiReq(t, http.MethodGet, "/recordings/live/000001.ts", nil, map[string]string{
-		"rid": "live", "file": "000001.ts",
-	}))
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "video/mp2t", w.Header().Get("Content-Type"))
-}
-
-func TestRecordingHandler_ServeFile_UnsupportedExtensionReturns404(t *testing.T) {
-	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
-	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: t.TempDir()})
-
-	w := httptest.NewRecorder()
-	h.ServeFile(w, chiReq(t, http.MethodGet, "/recordings/live/index.json", nil, map[string]string{
-		"rid": "live", "file": "index.json",
-	}))
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?delay=10", "live"))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-func TestRecordingHandler_ServeFile_NoSegmentDirReturns404(t *testing.T) {
-	t.Parallel()
-	h, repo, _ := newRecHandlerForTest(t)
-	repo.seed(&domain.Recording{ID: "live", StreamCode: "live"})
-	w := httptest.NewRecorder()
-	h.ServeFile(w, chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8", nil, map[string]string{
-		"rid": "live", "file": "playlist.m3u8",
-	}))
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-// ─── serveTimeshift dispatch via ServeFile ──────────────────────────────────
-
-func TestRecordingHandler_ServeFile_TimeshiftFromOffset(t *testing.T) {
+func TestServeTimeshift_FromUnixSeconds(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
 
-	// Stub two parsed segments — handler builds a sliced VOD playlist.
-	base := time.Now().Add(-time.Hour)
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
 	d.playByDir[dir] = []dvr.SegmentMeta{
 		{Index: 1, WallTime: base, Duration: 4 * time.Second},
 		{Index: 2, WallTime: base.Add(4 * time.Second), Duration: 4 * time.Second},
 	}
 
-	r := chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8?offset_sec=0", nil,
-		map[string]string{"rid": "live", "file": "playlist.m3u8"})
+	url := fmt.Sprintf("/live/index.m3u8?from=%d", base.Unix())
 	w := httptest.NewRecorder()
-	h.ServeFile(w, r)
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, url, "live"))
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "#EXT-X-PLAYLIST-TYPE:VOD")
+	assert.Contains(t, w.Body.String(), "000001.ts")
 	assert.Contains(t, w.Body.String(), "#EXT-X-ENDLIST")
 }
 
-func TestRecordingHandler_ServeFile_TimeshiftInvalidFromReturns400(t *testing.T) {
+func TestServeTimeshift_DelayFromNow(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
-	d.playByDir[dir] = []dvr.SegmentMeta{{Index: 1, WallTime: time.Now(), Duration: time.Second}}
 
-	r := chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8?from=garbage", nil,
-		map[string]string{"rid": "live", "file": "playlist.m3u8"})
+	// One segment ~30s in the past — a delay=60 query should include it
+	// (window starts 60s before now), delay=5 should not.
+	d.playByDir[dir] = []dvr.SegmentMeta{
+		{Index: 1, WallTime: time.Now().Add(-30 * time.Second), Duration: 4 * time.Second},
+	}
+
 	w := httptest.NewRecorder()
-	h.ServeFile(w, r)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?delay=60", "live"))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "000001.ts")
+
+	w = httptest.NewRecorder()
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?delay=5", "live"))
+	assert.Equal(t, http.StatusNotFound, w.Code, "delay=5 starts after the segment ended")
 }
 
-func TestRecordingHandler_ServeFile_TimeshiftEmptyPlaylistReturns404(t *testing.T) {
-	t.Parallel()
-	h, repo, d := newRecHandlerForTest(t)
-	dir := t.TempDir()
-	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
-	d.playByDir[dir] = nil // no segments yet
-
-	r := chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8?offset_sec=0", nil,
-		map[string]string{"rid": "live", "file": "playlist.m3u8"})
-	w := httptest.NewRecorder()
-	h.ServeFile(w, r)
-	assert.Equal(t, http.StatusNotFound, w.Code)
-}
-
-func TestRecordingHandler_ServeFile_TimeshiftWindowOutOfRange(t *testing.T) {
+// `ago` is documented as an alias of `delay`; behaviour must match.
+func TestServeTimeshift_AgoIsAliasOfDelay(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
 	d.playByDir[dir] = []dvr.SegmentMeta{
-		{Index: 1, WallTime: time.Now().Add(-time.Hour), Duration: 4 * time.Second},
+		{Index: 1, WallTime: time.Now().Add(-30 * time.Second), Duration: 4 * time.Second},
 	}
 
-	// offset_sec far past every segment → window is empty → 404.
-	r := chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8?offset_sec=86400", nil,
-		map[string]string{"rid": "live", "file": "playlist.m3u8"})
 	w := httptest.NewRecorder()
-	h.ServeFile(w, r)
-	assert.Equal(t, http.StatusNotFound, w.Code)
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?ago=60", "live"))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "000001.ts")
 }
 
-func TestRecordingHandler_ServeFile_TimeshiftInvalidDurationReturns400(t *testing.T) {
+func TestServeTimeshift_DurWindowsClipLength(t *testing.T) {
+	t.Parallel()
+	h, repo, d := newRecHandlerForTest(t)
+	dir := t.TempDir()
+	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	d.playByDir[dir] = []dvr.SegmentMeta{
+		{Index: 1, WallTime: base, Duration: 4 * time.Second},
+		{Index: 2, WallTime: base.Add(4 * time.Second), Duration: 4 * time.Second},
+		{Index: 3, WallTime: base.Add(8 * time.Second), Duration: 4 * time.Second},
+	}
+
+	// from=base, dur=5 → segment 1 (wall_time base) included, 2 (wall_time
+	// base+4) included since base+4 <= base+5, but 3 (base+8) excluded.
+	url := fmt.Sprintf("/live/index.m3u8?from=%d&dur=5", base.Unix())
+	w := httptest.NewRecorder()
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, url, "live"))
+	require.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, "000001.ts")
+	assert.Contains(t, body, "000002.ts")
+	assert.NotContains(t, body, "000003.ts")
+}
+
+func TestServeTimeshift_InvalidFromReturns400(t *testing.T) {
 	t.Parallel()
 	h, repo, d := newRecHandlerForTest(t)
 	dir := t.TempDir()
 	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
 	d.playByDir[dir] = []dvr.SegmentMeta{{Index: 1, WallTime: time.Now(), Duration: time.Second}}
 
-	r := chiReq(t, http.MethodGet, "/recordings/live/playlist.m3u8?offset_sec=0&duration=-1", nil,
-		map[string]string{"rid": "live", "file": "playlist.m3u8"})
 	w := httptest.NewRecorder()
-	h.ServeFile(w, r)
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?from=garbage", "live"))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestServeTimeshift_InvalidDurReturns400(t *testing.T) {
+	t.Parallel()
+	h, repo, d := newRecHandlerForTest(t)
+	dir := t.TempDir()
+	repo.seed(&domain.Recording{ID: "live", StreamCode: "live", SegmentDir: dir})
+	d.playByDir[dir] = []dvr.SegmentMeta{{Index: 1, WallTime: time.Now(), Duration: time.Second}}
+
+	w := httptest.NewRecorder()
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?from=1700000000&dur=-1", "live"))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestServeTimeshift_NoSegmentDirReturns404(t *testing.T) {
+	t.Parallel()
+	h, repo, _ := newRecHandlerForTest(t)
+	repo.seed(&domain.Recording{ID: "live", StreamCode: "live"})
+	w := httptest.NewRecorder()
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/live/index.m3u8?delay=10", "live"))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestServeTimeshift_RecordingNotFound(t *testing.T) {
+	t.Parallel()
+	h, _, _ := newRecHandlerForTest(t)
+	w := httptest.NewRecorder()
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/missing/index.m3u8?from=1700000000", "missing"))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestServeTimeshift_InvalidStreamCode_400(t *testing.T) {
+	t.Parallel()
+	h, _, _ := newRecHandlerForTest(t)
+	w := httptest.NewRecorder()
+	h.ServeTimeshift(w, recReq(t, http.MethodGet, "/$bad/index.m3u8?delay=10", "$bad"))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }

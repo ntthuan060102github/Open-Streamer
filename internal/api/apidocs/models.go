@@ -64,7 +64,7 @@ type StreamList struct {
 	Total int              `json:"total"`
 }
 
-// InputSwitchRequest is the request body for POST /streams/{code}/inputs/switch.
+// InputSwitchRequest is the request body for POST /streams/{code}/switch.
 type InputSwitchRequest struct {
 	Priority int `json:"priority"`
 }

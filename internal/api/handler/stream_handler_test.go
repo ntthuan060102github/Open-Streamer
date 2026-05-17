@@ -576,7 +576,7 @@ func TestStreamHandler_SwitchInput_HappyPath(t *testing.T) {
 	h, _, _, mg, _ := newStreamHandlerForTest(t)
 
 	body := bytes.NewBufferString(`{"priority": 2}`)
-	req := chiReq(t, http.MethodPost, "/streams/live/inputs/switch", body.Bytes(), map[string]string{"code": "live"})
+	req := chiReq(t, http.MethodPost, "/streams/live/switch", body.Bytes(), map[string]string{"code": "live"})
 	w := httptest.NewRecorder()
 	h.SwitchInput(w, req)
 
@@ -587,7 +587,7 @@ func TestStreamHandler_SwitchInput_HappyPath(t *testing.T) {
 func TestStreamHandler_SwitchInput_BadJSON(t *testing.T) {
 	t.Parallel()
 	h, _, _, _, _ := newStreamHandlerForTest(t)
-	req := chiReq(t, http.MethodPost, "/streams/x/inputs/switch", []byte(`{nope`), map[string]string{"code": "x"})
+	req := chiReq(t, http.MethodPost, "/streams/x/switch", []byte(`{nope`), map[string]string{"code": "x"})
 	w := httptest.NewRecorder()
 	h.SwitchInput(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -597,7 +597,7 @@ func TestStreamHandler_SwitchInput_ManagerError(t *testing.T) {
 	t.Parallel()
 	h, _, _, mg, _ := newStreamHandlerForTest(t)
 	mg.switchErr = fmt.Errorf("priority not registered")
-	req := chiReq(t, http.MethodPost, "/streams/x/inputs/switch", []byte(`{"priority":1}`), map[string]string{"code": "x"})
+	req := chiReq(t, http.MethodPost, "/streams/x/switch", []byte(`{"priority":1}`), map[string]string{"code": "x"})
 	w := httptest.NewRecorder()
 	h.SwitchInput(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)

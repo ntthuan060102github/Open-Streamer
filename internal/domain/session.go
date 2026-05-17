@@ -98,9 +98,9 @@ type PlaySession struct {
 	// Secure is true when the underlying transport was TLS / SRTS / RTMPS.
 	Secure bool `json:"secure"`
 
-	// DVR is true when playback originated from the DVR / recording route
-	// (/recordings/{rid}/...), false for live-edge mediaserve hits. Set
-	// by sessions.DVRHTTPMiddleware on the recording sub-router. The flag
+	// DVR is true when the playlist request carried any timeshift query
+	// parameter (from / delay / dur / ago) — false for live-edge hits. Set
+	// by sessions.HTTPMiddleware after detecting the query shape. The flag
 	// also participates in the session fingerprint, so a viewer watching
 	// both live and timeshift gets two distinct session records.
 	DVR bool `json:"dvr"`

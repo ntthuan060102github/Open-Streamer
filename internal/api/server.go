@@ -19,7 +19,6 @@ import (
 	_ "github.com/ntt0601zcoder/open-streamer/api/docs" // swag Register(SwaggerInfo)
 	"github.com/ntt0601zcoder/open-streamer/config"
 	"github.com/ntt0601zcoder/open-streamer/internal/api/handler"
-	"github.com/ntt0601zcoder/open-streamer/internal/mediaserve"
 	"github.com/ntt0601zcoder/open-streamer/internal/metrics"
 	"github.com/ntt0601zcoder/open-streamer/internal/publisher"
 	"github.com/ntt0601zcoder/open-streamer/internal/sessions"
@@ -165,67 +164,17 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 	r.Get("/swagger", http.RedirectHandler("/swagger/", http.StatusMovedPermanently).ServeHTTP)
 	r.Get("/swagger/", serveSwaggerIndex)
 
-	// Mount media routes under a sub-router so we can attach the play-sessions
-	// middleware ONLY to /<code>/<segment> paths and not to the API endpoints
-	// above. Chi composes Use+Mount cleanly here.
-	r.Group(func(mr chi.Router) {
-		if s.sessTracker != nil {
-			mr.Use(sessions.HTTPMiddleware(s.sessTracker))
-		}
-		// /<code>/mpegts must be registered BEFORE mediaserve.Mount because
-		// mediaserve attaches a `/<code>/*` wildcard for HLS / DASH file
-		// serving. Chi's trie matches more-specific routes first when
-		// registered in order, so `/<code>/mpegts` wins as long as it is
-		// declared before the wildcard.
-		if s.pub != nil {
-			mr.Get("/{code}/mpegts", s.pub.HandleMPEGTS())
-		}
-		mediaserve.Mount(mr, s.hlsDir, s.dashDir)
-	})
-
-	r.Route("/streams", func(r chi.Router) {
-		r.Get("/", s.streamH.List)
-		r.Route("/{code}", func(r chi.Router) {
-			r.Get("/", s.streamH.Get)
-			r.Post("/", s.streamH.Put)
-			r.Delete("/", s.streamH.Delete)
-			r.Post("/restart", s.streamH.Restart)
-			r.Post("/inputs/switch", s.streamH.SwitchInput)
-
-			r.Get("/recordings", s.recordingH.ListByStream)
-			r.Get("/sessions", s.sessionH.ListByStream)
-		})
-	})
+	// Admin: /streams. Stream codes may contain '/' (namespacing) so the
+	// per-code routes are served by a catch-all dispatcher that parses
+	// (code, action) from the suffix. See dispatch.go for the rules.
+	r.Get("/streams", s.streamH.List)
+	r.HandleFunc("/streams/*", s.dispatchStreamsSubpath())
 
 	r.Route("/sessions", func(r chi.Router) {
 		r.Get("/", s.sessionH.List)
 		r.Route("/{id}", func(r chi.Router) {
 			r.Get("/", s.sessionH.Get)
 			r.Delete("/", s.sessionH.Delete)
-		})
-	})
-
-	r.Route("/recordings/{rid}", func(r chi.Router) {
-		// DVR session tracking on the /{file} sub-route only — Get / Info
-		// return JSON metadata (handler outputs nothing media-related), so
-		// the middleware would skip them via its extension filter anyway,
-		// but keeping the mount tight avoids running the wrap+chi.URLParam
-		// pair for every /info call.
-		r.Get("/", s.recordingH.Get)
-		r.Get("/info", s.recordingH.Info)
-		// /{file} handles BOTH segments (*.ts) and playlist (*.m3u8).
-		// When the request is for an m3u8 AND has from / offset_sec query
-		// params, the handler builds a dynamic timeshift slice instead of
-		// serving playlist.m3u8 from disk. The legacy /playlist.m3u8 and
-		// /timeshift.m3u8 routes were removed in favour of this dispatch.
-		// DVRHTTPMiddleware tags every successful .ts / .m3u8 hit with
-		// DVR=true so the dashboard distinguishes archive viewers from
-		// live-edge viewers.
-		r.Group(func(rr chi.Router) {
-			if s.sessTracker != nil {
-				rr.Use(sessions.DVRHTTPMiddleware(s.sessTracker))
-			}
-			rr.Get("/{file}", s.recordingH.ServeFile)
 		})
 	})
 
@@ -262,6 +211,17 @@ func (s *Server) buildRouter(serverCfg *config.ServerConfig) *chi.Mux {
 			r.Delete("/files/*", s.vodH.DeleteFile)
 			r.Get("/raw/*", s.vodH.Raw)
 		})
+	})
+
+	// Media: catch-all for /<code>/<tail>. Mounted last so all named admin
+	// prefixes above (e.g. /streams, /sessions, /hooks) win on chi's trie.
+	// The play-sessions middleware is scoped to this group so only media
+	// fetches accrue session events — admin calls don't pollute the tracker.
+	r.Group(func(mr chi.Router) {
+		if s.sessTracker != nil {
+			mr.Use(sessions.HTTPMiddleware(s.sessTracker))
+		}
+		mr.HandleFunc("/*", s.dispatchMedia())
 	})
 
 	return r

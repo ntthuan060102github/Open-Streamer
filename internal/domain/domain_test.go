@@ -17,11 +17,15 @@ func TestValidateStreamCode(t *testing.T) {
 		{"valid mixed", "Live_42", ""},
 		{"valid digits", "1234567890", ""},
 		{"valid underscore", "_test_", ""},
+		{"valid dash", "live-stream", ""},
+		{"valid slash namespace", "region/north/live", ""},
+		{"valid dash+slash mix", "vn_north/live-01", ""},
 		{"too long", strings.Repeat("a", MaxStreamCodeLen+1), "exceeds max length"},
-		{"contains dash", "live-stream", "must contain only"},
-		{"contains slash", "live/stream", "must contain only"},
 		{"contains dollar", "$raw$live", "must contain only"},
 		{"contains space", "live stream", "must contain only"},
+		{"leading slash", "/live", "start or end with"},
+		{"trailing slash", "live/", "start or end with"},
+		{"double slash", "a//b", "consecutive '/'"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
