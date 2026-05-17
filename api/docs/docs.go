@@ -2559,6 +2559,8 @@ const docTemplate = `{
         "domain.EventType": {
             "type": "string",
             "enum": [
+                "session.opened",
+                "session.closed",
                 "stream.created",
                 "stream.updated",
                 "stream.started",
@@ -2590,9 +2592,7 @@ const docTemplate = `{
                 "hook.deleted",
                 "template.created",
                 "template.updated",
-                "template.deleted",
-                "session.opened",
-                "session.closed"
+                "template.deleted"
             ],
             "x-enum-comments": {
                 "EventDVRSegmentPruned": "retention loop deleted an aged-out segment",
@@ -2609,6 +2609,8 @@ const docTemplate = `{
                 "EventStreamUpdated": "PUT /streams/{code} on existing record"
             },
             "x-enum-descriptions": [
+                "",
+                "",
                 "",
                 "PUT /streams/{code} on existing record",
                 "",
@@ -2640,11 +2642,11 @@ const docTemplate = `{
                 "",
                 "",
                 "",
-                "",
-                "",
                 ""
             ],
             "x-enum-varnames": [
+                "EventSessionOpened",
+                "EventSessionClosed",
                 "EventStreamCreated",
                 "EventStreamUpdated",
                 "EventStreamStarted",
@@ -2676,9 +2678,7 @@ const docTemplate = `{
                 "EventHookDeleted",
                 "EventTemplateCreated",
                 "EventTemplateUpdated",
-                "EventTemplateDeleted",
-                "EventSessionOpened",
-                "EventSessionClosed"
+                "EventTemplateDeleted"
             ]
         },
         "domain.GlobalConfig": {

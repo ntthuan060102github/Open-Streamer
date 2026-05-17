@@ -3,6 +3,7 @@ package dvr
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,32 @@ import (
 )
 
 const indexFileName = "index.json"
+
+// resolveSegDir joins root and code into an absolute segment directory and
+// rejects any result that would escape root. Stream codes are validated to
+// reject `..` segments, but `/` is allowed so the joined path can legally
+// have multiple segments — this guard makes path containment explicit so
+// every downstream filepath.Join sees a path the caller has already proven
+// safe (and CodeQL's path-injection tracker sees a sink-side validator).
+func resolveSegDir(root, code string) (string, error) {
+	cleanCode := filepath.Clean("/" + code)
+	if cleanCode == "/" {
+		return "", fmt.Errorf("dvr: stream code is empty")
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("dvr: resolve dvr root %q: %w", root, err)
+	}
+	segDir, err := filepath.Abs(filepath.Join(rootAbs, cleanCode))
+	if err != nil {
+		return "", fmt.Errorf("dvr: resolve segment dir: %w", err)
+	}
+	rootPrefix := rootAbs + string(filepath.Separator)
+	if segDir != rootAbs && !strings.HasPrefix(segDir, rootPrefix) {
+		return "", fmt.Errorf("dvr: stream code %q escapes dvr root", code)
+	}
+	return segDir, nil
+}
 
 // loadIndex reads index.json from segDir.
 // Returns nil, nil if the file does not exist (fresh recording).

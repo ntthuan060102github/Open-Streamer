@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,60 @@ import (
 
 	"github.com/ntt0601zcoder/open-streamer/internal/domain"
 )
+
+// resolveSegDir must accept valid stream codes (including multi-segment
+// codes that contain `/`) and reject any path that would escape root.
+func TestResolveSegDir_HappyPath(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	got, err := resolveSegDir(root, "foo")
+	require.NoError(t, err)
+	rootAbs, _ := filepath.Abs(root)
+	assert.Equal(t, filepath.Join(rootAbs, "foo"), got)
+}
+
+func TestResolveSegDir_MultiSegmentCode(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	got, err := resolveSegDir(root, "region/north/live")
+	require.NoError(t, err)
+	rootAbs, _ := filepath.Abs(root)
+	assert.Equal(t, filepath.Join(rootAbs, "region", "north", "live"), got)
+	assert.True(t, strings.HasPrefix(got, rootAbs),
+		"resolved segment dir must stay under the dvr root")
+}
+
+func TestResolveSegDir_RejectsEmptyCode(t *testing.T) {
+	t.Parallel()
+	_, err := resolveSegDir(t.TempDir(), "")
+	require.Error(t, err)
+}
+
+// Traversal attempts must never produce a path outside root, even if the
+// input bypasses the stream-code validator. filepath.Clean normalises the
+// `..` segments away; the explicit containment check is the second line
+// of defence and the one CodeQL's path-injection model recognises.
+func TestResolveSegDir_TraversalStaysInsideRoot(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	rootAbs, _ := filepath.Abs(root)
+
+	cases := []string{
+		"../escape",
+		"foo/../../etc",
+		"/../../etc/passwd",
+	}
+	for _, code := range cases {
+		t.Run(code, func(t *testing.T) {
+			got, err := resolveSegDir(root, code)
+			require.NoError(t, err)
+			assert.True(t, strings.HasPrefix(got, rootAbs+string(filepath.Separator)) || got == rootAbs,
+				"resolved %q must stay inside %q", got, rootAbs)
+		})
+	}
+}
 
 // ---- loadIndex / saveIndex round-trip ----------------------------------------
 
